@@ -1,0 +1,99 @@
+source .venv/bin/activate
+
+find . -name "*:Zone.Identifier" -type f -delete
+
+python summarize_results.py \
+  --results_root results_query_only_miri_672_small \
+  --outdir results_summary
+
+python viewer.py \
+  --maps_dir results_query_only_miri_672_small/anomaly_maps/seed=0 \
+  --png_dir datasets/miri/query \
+  --csv_path results_summary/results_query_only_miri_672_small/samples_sorted_by_anomaly_score.csv
+
+
+# For Big Data
+python prep_data.py \
+  --sensor miri \
+  --indir rawfits \
+  --out datasets/miri \
+  --pattern "*i2d.fits" \
+  --sci_ext SCI \
+  --wht_ext WHT \
+  --tile_size 448 --upscale 1 --stride 420 \
+  --min_wht_frac 0.80 \
+  --mean_thresh 5 --var_thresh 50 \
+  --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
+  --wcs_in_name
+
+# For Small Data
+python prep_data.py \
+  --sensor miri \
+  --indir rawfits \
+  --out datasets/miri \
+  --pattern "*sci.fits" \
+  --sci_ext SCI \
+  --wht_ext WHT \
+  --tile_size 672 --upscale 1 --stride 644 \
+  --min_wht_frac 0.5 \
+  --mean_thresh 5 --var_thresh 50 \
+  --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
+  --wcs_in_name
+
+# For Small Data
+python run_query_bootstrap.py \
+  --data_root datasets/miri \
+  --query_subdir query \
+  --recursive_query \
+  --model_name dinov2_vitl14 \
+  --resolution 672 \
+  --knn_metric L2_normalized \
+  --k_neighbors 20 \
+  --no-faiss_on_cpu \
+  --masking \
+  --mask_ref_images \
+  --rotation \
+  --save_examples \
+  --save_patch_dists \
+  --save_tiffs \
+  --device cuda:0 \
+  --warmup_iters 100 \
+  --seed 0 \
+  --init_ref_frac 0.2 \
+  --init_ref_min 100 \
+  --init_ref_max 425 \
+  --bootstrap_keep_frac 0.1 \
+  --bootstrap_keep_min 100 \
+  --bootstrap_keep_max 425 \
+  --out_dir results_query_only \
+  --tag miri_672_big
+
+# For Big Data
+python run_query_bootstrap.py \
+  --data_root datasets/miri \
+  --query_subdir query \
+  --recursive_query \
+  --model_name dinov2_vits14 \
+  --resolution 488 \
+  --knn_metric L2_normalized \
+  --k_neighbors 2 \
+  --no-faiss_on_cpu \
+  --masking \
+  --mask_ref_images \
+  --rotation \
+  --save_examples \
+  --save_patch_dists \
+  --save_tiffs \
+  --device cuda:0 \
+  --warmup_iters 200 \
+  --seed 0 \
+  --init_ref_frac 0.2 \
+  --init_ref_min 1000 \
+  --init_ref_max 2000 \
+  --bootstrap_keep_frac 0.1 \
+  --bootstrap_keep_min 1000 \
+  --bootstrap_keep_max 2000 \
+  --out_dir results_query_only \
+  --tag miri_jwst_488_maxq
+  --memmap_scores
+
