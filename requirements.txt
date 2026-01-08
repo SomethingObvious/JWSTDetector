@@ -1,0 +1,11 @@
+numpy
+torch
+tqdm
+PyYAML
+pandas
+opencv-python
+tifffile
+faiss-cpu
+astropy
+Pillow
+matplotlib
