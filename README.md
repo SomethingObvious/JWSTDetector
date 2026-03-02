@@ -1,4 +1,4 @@
-# JWSTDetectpr (JWST helpers + runners + AnomalyDINO) 
+# JWSTDetector (JWST helpers + runners + AnomalyDINO) 
 
 Utilities and CLI scripts to (1) preprocess JWST mosaics into PNG tiles and (2) run DINOv2-based anomaly detection in either a standard `train/` vs `test/` setting or a query-only “bootstrap reference from query” setting.
 Example end-to-end commands (prep → run → summarize → view) are included in `instructions.txt`.
