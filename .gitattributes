@@ -1,0 +1,19 @@
+# Text is stored and checked out with LF everywhere, and binary files are
+# marked so git never converts them.
+* text=auto eol=lf
+
+*.py text
+*.md text
+*.txt text
+*.toml text
+
+*.fits binary
+*.gz binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.npy binary
+*.bmp binary
+*.webp binary
