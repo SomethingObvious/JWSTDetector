@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+*venv/
+.venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+*:Zone.Identifier
+
+# Data, models, and run outputs (large / machine-specific)
+dev/
+data/*
+data_utils/*
+datasets*/
+rawfits/*
+rawfits*/
+rawfits_miri*/
+results
+results*/
+paper_plots*/
+paper_tables*/
+viewer_renders*/
+
+# Notebooks kept out of the repo
+*personal.ipynb
+feature_extraction.ipynb

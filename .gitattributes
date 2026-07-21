@@ -1,0 +1,20 @@
+# Normalize line endings: the working tree had mixed CRLF/LF churn. Text files
+# are stored with LF in the repo and checked out with the platform's native
+# endings. Binary blobs (FITS, images, arrays) are marked so git never munges them.
+* text=auto eol=lf
+
+*.py text
+*.md text
+*.txt text
+*.toml text
+
+*.fits binary
+*.gz binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.npy binary
+*.bmp binary
+*.webp binary
