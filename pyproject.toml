@@ -1,3 +1,37 @@
+[project]
+name = "jwstdetector"
+version = "0.2.0"
+description = "Unsupervised anomaly detection on JWST imagery with DINO patch embeddings"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+  "numpy",
+  "torch",
+  "torchvision",
+  "transformers",     # DINOv3 backbones
+  "astropy",
+  "Pillow",
+  "scipy",
+  "tifffile",
+  "pandas",
+  "PyYAML",
+  "tqdm",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+# viewer.py opens a desktop window; nothing else needs a GUI toolkit.
+viewer = ["PyQt6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
+py-modules = ["prep_data", "run_query_bootstrap", "run_anomalydino", "summarize_results", "viewer"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -7,7 +41,7 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RET", "PIE", "PT", "
 ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
-"test*.py" = ["S", "ARG", "PT"]
+"test*.py" = ["S", "ARG", "PT", "SLF"]
 
 [tool.ruff.format]
 quote-style = "double"

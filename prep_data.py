@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""
-prep_data.py (streaming per mosaic)
+"""FITS mosaics to PNG tiles, one mosaic at a time.
 
-Key behavior:
-- Processes exactly ONE mosaic at a time (SCI + optional WHT), then closes FITS, deletes arrays,
-  runs gc.collect(), and moves to the next mosaic.
-- For MIRI: expects paired files with same name except 'sci.fits' vs 'wht.fits'
-  (e.g., a5_sci.fits -> a5_wht.fits).
-- Prints per-mosaic:
-    Saved PNG tiles: {saved}
-    Skipped: {skipped_empty} empty-ish, {skipped_wht} low-WHT
+Each mosaic is opened memmapped, cut into tiles, then closed and collected before the
+next one, so memory stays flat whatever the mosaic size. MIRI expects paired files
+named the same except for 'sci.fits' and 'wht.fits'. Tiles are written to out/query/.
 
-Output structure:
-out/
-  query/
+Two measurements are taken per mosaic before any tile is cut: the sky level and its
+noise, from a strided subsample. Everything downstream is expressed against those, so
+the thresholds mean the same thing whatever units the mosaic carries and however deep
+the exposure is.
 """
 
 from __future__ import annotations
@@ -72,26 +67,72 @@ def _find_hdu_with_data(hdul, prefer_extnames: Sequence[str]) -> tuple[np.ndarra
     raise RuntimeError("No 2D image data found in FITS file.")
 
 
-def robust_asinh_to_uint8(
-    img: np.ndarray, p_lo: float = 1.0, p_hi: float = 99.8, asinh_q: float = 10.0
-) -> np.ndarray:
-    img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-    lo = np.percentile(img, p_lo)
-    hi = np.percentile(img, p_hi)
+@dataclass
+class MosaicStats:
+    """Sky level, noise and stretch limits measured once for a whole mosaic."""
+
+    sky: float
+    sigma: float
+    lo: float
+    hi: float
+
+
+def subsample(data: np.ndarray, max_values: int = 1 << 24) -> np.ndarray:
+    """A bounded, evenly spaced sample of a mosaic, kept small enough to hold in RAM.
+
+    Mosaics are memmapped and can run to several GB, so the statistics below are
+    measured on a strided view rather than the full array.
+    """
+    h, w = data.shape[:2]
+    step = max(1, int(np.ceil(np.sqrt(h * w / max_values))))
+    sample = np.asarray(data[::step, ::step], dtype=np.float32).reshape(-1)
+    return sample[np.isfinite(sample)]
+
+
+def measure_mosaic(data: np.ndarray, p_lo: float, p_hi: float) -> MosaicStats:
+    """Robust sky statistics and stretch limits for one mosaic."""
+    sample = subsample(data)
+    if sample.size == 0:
+        return MosaicStats(sky=0.0, sigma=0.0, lo=0.0, hi=1.0)
+
+    sky = float(np.median(sample))
+    # MAD scaled to a Gaussian sigma; unlike std it ignores the sources themselves.
+    sigma = float(np.median(np.abs(sample - sky)) * 1.4826)
+    lo, hi = (float(v) for v in np.percentile(sample, [p_lo, p_hi]))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo = float(np.min(img))
-        hi = float(np.max(img) + 1e-6)
-    x = (img - lo) / (hi - lo + 1e-12)
-    x = np.clip(x, 0.0, 1.0)
-    x = np.arcsinh(asinh_q * x) / np.arcsinh(asinh_q)
-    return (255.0 * x).astype(np.uint8)
+        lo, hi = float(sample.min()), float(sample.max()) + 1e-6
+    return MosaicStats(sky=sky, sigma=sigma, lo=lo, hi=hi)
 
 
-def mostly_empty_rgb(
-    tile_u8_rgb: np.ndarray, mean_thresh: float = 2.0, var_thresh: float = 1.0
+def asinh_to_uint8(img: np.ndarray, lo: float, hi: float, asinh_q: float = 10.0) -> np.ndarray:
+    """Map flux to 8-bit through an asinh stretch between fixed limits.
+
+    The limits are an argument rather than per-tile percentiles on purpose. Stretching
+    each tile against its own percentiles rescales every tile independently, so a faint
+    patch of sky and a tile with a bright source come out looking equally bright and
+    stop being comparable, which is exactly the comparison the detector then makes.
+    """
+    img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    x = np.clip((img - lo) / (hi - lo + 1e-12), 0.0, 1.0)
+    return (255.0 * np.arcsinh(asinh_q * x) / np.arcsinh(asinh_q)).astype(np.uint8)
+
+
+def has_signal(
+    cut: np.ndarray, stats: MosaicStats, source_sigma: float = 5.0, min_frac: float = 2e-4
 ) -> bool:
-    g = tile_u8_rgb.mean(axis=-1)
-    return (float(g.mean()) < mean_thresh) or (float(g.var()) < var_thresh)
+    """True when enough pixels rise above the sky for the tile to be worth embedding.
+
+    Measured on raw flux against the mosaic's own noise, so the threshold means the
+    same thing for MIRI and NIRCam without retuning. Pure sky puts essentially nothing
+    above 5 sigma; anything real puts up a compact clump of pixels.
+    """
+    if stats.sigma <= 0.0:
+        return bool(np.any(np.isfinite(cut) & (cut != stats.sky)))
+    finite = np.isfinite(cut)
+    if not finite.any():
+        return False
+    above = finite & (cut > stats.sky + source_sigma * stats.sigma)
+    return float(above.sum()) / float(finite.sum()) >= min_frac
 
 
 def ensure_dirs_query_only(out_root: str) -> str:
@@ -247,6 +288,16 @@ class MiriSensor(Sensor):
             except Exception:
                 wcs_obj = None
 
+        stats = measure_mosaic(sci_data, args.p_lo, args.p_hi)
+        logger.info(
+            "[%s] sky=%.4g sigma=%.4g stretch=[%.4g, %.4g]",
+            spec.tile_id,
+            stats.sky,
+            stats.sigma,
+            stats.lo,
+            stats.hi,
+        )
+
         saved = skipped_empty = skipped_wht = 0
         h, w = sci_data.shape[:2]
         for y in range(0, h - crop + 1, stride):
@@ -261,17 +312,21 @@ class MiriSensor(Sensor):
                         skipped_wht += 1
                         continue
 
-                cut = sci_data[y : y + crop, x : x + crop]
-                tile_u8 = robust_asinh_to_uint8(
-                    cut, p_lo=args.p_lo, p_hi=args.p_hi, asinh_q=args.asinh_q
-                )
-                rgb_u8 = np.stack([tile_u8, tile_u8, tile_u8], axis=-1)
+                cut = np.asarray(sci_data[y : y + crop, x : x + crop], dtype=np.float32)
 
-                if mostly_empty_rgb(
-                    rgb_u8, mean_thresh=args.mean_thresh, var_thresh=args.var_thresh
-                ):
+                # Judge emptiness on raw flux, before the stretch flattens the
+                # difference between blank sky and a tile with something in it.
+                if not has_signal(cut, stats, args.source_sigma, args.min_source_frac):
                     skipped_empty += 1
                     continue
+
+                tile_stats = (
+                    stats
+                    if args.stretch_scope == "mosaic"
+                    else measure_mosaic(cut, args.p_lo, args.p_hi)
+                )
+                tile_u8 = asinh_to_uint8(cut, tile_stats.lo, tile_stats.hi, args.asinh_q)
+                rgb_u8 = np.stack([tile_u8] * 3, axis=-1)
 
                 radec = maybe_center_radec(wcs_obj, cx, cy) if args.wcs_in_name else None
                 sample_name = make_output_name(spec.tile_id, cx, cy, global_idx, wcs_ra_dec=radec)
@@ -434,16 +489,26 @@ class NircamSensor(Sensor):
             except Exception:
                 wcs_obj = None
 
+        # The emptiness cut always reads raw flux, so keep the detection plane around
+        # even when the tile itself ends up as a three-filter colour composite.
+        signal_plane = planes[0]
+        stats = measure_mosaic(signal_plane, args.p_lo, args.p_hi)
+        logger.info(
+            "[%s] sky=%.4g sigma=%.4g stretch=[%.4g, %.4g]",
+            spec.tile_id,
+            stats.sky,
+            stats.sigma,
+            stats.lo,
+            stats.hi,
+        )
+
         if len(planes) == 1:
             img = planes[0]
         else:
             r, g, b = planes
             img = make_lupton_rgb(r, g, b, stretch=args.stretch, Q=args.Q)
 
-        if img.ndim == 2:
-            h, w = img.shape
-        else:
-            h, w, _ = img.shape
+        h, w = img.shape[:2]
 
         for y in range(0, h - crop + 1, stride):
             for x in range(0, w - crop + 1, stride):
@@ -457,29 +522,29 @@ class NircamSensor(Sensor):
                         skipped_wht += 1
                         continue
 
+                raw = signal_plane[y : y + crop, x : x + crop]
+                if not has_signal(raw, stats, args.source_sigma, args.min_source_frac):
+                    skipped_empty += 1
+                    continue
+
                 if img.ndim == 2:
-                    cut = img[y : y + crop, x : x + crop]
-                    tile_u8 = robust_asinh_to_uint8(
-                        cut, p_lo=args.p_lo, p_hi=args.p_hi, asinh_q=args.asinh_q
+                    tile_stats = (
+                        stats
+                        if args.stretch_scope == "mosaic"
+                        else measure_mosaic(raw, args.p_lo, args.p_hi)
                     )
-                    rgb_u8 = np.stack([tile_u8, tile_u8, tile_u8], axis=-1)
+                    tile_u8 = asinh_to_uint8(raw, tile_stats.lo, tile_stats.hi, args.asinh_q)
+                    rgb_u8 = np.stack([tile_u8] * 3, axis=-1)
                 else:
+                    # make_lupton_rgb already produced a stretched uint8 composite.
                     cut = img[y : y + crop, x : x + crop, :]
-                    if cut.dtype != np.uint8:
-                        cutf = np.nan_to_num(
-                            cut.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
-                        )
+                    if cut.dtype == np.uint8:
+                        rgb_u8 = cut
+                    else:
+                        cutf = np.nan_to_num(cut.astype(np.float32), nan=0.0)
                         if cutf.max() <= 1.0:
                             cutf = 255.0 * cutf
                         rgb_u8 = np.clip(cutf, 0.0, 255.0).astype(np.uint8)
-                    else:
-                        rgb_u8 = cut
-
-                if mostly_empty_rgb(
-                    rgb_u8, mean_thresh=args.mean_thresh, var_thresh=args.var_thresh
-                ):
-                    skipped_empty += 1
-                    continue
 
                 radec = maybe_center_radec(wcs_obj, cx, cy) if args.wcs_in_name else None
                 sample_name = make_output_name(spec.tile_id, cx, cy, global_idx, wcs_ra_dec=radec)
@@ -558,23 +623,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Drop tiles whose WHT coverage fraction is below this.",
     )
     p.add_argument(
-        "--mean_thresh",
-        "--meanthresh",
-        dest="mean_thresh",
+        "--source_sigma",
         type=float,
-        default=2.0,
-        help="Drop tiles dimmer than this mean brightness (empty-sky cut).",
+        default=5.0,
+        help="A pixel counts as signal this far above the mosaic's sky noise.",
     )
     p.add_argument(
-        "--var_thresh",
-        "--varthresh",
-        dest="var_thresh",
+        "--min_source_frac",
         type=float,
-        default=1.0,
-        help="Drop tiles with variance below this (flat/empty cut).",
+        default=2e-4,
+        help="Drop tiles with fewer than this fraction of signal pixels (empty-sky cut).",
     )
+    # Retired in favour of the two flags above, which measure raw flux instead of
+    # the stretched PNG. Fail loudly rather than silently ignoring them.
+    p.add_argument("--mean_thresh", "--meanthresh", dest="mean_thresh", help=argparse.SUPPRESS)
+    p.add_argument("--var_thresh", "--varthresh", dest="var_thresh", help=argparse.SUPPRESS)
 
     # Robust scaling (grayscale): accept both spellings
+    p.add_argument(
+        "--stretch_scope",
+        choices=("mosaic", "tile"),
+        default="mosaic",
+        help="Measure the stretch once per mosaic (comparable tiles) or per tile (legacy).",
+    )
     p.add_argument(
         "--p_lo", "--plo", dest="p_lo", type=float, default=1.0, help="Low percentile for stretch."
     )
@@ -628,6 +699,13 @@ def run() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    if args.mean_thresh is not None or args.var_thresh is not None:
+        raise SystemExit(
+            "--mean_thresh/--var_thresh are gone. They ran on the stretched PNG, where a\n"
+            "per-tile stretch had already normalised blank sky up to full brightness, so the\n"
+            "cut kept empty tiles and threw away tiles holding a bright source.\n"
+            "Use --source_sigma / --min_source_frac, which read raw flux instead."
+        )
     if args.dry_run:
         logger.info("Dry run: filtering and counting tiles only, no PNGs will be written.")
 

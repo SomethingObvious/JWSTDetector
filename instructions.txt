@@ -2,17 +2,12 @@ source .venv/bin/activate
 
 find . -name "*:Zone.Identifier" -type f -delete
 
-python summarize_results.py \
-  --results_root results_query_only_miri_672_small \
-  --outdir results_summary
 
-python viewer.py \
-  --maps_dir results_query_only_miri_672_small/anomaly_maps/seed=0 \
-  --png_dir datasets/miri/query \
-  --csv_path results_summary/results_query_only_miri_672_small/samples_sorted_by_anomaly_score.csv
+# ---------------------------------------------------------------------------
+# 1. Tiles
+# ---------------------------------------------------------------------------
 
-
-# For Big Data
+# Big data: smaller tiles, tighter coverage cut.
 python prep_data.py \
   --sensor miri \
   --indir rawfits \
@@ -22,11 +17,12 @@ python prep_data.py \
   --wht_ext WHT \
   --tile_size 448 --upscale 1 --stride 420 \
   --min_wht_frac 0.80 \
-  --mean_thresh 5 --var_thresh 50 \
+  --source_sigma 5 --min_source_frac 2e-4 \
   --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
+  --stretch_scope mosaic \
   --wcs_in_name
 
-# For Small Data
+# Small data.
 python prep_data.py \
   --sensor miri \
   --indir rawfits \
@@ -36,28 +32,38 @@ python prep_data.py \
   --wht_ext WHT \
   --tile_size 672 --upscale 1 --stride 644 \
   --min_wht_frac 0.5 \
-  --mean_thresh 5 --var_thresh 50 \
+  --source_sigma 5 --min_source_frac 2e-4 \
   --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
+  --stretch_scope mosaic \
   --wcs_in_name
 
-# For Small Data
+# Check what the thresholds would keep before writing anything.
+python prep_data.py --sensor miri --indir rawfits --out datasets/miri \
+  --pattern "*sci.fits" --tile_size 672 --stride 644 --min_wht_frac 0.5 --dry-run --limit 2
+
+
+# ---------------------------------------------------------------------------
+# 2. Scoring
+# ---------------------------------------------------------------------------
+
+# Small data: ViT-L at 672, eight-fold augmented reference set.
 python run_query_bootstrap.py \
   --data_root datasets/miri \
   --query_subdir query \
   --recursive_query \
-  --model_name dinov2_vitl14 \
+  --model_name dinov3-vitl16-pretrain-sat493m \
   --resolution 672 \
+  --batch_size 16 \
+  --num_workers 8 \
   --knn_metric L2_normalized \
   --k_neighbors 20 \
-  --no-faiss_on_cpu \
-  --masking \
-  --mask_ref_images \
+  --max_bank_patches 1000000 \
+  --score_mode top1p \
   --rotation \
   --save_examples \
   --save_patch_dists \
   --save_tiffs \
   --device cuda:0 \
-  --warmup_iters 100 \
   --seed 0 \
   --init_ref_frac 0.2 \
   --init_ref_min 100 \
@@ -68,24 +74,22 @@ python run_query_bootstrap.py \
   --out_dir results_query_only \
   --tag miri_672_big
 
-# For Big Data
+# Big data: ViT-S at 448, larger reference set, no augmentation.
 python run_query_bootstrap.py \
   --data_root datasets/miri \
   --query_subdir query \
   --recursive_query \
-  --model_name dinov2_vits14 \
-  --resolution 488 \
+  --model_name dinov3-vits16-pretrain-lvd1689m \
+  --resolution 448 \
+  --batch_size 32 \
+  --num_workers 8 \
   --knn_metric L2_normalized \
   --k_neighbors 2 \
-  --no-faiss_on_cpu \
-  --masking \
-  --mask_ref_images \
-  --rotation \
-  --save_examples \
+  --max_bank_patches 2000000 \
+  --score_mode top1p \
+  --no-rotation \
   --save_patch_dists \
-  --save_tiffs \
   --device cuda:0 \
-  --warmup_iters 200 \
   --seed 0 \
   --init_ref_frac 0.2 \
   --init_ref_min 1000 \
@@ -94,6 +98,21 @@ python run_query_bootstrap.py \
   --bootstrap_keep_min 1000 \
   --bootstrap_keep_max 2000 \
   --out_dir results_query_only \
-  --tag miri_jwst_488_maxq
-  --memmap_scores
+  --tag miri_jwst_448_maxq
 
+# Hunting a small bright oddity rather than a generally strange tile:
+#   --score_mode peak_minus_median
+
+
+# ---------------------------------------------------------------------------
+# 3. Look at the results
+# ---------------------------------------------------------------------------
+
+python summarize_results.py \
+  --results_root results_query_only_miri_672_big \
+  --outdir results_summary
+
+python viewer.py \
+  --maps_dir results_query_only_miri_672_big/pass2/anomaly_maps/seed=0 \
+  --png_dir datasets/miri/query \
+  --csv_path results_summary/results_query_only_miri_672_big/samples_sorted_by_anomaly_score.csv

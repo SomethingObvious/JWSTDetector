@@ -1,180 +1,118 @@
+#!/usr/bin/env python3
+"""Label-free anomaly scoring for JWST tiles.
+
+Pass 1 draws a random reference subset from the query set and scores everything
+against it. Pass 2 rebuilds the reference from the lowest-scoring tiles, the ones
+pass 1 judged most ordinary, and scores again. Nothing here needs labels, which is
+the point: JWST tiles do not come with any.
+"""
+
+from __future__ import annotations
+
 import argparse
-import bisect
-import csv
 import logging
-import os
 import shutil
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import yaml
-from tqdm import trange
 
-from src.backbones import get_model
-from src.detection import run_anomaly_detection
+from src.backbones import get_backbone
+from src.data import (
+    list_images,
+    relative_key,
+    resolve_device,
+    write_measurements_csv,
+    write_ref_list,
+)
+from src.detection import METRICS, run_anomaly_detection
+from src.scoring import SCORE_MODES
 from src.seeding import set_seed
-
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
 logger = logging.getLogger("run_query_bootstrap")
 
 
-def maybe_set_cuda_visible_devices(device: str):
-    # Keep behavior consistent with older runner: cuda:0 -> CUDA_VISIBLE_DEVICES=0
-    if device and device.startswith("cuda:"):
-        idx = device.split(":", 1)[1]
-        if idx.isdigit():
-            os.environ["CUDA_VISIBLE_DEVICES"] = idx
-
-
-def find_first_image_under(root_dir: str):
-    for p in Path(root_dir).rglob("*"):
-        if p.is_file() and p.suffix.lower() in IMG_EXTS:
-            return str(p)
-    return None
-
-
-def list_images(query_dir: Path, recursive: bool) -> list[Path]:
-    if recursive:
-        paths = [p for p in query_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS]
-    else:
-        paths = [p for p in query_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS]
-
-    paths = sorted(paths)
-    if not paths:
-        raise RuntimeError(f"No images found in query_dir={query_dir} (recursive={recursive})")
-    return paths
-
-
-def write_measurements_csv(path: Path, scores: dict, time_mb: float, inf_times: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["Sample", "AnomalyScore", "MemoryBankTimeSec", "InferenceTimeSec"])
-        for k in sorted(scores.keys()):
-            w.writerow(
-                [
-                    k,
-                    f"{float(scores[k]):.8f}",
-                    f"{float(time_mb):.6f}",
-                    f"{float(inf_times[k]):.6f}",
-                ]
-            )
-
-
-def make_ref_dir(tmp_dir: Path, ref_paths: list[Path]) -> Path:
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    for p in ref_paths:
-        dst = tmp_dir / p.name
-        if dst.exists():
-            continue
-        try:
-            dst.symlink_to(p)
-        except Exception:
-            shutil.copyfile(p, dst)
-    return tmp_dir
-
-
-class _MemmapDictView(dict):
-    """
-    Minimal dict-like wrapper backed by:
-      - sorted_keys: list[str] (sorted ascending)
-      - values: np.memmap (aligned by index to sorted_keys)
-
-    Supports .keys() and __getitem__ so existing CSV writer stays unchanged.
-    """
-
-    def __init__(self, sorted_keys: list[str], values: np.memmap):
-        self._keys = sorted_keys
-        self._values = values
-
-    def keys(self):
-        return self._keys
-
-    def __getitem__(self, key: str):
-        i = bisect.bisect_left(self._keys, key)
-        if i >= len(self._keys) or self._keys[i] != key:
-            raise KeyError(key)
-        return self._values[i]
-
-
-def _dict_to_memmap(
-    out_path: Path,
-    d: dict,
-    *,
-    dtype: np.dtype = np.float32,
-) -> tuple[list[str], np.memmap]:
-    """
-    Convert dict[str, number] -> (sorted_keys, memmap array of values aligned to sorted_keys).
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    keys = sorted(d.keys())
-    mm = np.memmap(str(out_path), dtype=dtype, mode="w+", shape=(len(keys),))
-    for i, k in enumerate(keys):
-        mm[i] = float(d[k])
-    mm.flush()
-    return keys, mm
+def subset_size(n: int, frac: float, minimum: int, maximum: int | None) -> int:
+    """How many tiles to keep: a fraction of the set, clamped both ways."""
+    k = max(minimum, round(n * frac))
+    if maximum is not None:
+        k = min(k, maximum)
+    return max(1, min(k, n))
 
 
 def parse_args(argv: list[str] | None = None):
     p = argparse.ArgumentParser(
-        description=(
-            "Label-free (query-only) anomaly scoring for JWST tiles. Pass 1 scores against a "
-            "random reference subset; pass 2 rebuilds the reference from the most 'normal' tiles "
-            "and re-scores. Needs a CUDA GPU."
-        )
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    p.add_argument("--data_root", type=str, required=True, help="Folder containing query/ only.")
-    p.add_argument("--query_subdir", type=str, default="query")
+    p.add_argument("--data_root", required=True, help="Folder containing the query/ subdirectory.")
+    p.add_argument("--query_subdir", default="query")
     p.add_argument("--recursive_query", default=True, action=argparse.BooleanOptionalAction)
 
-    p.add_argument("--model_name", type=str, default="dinov2_vits14")
-    p.add_argument("--resolution", type=int, default=448)
+    p.add_argument(
+        "--model_name",
+        default="dinov3-vitl16-pretrain-sat493m",
+        help="dinov3-* (transformers, gated weights) or dinov2_* (torch.hub).",
+    )
+    p.add_argument("--resolution", type=int, default=448, help="Snapped down to a patch multiple.")
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=4, help="Tile decoding workers.")
+    p.add_argument(
+        "--autocast",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Run the backbone in bf16/fp16 on CUDA. Distances stay in fp32.",
+    )
 
-    p.add_argument("--knn_metric", type=str, default="L2_normalized")
+    p.add_argument("--knn_metric", default="L2_normalized", choices=METRICS)
     p.add_argument("--k_neighbors", type=int, default=1)
-    p.add_argument("--faiss_on_cpu", default=False, action=argparse.BooleanOptionalAction)
+    p.add_argument(
+        "--max_bank_patches",
+        type=int,
+        default=1_000_000,
+        help="Cap on memory-bank patches. ~4 GB of fp32 at 1024 dims.",
+    )
+
+    p.add_argument("--score_mode", default="top1p", choices=SCORE_MODES)
+    p.add_argument("--score_top_frac", type=float, default=0.01, help="For --score_mode topk_mean.")
+    p.add_argument("--score_quantile", type=float, default=0.9995, help="For score_mode quantile.")
 
     p.add_argument("--masking", default=False, action=argparse.BooleanOptionalAction)
     p.add_argument("--mask_ref_images", default=False, action=argparse.BooleanOptionalAction)
-    p.add_argument("--rotation", default=False, action=argparse.BooleanOptionalAction)
-
-    p.add_argument("--save_examples", default=False, action=argparse.BooleanOptionalAction)
+    p.add_argument(
+        "--rotation",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Add the eight square symmetries of each reference tile to the bank.",
+    )
+    p.add_argument(
+        "--save_examples",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Render a few reference tiles with their background masks.",
+    )
     p.add_argument("--save_patch_dists", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--save_tiffs", default=False, action=argparse.BooleanOptionalAction)
 
-    p.add_argument("--device", default="cuda:0")
-    p.add_argument("--warmup_iters", type=int, default=25)
-    p.add_argument("--seed", type=int, default=0, help="Seeds random/numpy/torch for the run.")
+    p.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:1, mps.")
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--deterministic",
         default=False,
         action=argparse.BooleanOptionalAction,
-        help="Force cuDNN deterministic mode (slower; off by default to preserve speed/numerics).",
+        help="Force cuDNN deterministic mode. Slower, so off by default.",
     )
 
-    # Pass 1: random ref from query
     p.add_argument("--init_ref_frac", type=float, default=0.1)
     p.add_argument("--init_ref_min", type=int, default=500)
     p.add_argument("--init_ref_max", type=int, default=5000)
 
-    # Pass 2: bootstrap ref from lowest scoring query images
     p.add_argument("--bootstrap_keep_frac", type=float, default=0.2)
     p.add_argument("--bootstrap_keep_min", type=int, default=500)
     p.add_argument("--bootstrap_keep_max", type=int, default=5000)
 
-    p.add_argument("--out_dir", type=str, default="results_query_only")
-    p.add_argument("--tag", type=str, default=None)
-
-    p.add_argument(
-        "--memmap_scores",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Back score/time vectors with disk np.memmap to reduce RAM on large query sets.",
-    )
-
+    p.add_argument("--out_dir", default="results_query_only")
+    p.add_argument("--tag", default=None)
     p.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     return p.parse_args(argv)
@@ -188,157 +126,79 @@ def main(argv: list[str] | None = None) -> int:
     )
     set_seed(args.seed, deterministic=args.deterministic)
 
-    maybe_set_cuda_visible_devices(args.device)
-
-    data_root = Path(args.data_root).resolve()
-    query_dir = data_root / args.query_subdir
+    query_dir = Path(args.data_root).resolve() / args.query_subdir
     if not query_dir.is_dir():
-        raise RuntimeError(f"Missing query folder: {query_dir}")
+        raise SystemExit(f"Missing query folder: {query_dir}")
 
-    out_dir = Path(args.out_dir)
-    if args.tag:
-        out_dir = Path(str(out_dir) + "_" + args.tag)
+    out_dir = Path(f"{args.out_dir}_{args.tag}" if args.tag else args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "args.yaml").write_text(yaml.safe_dump(vars(args)), encoding="utf-8")
 
-    with (out_dir / "args.yaml").open("w") as f:
-        yaml.safe_dump(vars(args), f)
+    backbone = get_backbone(
+        args.model_name,
+        resolve_device(args.device),
+        resolution=args.resolution,
+        autocast=args.autocast,
+    )
 
-    # Build model
-    model = get_model(args.model_name, "cuda", smaller_edge_size=args.resolution)
-
-    # Warmup
-    warm_img = find_first_image_under(str(query_dir))
-    if warm_img is None:
-        raise RuntimeError(f"No images found under {query_dir} for warmup.")
-
-    for _ in trange(args.warmup_iters, desc="CUDA warmup", leave=False):
-        x, _ = model.prepare_image(warm_img)
-        _ = model.extract_features(x)
-
-    all_query_paths = list_images(query_dir, recursive=args.recursive_query)
-    n = len(all_query_paths)
+    query_paths = list_images(query_dir, recursive=args.recursive_query)
+    logger.info("%d query tiles under %s", len(query_paths), query_dir)
     rng = np.random.default_rng(args.seed)
 
-    # ---- Pass 1: random reference subset from query ----
-    k1 = max(args.init_ref_min, round(n * args.init_ref_frac))
-    if args.init_ref_max is not None:
-        k1 = min(k1, args.init_ref_max)
-    k1 = max(1, min(k1, n))
-
-    ref1_idx = sorted(rng.choice(n, size=k1, replace=False).tolist())
-    ref1_paths = [all_query_paths[i] for i in ref1_idx]
-
-    pass1_dir = out_dir / "pass1"
-    pass1_dir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="ref_pass1_") as tmp:
-        ref_dir1 = make_ref_dir(Path(tmp), ref1_paths)
-        scores1, tmb1, tinf1 = run_anomaly_detection(
-            model=model,
-            ref_dir=str(ref_dir1),
-            query_dir=str(query_dir),
-            plots_dir=str(pass1_dir),
-            recursive_ref=True,
-            recursive_query=args.recursive_query,
-            save_examples=args.save_examples,
+    def detect(ref_paths: list[Path], pass_dir: Path):
+        pass_dir.mkdir(parents=True, exist_ok=True)
+        write_ref_list(pass_dir / "ref_list.txt", query_dir, ref_paths)
+        scores, memorybank_sec, seconds = run_anomaly_detection(
+            backbone,
+            ref_paths,
+            query_dir,
+            query_paths,
+            query_dir,
+            pass_dir,
             masking=args.masking,
             mask_ref_images=args.mask_ref_images,
             rotation=args.rotation,
             knn_metric=args.knn_metric,
-            knn_neighbors=args.k_neighbors,
-            faiss_on_cpu=args.faiss_on_cpu,
+            k_neighbors=args.k_neighbors,
+            max_bank_patches=args.max_bank_patches,
+            score_mode=args.score_mode,
+            score_top_frac=args.score_top_frac,
+            score_quantile=args.score_quantile,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
             seed=args.seed,
             save_patch_dists=args.save_patch_dists,
             save_tiffs=args.save_tiffs,
         )
+        write_measurements_csv(pass_dir / "measurements.csv", scores, memorybank_sec, seconds)
+        return scores
 
-    if args.memmap_scores:
-        keys1, scores1_mm = _dict_to_memmap(
-            pass1_dir / "measurements.memmap", scores1, dtype=np.float32
-        )
-        keys1_t, tinf1_mm = _dict_to_memmap(pass1_dir / "inf_times.memmap", tinf1, dtype=np.float32)
+    # Pass 1: a random slice of the query set stands in for "normal".
+    n = len(query_paths)
+    k1 = subset_size(n, args.init_ref_frac, args.init_ref_min, args.init_ref_max)
+    ref1 = [query_paths[i] for i in sorted(rng.choice(n, size=k1, replace=False).tolist())]
+    logger.info("pass 1: %d random reference tiles of %d", k1, n)
 
-        scores1_view = _MemmapDictView(keys1, scores1_mm)
-        tinf1_view = _MemmapDictView(keys1_t, tinf1_mm)
+    if args.save_examples:
+        from src.utils import plot_reference_masks
 
-        del scores1
-        del tinf1
+        plot_reference_masks(backbone, ref1, query_dir, out_dir / "reference_samples.png")
 
-        write_measurements_csv(pass1_dir / "measurements.csv", scores1_view, tmb1, tinf1_view)
+    scores1 = detect(ref1, out_dir / "pass1")
 
-        # For bootstrap, we need sorted-by-score order (lowest = most normal).
-        order1 = np.argsort(np.asarray(scores1_mm), kind="stable")
-        sorted_items = [(keys1[i], float(scores1_mm[i])) for i in order1]
-    else:
-        write_measurements_csv(pass1_dir / "measurements.csv", scores1, tmb1, tinf1)
-        sorted_items = sorted(scores1.items(), key=lambda kv: float(kv[1]))  # lowest = most normal
+    # Pass 2: rebuild the reference from whatever pass 1 called most ordinary.
+    by_score = sorted(scores1, key=scores1.__getitem__)
+    k2 = subset_size(
+        len(by_score), args.bootstrap_keep_frac, args.bootstrap_keep_min, args.bootstrap_keep_max
+    )
+    lookup = {relative_key(p, query_dir): p for p in query_paths}
+    ref2 = [lookup[key] for key in by_score[:k2]]
+    logger.info("pass 2: %d lowest-scoring tiles as the reference", len(ref2))
 
-    with (pass1_dir / "ref_list.txt").open("w", encoding="utf-8") as f:
-        for p in ref1_paths:
-            f.write(str(p.relative_to(query_dir)).replace("\\", "/") + "\n")
+    detect(ref2, out_dir / "pass2")
 
-    # ---- Pass 2: bootstrap reference from lowest scoring query images ----
-    k2 = max(args.bootstrap_keep_min, round(len(sorted_items) * args.bootstrap_keep_frac))
-    if args.bootstrap_keep_max is not None:
-        k2 = min(k2, args.bootstrap_keep_max)
-    k2 = max(1, min(k2, len(sorted_items)))
-
-    # Build a map from query relative-path string -> actual Path
-    rel_to_path: dict[str, Path] = {}
-    for p in all_query_paths:
-        rel = str(p.relative_to(query_dir)).replace("\\", "/")
-        rel_to_path[rel] = p
-
-    ref2_rels = [k for k, _ in sorted_items[:k2]]
-    ref2_paths = [rel_to_path[k] for k in ref2_rels if k in rel_to_path]
-
-    pass2_dir = out_dir / "pass2"
-    pass2_dir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="ref_pass2_") as tmp:
-        ref_dir2 = make_ref_dir(Path(tmp), ref2_paths)
-        scores2, tmb2, tinf2 = run_anomaly_detection(
-            model=model,
-            ref_dir=str(ref_dir2),
-            query_dir=str(query_dir),
-            plots_dir=str(pass2_dir),
-            recursive_ref=True,
-            recursive_query=args.recursive_query,
-            save_examples=args.save_examples,
-            masking=args.masking,
-            mask_ref_images=args.mask_ref_images,
-            rotation=args.rotation,
-            knn_metric=args.knn_metric,
-            knn_neighbors=args.k_neighbors,
-            faiss_on_cpu=args.faiss_on_cpu,
-            seed=args.seed,
-            save_patch_dists=args.save_patch_dists,
-            save_tiffs=args.save_tiffs,
-        )
-
-    if args.memmap_scores:
-        keys2, scores2_mm = _dict_to_memmap(
-            pass2_dir / "measurements.memmap", scores2, dtype=np.float32
-        )
-        keys2_t, tinf2_mm = _dict_to_memmap(pass2_dir / "inf_times.memmap", tinf2, dtype=np.float32)
-
-        scores2_view = _MemmapDictView(keys2, scores2_mm)
-        tinf2_view = _MemmapDictView(keys2_t, tinf2_mm)
-
-        del scores2
-        del tinf2
-
-        write_measurements_csv(pass2_dir / "measurements.csv", scores2_view, tmb2, tinf2_view)
-    else:
-        write_measurements_csv(pass2_dir / "measurements.csv", scores2, tmb2, tinf2)
-
-    with (pass2_dir / "ref_list.txt").open("w", encoding="utf-8") as f:
-        for p in ref2_paths:
-            f.write(str(p.relative_to(query_dir)).replace("\\", "/") + "\n")
-
-    shutil.copyfile(pass2_dir / "measurements.csv", out_dir / "measurements_final.csv")
-    logger.info("Done. Final measurements: %s", out_dir / "measurements_final.csv")
-
+    shutil.copyfile(out_dir / "pass2/measurements.csv", out_dir / "measurements_final.csv")
+    logger.info("done: %s", out_dir / "measurements_final.csv")
     return 0
 
 

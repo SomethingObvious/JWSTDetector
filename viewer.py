@@ -33,11 +33,17 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-# Force Qt backend BEFORE importing pyplot.
+# Pick the backend before pyplot is imported. Qt gives a resizable popup window,
+# but it is an optional extra (pip install -e '.[viewer]'), so fall back quietly to
+# whatever matplotlib would have chosen instead of dying on the import.
 os.environ.setdefault("MPLBACKEND", "QtAgg")
 import matplotlib
 
-matplotlib.use("QtAgg", force=True)
+try:
+    matplotlib.use("QtAgg", force=True)
+except ImportError:
+    os.environ.pop("MPLBACKEND", None)
+    matplotlib.use(matplotlib.rcParamsDefault["backend"], force=True)
 
 import matplotlib.pyplot as plt
 
