@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Steps through ranked tiles, showing each PNG beside its raw patch-distance grid.
+"""Steps through the highest-scoring tiles, each beside its patch-distance map.
 
 It reads samples_sorted_by_anomaly_score.csv, or any CSV with Sample and AnomalyScore
-columns, and loads the .npy map saved for each tile. Every view is also saved to
---render_dir unless a render for it is already there. It opens a Qt window, so it
-needs PyQt and a display. Press Enter in the terminal for the next tile and q to stop.
+columns, and shows each PNG tile next to the raw .npy grid of patch distances in a
+maximised window. A render of each one goes to viewer_renders/ unless it's already
+there. Press Enter in the terminal for the next tile, or type q and Enter to stop.
 
-    python viewer.py --maps_dir results/pass2/anomaly_maps/seed=0 \\
-        --png_dir datasets/miri/query --csv_path samples_sorted_by_anomaly_score.csv
+Usage:
+  python viewer.py \
+    --maps_dir /path/to/pass2/anomaly_maps/seed=0 \
+    --png_dir  /path/to/dataset/query \
+    --csv_path /path/to/samples_sorted_by_anomaly_score.csv
 """
 
 from __future__ import annotations
@@ -22,11 +25,17 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-# The backend has to be set before pyplot is imported, and only Qt has showMaximized.
+# The backend has to be picked before pyplot is imported. Qt is an optional extra
+# (pip install -e '.[viewer]'), so without it this falls back to whatever matplotlib
+# would have chosen rather than failing on the import.
 os.environ.setdefault("MPLBACKEND", "QtAgg")
 import matplotlib
 
-matplotlib.use("QtAgg", force=True)
+try:
+    matplotlib.use("QtAgg", force=True)
+except ImportError:
+    os.environ.pop("MPLBACKEND", None)
+    matplotlib.use(matplotlib.rcParamsDefault["backend"], force=True)
 
 import matplotlib.pyplot as plt
 
@@ -49,7 +58,7 @@ def _read_sorted_samples(csv_path: Path) -> list[tuple[str, float]]:
         sample_col = cols.get("sample")
         score_col = cols.get("anomalyscore") or cols.get("anomaly_score") or cols.get("score")
         if not sample_col or not score_col:
-            raise RuntimeError(f"The CSV needs Sample and AnomalyScore columns, not {r.fieldnames}")
+            raise RuntimeError(f"The CSV needs Sample and AnomalyScore columns, and it has {r.fieldnames}")
 
         for row in r:
             s = (row.get(sample_col) or "").strip()
@@ -70,10 +79,10 @@ def _load_png(p: Path) -> np.ndarray:
 
 
 def _load_npy_map_only(maps_dir: Path, sample_rel: str) -> tuple[np.ndarray, Path]:
-    """The .npy patch-distance grid saved for a tile.
+    """The saved .npy patch-distance grid for a sample, and the path it came from.
 
-    There is no TIFF fallback, on purpose. A missing .npy usually means --maps_dir
-    points at the wrong run, and quietly showing something else would hide that.
+    There is no TIFF fallback on purpose, so a wrong --maps_dir fails loudly rather
+    than quietly showing a smoothed map.
     """
     rel = Path(sample_rel)
     stem_rel = rel.with_suffix("")
@@ -81,14 +90,14 @@ def _load_npy_map_only(maps_dir: Path, sample_rel: str) -> tuple[np.ndarray, Pat
     if npy_path.exists():
         return np.asarray(np.load(str(npy_path))), npy_path
 
-    # The CSV may name tiles relative to a different root than the maps.
+    # The same file name anywhere under maps_dir, in case the subfolders don't match.
     base = stem_rel.name
     hits = list(maps_dir.rglob(base + ".npy"))
     if hits:
         p = hits[0]
         return np.asarray(np.load(str(p))), p
 
-    raise FileNotFoundError(f"There is no map for {sample_rel} under {maps_dir}")
+    raise FileNotFoundError(f"There is no .npy map for {sample_rel} under {maps_dir}")
 
 
 def _normalize01(a: np.ndarray) -> np.ndarray:
@@ -101,7 +110,7 @@ def _normalize01(a: np.ndarray) -> np.ndarray:
 
 
 def _maximize(fig) -> None:
-    """Maximize rather than go full screen, which would hide the taskbar."""
+    """Maximise the window, which unlike full screen leaves the taskbar showing."""
     mgr = getattr(fig.canvas, "manager", None)
     if mgr is None:
         return
@@ -112,31 +121,31 @@ def _maximize(fig) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--maps_dir", required=True, type=str, help="Folder holding the .npy maps."
+        "--maps_dir", required=True, type=str, help="Folder holding the .npy anomaly maps."
     )
     ap.add_argument(
         "--png_dir",
         required=True,
         type=str,
-        help="Folder the CSV's Sample paths are under.",
+        help="Folder holding the PNG tiles, laid out like the CSV's Sample paths.",
     )
     ap.add_argument(
-        "--csv_path", required=True, type=str, help="samples_sorted_by_anomaly_score.csv"
+        "--csv_path", required=True, type=str, help="Path to samples_sorted_by_anomaly_score.csv."
     )
     ap.add_argument("--top", default=500, type=int, help="Most tiles to step through.")
     ap.add_argument(
         "--render_dir",
         default="viewer_renders",
         type=str,
-        help="Where renders are saved.",
+        help="Where the side-by-side renders go.",
     )
-    ap.add_argument("--render_dpi", default=150, type=int, help="DPI for saved renders.")
+    ap.add_argument("--render_dpi", default=150, type=int, help="DPI of the saved renders.")
     ap.add_argument("--no_maximize", default=False, action=argparse.BooleanOptionalAction)
     ap.add_argument(
         "--map_display",
         choices=["patchgrid", "upsampled"],
         default="patchgrid",
-        help="Show the raw patch grid, or blow it up to the tile size. Both stay blocky.",
+        help="patchgrid shows the raw .npy grid, and upsampled resizes it to the tile's size.",
     )
     args = ap.parse_args()
 
@@ -149,8 +158,8 @@ def main() -> int:
     samples = _read_sorted_samples(csv_path)
 
     print(f"Loaded {len(samples)} tiles from {csv_path}")
-    print("Press Enter for the next tile, or q then Enter to stop.")
-    print(f"Drawing with the {matplotlib.get_backend()} backend")
+    print("Press Enter for the next tile, or type q and Enter to stop.")
+    print(f"Matplotlib is using the {matplotlib.get_backend()} backend")
 
     plt.ion()
 
@@ -161,13 +170,13 @@ def main() -> int:
 
         png_path = png_dir / sample_rel
         if not png_path.exists():
-            print(f"Skipping {png_path}, as it doesn't exist")
+            print(f"[skip] There is no PNG at {png_path}")
             continue
 
         try:
             amap, amap_path = _load_npy_map_only(maps_dir, sample_rel)
         except Exception as e:
-            print(f"Skipping {sample_rel}. {e}")
+            print(f"[skip] Couldn't load the map for {sample_rel}. {e}")
             continue
 
         img = _load_png(png_path)
@@ -175,39 +184,41 @@ def main() -> int:
 
         amap = np.asarray(amap)
         print(
-            f"{amap_path} {amap.shape} from {amap.min():.4g} to {amap.max():.4g}"
+            f"Map {amap_path}, shape {amap.shape}, min {amap.min():.4g}, max {amap.max():.4g}"
         )
 
+        # Normalised for display only. The raw values are in the line printed above.
         amap_disp = _normalize01(amap)
 
         fig, axs = plt.subplots(1, 2, figsize=(16, 9))
-        fig.canvas.manager.set_window_title("JWSTDetector Viewer")
+        fig.canvas.manager.set_window_title("AnomalyDINO Viewer")
 
         axs[0].imshow(img)
-        axs[0].set_title("Tile")
+        axs[0].set_title("PNG")
         axs[0].axis("off")
 
         if args.map_display == "patchgrid":
-            # nearest keeps each patch a solid block rather than smearing it into the next.
+            # Nearest keeps each patch a hard-edged block when matplotlib scales it up.
             axs[1].imshow(amap_disp, cmap="magma", interpolation="nearest")
-            axs[1].set_title(f"Patch Distances {amap.shape}")
+            axs[1].set_title(f"NPY Patch Grid {amap.shape}")
         else:
+            # Still nearest, so the patches stay blocky at the tile's size.
             im = Image.fromarray((255.0 * amap_disp).astype(np.uint8)).resize(
                 (w, h), resample=Image.NEAREST
             )
             axs[1].imshow(np.asarray(im) / 255.0, cmap="magma", interpolation="nearest")
-            axs[1].set_title(f"Patch Distances at {w}x{h}")
+            axs[1].set_title(f"NPY Upsampled to {w}x{h}")
 
         axs[1].axis("off")
 
         slug = _slugify(sample_rel)
         out_render = render_dir / f"{rank:05d}_{slug}.png"
 
-        fig.suptitle(f"Rank {rank}, score {score:.6f}, {sample_rel}", fontsize=12)
+        fig.suptitle(f"Rank {rank}, Score {score:.6f}, {sample_rel}", fontsize=12)
         fig.text(
             0.01,
             0.01,
-            f"PNG: {png_path}\nNPY: {amap_path}\nNPY shape: {amap.shape}\nOUT: {out_render}",
+            f"PNG: {png_path}\nNPY: {amap_path}\nNPY shape: {amap.shape}\nRender: {out_render}",
             ha="left",
             va="bottom",
             fontsize=8,
@@ -216,9 +227,9 @@ def main() -> int:
 
         if not out_render.exists():
             fig.savefig(out_render, dpi=args.render_dpi)
-            print(f"Saved {out_render}")
+            print(f"[saved] {out_render}")
         else:
-            print(f"Kept the render already at {out_render}")
+            print(f"[skip] {out_render} is already there")
 
         plt.show(block=False)
         plt.pause(0.001)

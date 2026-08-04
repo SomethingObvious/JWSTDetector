@@ -1,65 +1,62 @@
-import cv2
-import matplotlib.pyplot as plt
+"""Turning patch distances into something you can look at."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, zoom
 
 
-def augment_image(img_ref, augmentation="rotate", angles=(0, 45, 90, 135, 180, 225, 270, 315)):
-    """Rotated copies of a tile. The 45-degree ones fill their corners with a reflection."""
-    imgs = []
-    if augmentation == "rotate":
-        for angle in angles:
-            imgs.append(rotate_image(img_ref, angle))
-    return imgs
+def dists2map(dists: np.ndarray, img_shape: tuple[int, int], sigma: float = 4.0) -> np.ndarray:
+    """The patch-distance grid scaled up to pixels and smoothed."""
+    h, w = img_shape[:2]
+    grid = np.asarray(dists, dtype=np.float32)
+    scaled = zoom(grid, (h / grid.shape[0], w / grid.shape[1]), order=1)
+    return gaussian_filter(scaled, sigma=sigma)
 
 
-def rotate_image(image, angle):
-    image_center = tuple(np.array(image.shape[1::-1]) / 2)
-    rot_mat = cv2.getRotationMatrix2D(image_center, angle, 1.0)
-    return cv2.warpAffine(
-        image, rot_mat, image.shape[1::-1], flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_DEFAULT
-    )
+def plot_reference_masks(backbone, paths: list[Path], root: Path, out_path: Path, limit: int = 8):
+    """Draw a few reference tiles beside their embedding PCA and background mask.
 
+    It's only worth it while tuning --masking, which otherwise stays invisible until
+    the scores start looking wrong.
+    """
+    import matplotlib
 
-def dists2map(dists, img_shape):
-    # cv2.resize takes (width, height), the reverse of NumPy's (height, width).
-    dists = cv2.resize(dists, (img_shape[1], img_shape[0]), interpolation=cv2.INTER_LINEAR)
-    return gaussian_filter(dists, sigma=4)
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
 
+    from src.backbones import background_mask, embedding_rgb
+    from src.data import TileDataset, relative_key
 
-def resize_mask_img(mask, image_shape, grid_size1):
-    mask = mask.reshape(grid_size1)
-    imgd1 = image_shape[0] // grid_size1[0]
-    imgd2 = image_shape[1] // grid_size1[1]
-    mask = np.repeat(mask, imgd1, axis=0)
-    return np.repeat(mask, imgd2, axis=1)
+    paths = paths[:limit]
+    dataset = TileDataset(paths, root, backbone.transform())
+    grid = backbone.grid_size
 
+    fig, axs = plt.subplots(len(paths), 3, figsize=(9, 3 * len(paths)), squeeze=False)
+    for row, path in enumerate(paths):
+        _, tensor = dataset[row]
+        feats = backbone.embed(tensor.unsqueeze(0))
+        mask = background_mask(feats, grid)[0].reshape(grid).cpu().numpy()
+        rgb = embedding_rgb(feats[0], grid).cpu().numpy()
 
-def plot_ref_images(img_list, mask_list, vis_background_list, grid_size, save_path, img_names=None):
-    k = min(len(img_list), 32)  # past 32 rows the figure gets too tall to read
+        with Image.open(path) as img:
+            tile = np.asarray(img.convert("RGB"))
 
-    n_aug = len(img_list) // len(img_names)
+        axs[row][0].imshow(tile)
+        axs[row][0].set_title(relative_key(path, root), fontsize=8)
+        axs[row][1].imshow(rgb)
+        axs[row][1].set_title("PCA of Patch Embeddings", fontsize=8)
+        scale = (tile.shape[0] / grid[0], tile.shape[1] / grid[1])
+        axs[row][2].imshow(tile)
+        axs[row][2].imshow(zoom(mask.astype(np.float32), scale, order=0), alpha=0.5)
+        axs[row][2].set_title("Background Mask", fontsize=8)
+        for ax in axs[row]:
+            ax.axis("off")
 
-    _fig, axs = plt.subplots(k, 3, figsize=(10, 3 * k + 1.0))
-    if k == 1:
-        axs = axs.reshape(1, -1)
-    for i in range(k):
-        axs[i, 0].imshow(img_list[i])
-        axs[i, 1].imshow(vis_background_list[i])
-        axs[i, 2].imshow(img_list[i])
-        axs[i, 2].imshow(resize_mask_img(mask_list[i], img_list[i].shape, grid_size), alpha=0.5)
-        axs[i, 0].axis("off")
-        axs[i, 1].axis("off")
-        axs[i, 2].axis("off")
-        if i % n_aug == 0:
-            axs[i, 0].title.set_text(f"{img_names[i // n_aug]}")
-        else:
-            axs[i, 0].title.set_text(f"Rotated Copy of {img_names[i // n_aug]}")
-        axs[i, 1].title.set_text("PCA of Patch Embeddings")
-        axs[i, 2].title.set_text("Background Mask")
-    plt.tight_layout()
-    if save_path is None:
-        plt.show()
-    else:
-        plt.savefig(save_path + "reference_samples.png")
-    plt.close()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)

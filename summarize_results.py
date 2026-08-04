@@ -9,18 +9,18 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:
-    raise SystemExit("PyYAML isn't installed. Run pip install pyyaml.") from None
+    raise SystemExit("summarize_results.py needs pyyaml. Install it with `pip install pyyaml`.") from None
 
 try:
     import pandas as pd
 except ImportError:
-    raise SystemExit("pandas isn't installed. Run pip install pandas.") from None
+    raise SystemExit("summarize_results.py needs pandas. Install it with `pip install pandas`.") from None
 
 logger = logging.getLogger("summarize_results")
 
 
 def flatten_json(obj, prefix=""):
-    """Nested dicts flattened to one level with dotted keys, and lists kept as JSON."""
+    """Nested dicts as one flat dict with dotted keys, and lists as JSON text."""
     out = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -54,7 +54,7 @@ def read_csv(path: Path) -> pd.DataFrame:
 
 
 def find_run_dirs(results_root: Path):
-    # A run is any folder holding an args.yaml.
+    # Both runners write an args.yaml, so any folder holding one is a run.
     return sorted({p.parent for p in results_root.rglob("args.yaml")})
 
 
@@ -79,15 +79,16 @@ def pick_metrics_files(run_dir: Path):
 def normalize_measurements_df(df: pd.DataFrame, src_path: Path) -> pd.DataFrame:
     """A measurements CSV in the summary's column layout.
 
-    It takes the runners' Sample, AnomalyScore, MemoryBankTimeSec, InferenceTimeSec
-    layout as well as AnomalyDINO's, which has an Object column and no Sec suffixes.
+    It takes the older layout with an Object column and times in MemoryBankTime and
+    InferenceTime, or the one both runners write, which has no Object column and
+    puts the times in MemoryBankTimeSec and InferenceTimeSec.
     """
     cols = {c.lower(): c for c in df.columns}
 
     def has(col):
         return col.lower() in cols
 
-    # AnomalyDINO's layout
+    # The older layout, with an Object column.
     if has("object") and has("sample") and has("anomalyscore"):
         out = df.rename(
             columns={
@@ -104,7 +105,6 @@ def normalize_measurements_df(df: pd.DataFrame, src_path: Path) -> pd.DataFrame:
             out["InferenceTime"] = None
         return out
 
-    # The runners' layout
     if has("sample") and has("anomalyscore"):
         out = df.rename(
             columns={
@@ -126,11 +126,11 @@ def normalize_measurements_df(df: pd.DataFrame, src_path: Path) -> pd.DataFrame:
         else:
             out["InferenceTime"] = None
 
-        # The runners write no Object column, and the per-object summary needs one.
+        # The grouping below needs an Object, and every row here is a query tile.
         out["Object"] = "query"
         return out[["Object", "Sample", "AnomalyScore", "MemoryBankTime", "InferenceTime"]]
 
-    raise SystemExit(f"{src_path} needs Sample and AnomalyScore columns, not {list(df.columns)}")
+    raise SystemExit(f"{src_path} needs Sample and AnomalyScore columns, and it has {list(df.columns)}")
 
 
 def main():
@@ -160,6 +160,7 @@ def main():
     if not results_root.exists():
         raise SystemExit(f"There is no results folder at {results_root}")
 
+    # A subfolder per results folder, so summaries of different runs don't overwrite each other.
     outdir = Path(args.outdir) / results_root.name
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -178,6 +179,7 @@ def main():
         meas_files = pick_measurement_files(run_dir)
         metrics_files = pick_metrics_files(run_dir)
 
+        # Metrics with no seed in the name are filed under None.
         metrics_by_seed = {}
         for mf in metrics_files:
             seed = parse_seed_from_anywhere(mf.name)
@@ -188,7 +190,7 @@ def main():
 
         for meas_path in meas_files:
             seed = parse_seed_from_anywhere(meas_path.name)
-            # The bootstrap runner's file names carry no seed, but its args.yaml does.
+            # measurements_final.csv has no seed in its name, so it takes the one in args.yaml.
             if seed is None and isinstance(args_yaml, dict):
                 seed = args_yaml.get("seed", None)
 
@@ -273,7 +275,6 @@ def main():
     objs_df.to_csv(objs_path, index=False)
     samples_df.to_csv(samples_path, index=False)
 
-    # viewer.py reads this one.
     if len(samples_df) > 0 and "AnomalyScore" in samples_df.columns:
         tmp = samples_df.copy()
         tmp["AnomalyScore"] = pd.to_numeric(tmp["AnomalyScore"], errors="coerce")
@@ -283,7 +284,7 @@ def main():
         pd.DataFrame().to_csv(samples_sorted_path, index=False)
 
     logger.info(
-        "Wrote %s, %s, %s and %s", runs_path, objs_path, samples_path, samples_sorted_path
+        "Wrote\n %s\n %s\n %s\n %s", runs_path, objs_path, samples_path, samples_sorted_path
     )
 
 

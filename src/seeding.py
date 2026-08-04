@@ -23,7 +23,7 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     try:
         import torch
     except ImportError:
-        logger.debug("torch isn't installed, so only random and NumPy are seeded")
+        logger.debug("torch isn't installed, so only random and NumPy were seeded")
         return
 
     torch.manual_seed(seed)
@@ -35,17 +35,17 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
 
 
 def _self_test() -> None:
-    """The same seed has to give the same draws, and a different one different draws."""
+    """The same seed has to give the same draws, with no test framework needed."""
     set_seed(123)
     a = np.random.rand(4).tolist()
     set_seed(123)
     b = np.random.rand(4).tolist()
-    assert a == b, "set_seed(123) gave different NumPy draws the second time"
+    assert a == b, "Seed 123 gave different NumPy draws the second time"
 
     set_seed(456)
     c = np.random.rand(4).tolist()
-    assert c != a, "set_seed(456) gave the same draws as set_seed(123)"
-    print("set_seed ok")
+    assert c != a, "Seeds 123 and 456 gave the same NumPy draws"
+    print("The seeding self-test passed")
 
 
 if __name__ == "__main__":
