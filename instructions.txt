@@ -3,10 +3,6 @@ source .venv/bin/activate
 find . -name "*:Zone.Identifier" -type f -delete
 
 
-# ---------------------------------------------------------------------------
-# 1. Tiles
-# ---------------------------------------------------------------------------
-
 # Lots of mosaics, so smaller tiles and a tighter coverage cut.
 python prep_data.py \
   --sensor miri \
@@ -40,11 +36,6 @@ python prep_data.py \
 # This shows what the thresholds would keep without writing anything.
 python prep_data.py --sensor miri --indir rawfits --out datasets/miri \
   --pattern "*sci.fits" --tile_size 672 --stride 644 --min_wht_frac 0.5 --dry-run --limit 2
-
-
-# ---------------------------------------------------------------------------
-# 2. Scoring
-# ---------------------------------------------------------------------------
 
 # A few mosaics, with ViT-L at 672 px and every rotation and flip of the reference tiles.
 python run_query_bootstrap.py \
@@ -103,11 +94,7 @@ python run_query_bootstrap.py \
 # Add --score_mode peak_minus_median when hunting for one small oddity rather than
 # a tile that is strange all over.
 
-
-# ---------------------------------------------------------------------------
-# 3. Look at the Results
-# ---------------------------------------------------------------------------
-
+# Then summarise the run and step through the top of the ranking.
 python summarize_results.py \
   --results_root results_query_only_miri_672_big \
   --outdir results_summary
