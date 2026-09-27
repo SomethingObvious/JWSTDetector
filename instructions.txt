@@ -3,11 +3,7 @@ source .venv/bin/activate
 find . -name "*:Zone.Identifier" -type f -delete
 
 
-# ---------------------------------------------------------------------------
-# 1. Tiles
-# ---------------------------------------------------------------------------
-
-# Big data: smaller tiles, tighter coverage cut.
+# Lots of mosaics, so smaller tiles and a tighter coverage cut.
 python prep_data.py \
   --sensor miri \
   --indir rawfits \
@@ -22,7 +18,7 @@ python prep_data.py \
   --stretch_scope mosaic \
   --wcs_in_name
 
-# Small data.
+# Just a few mosaics.
 python prep_data.py \
   --sensor miri \
   --indir rawfits \
@@ -37,16 +33,11 @@ python prep_data.py \
   --stretch_scope mosaic \
   --wcs_in_name
 
-# Check what the thresholds would keep before writing anything.
+# This shows what the thresholds would keep without writing anything.
 python prep_data.py --sensor miri --indir rawfits --out datasets/miri \
   --pattern "*sci.fits" --tile_size 672 --stride 644 --min_wht_frac 0.5 --dry-run --limit 2
 
-
-# ---------------------------------------------------------------------------
-# 2. Scoring
-# ---------------------------------------------------------------------------
-
-# Small data: ViT-L at 672, eight-fold augmented reference set.
+# A few mosaics, with ViT-L at 672 px and every rotation and flip of the reference tiles.
 python run_query_bootstrap.py \
   --data_root datasets/miri \
   --query_subdir query \
@@ -74,7 +65,7 @@ python run_query_bootstrap.py \
   --out_dir results_query_only \
   --tag miri_672_big
 
-# Big data: ViT-S at 448, larger reference set, no augmentation.
+# Lots of mosaics, with ViT-S at 448 px and a bigger reference but no augmentation.
 python run_query_bootstrap.py \
   --data_root datasets/miri \
   --query_subdir query \
@@ -100,14 +91,10 @@ python run_query_bootstrap.py \
   --out_dir results_query_only \
   --tag miri_jwst_448_maxq
 
-# Hunting a small bright oddity rather than a generally strange tile:
-#   --score_mode peak_minus_median
+# Add --score_mode peak_minus_median when hunting for one small oddity rather than
+# a tile that is strange all over.
 
-
-# ---------------------------------------------------------------------------
-# 3. Look at the results
-# ---------------------------------------------------------------------------
-
+# Then summarise the run and step through the top of the ranking.
 python summarize_results.py \
   --results_root results_query_only_miri_672_big \
   --outdir results_summary
