@@ -1,4 +1,4 @@
-"""Tile listing, loading and result IO. Shared by both runners."""
+"""Tile listing, loading and result files, shared by both runners."""
 
 from __future__ import annotations
 
@@ -13,25 +13,25 @@ IMG_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
 
 def list_images(root: Path, recursive: bool = True) -> list[Path]:
-    """Every image under `root`, sorted so a run is reproducible."""
+    """Every image under `root`, sorted so a run can be repeated."""
     root = Path(root)
     if not root.is_dir():
-        raise RuntimeError(f"Folder does not exist: {root}")
+        raise FileNotFoundError(f"There is no folder at {root}")
 
     walk = root.rglob("*") if recursive else root.iterdir()
     paths = sorted(p for p in walk if p.is_file() and p.suffix.lower() in IMG_EXTS)
     if not paths:
-        raise RuntimeError(f"No images found under {root} (recursive={recursive})")
+        raise FileNotFoundError(f"There are no images under {root} (recursive={recursive})")
     return paths
 
 
 def relative_key(path: Path, root: Path) -> str:
-    """Stable, platform-independent identifier for a tile."""
+    """The tile's path under `root` with forward slashes, which names it in every output."""
     return path.relative_to(root).as_posix()
 
 
 class TileDataset(Dataset):
-    """Reads tiles off disk and applies the backbone transform, in worker processes."""
+    """Tiles read off disk and transformed, in the DataLoader's worker processes."""
 
     def __init__(self, paths: list[Path], root: Path, transform):
         self.paths = paths
@@ -63,9 +63,6 @@ def tile_loader(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        # Workers are only worth their startup cost if they are reused.
-        persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
     )
 
 
@@ -91,7 +88,7 @@ def write_ref_list(path: Path, root: Path, paths: list[Path]) -> None:
 
 
 def resolve_device(spec: str) -> torch.device:
-    """Turn a --device string into a real device, failing early if it is not there."""
+    """The device a --device value names, failing early when it isn't there."""
     if spec == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -101,7 +98,7 @@ def resolve_device(spec: str) -> torch.device:
 
     device = torch.device(spec)
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(f"--device {spec} but no CUDA device is visible to torch")
+        raise RuntimeError(f"--device {spec} asks for CUDA, but torch can't see a CUDA device")
     if device.type == "mps" and not torch.backends.mps.is_available():
-        raise RuntimeError(f"--device {spec} but MPS is not available")
+        raise RuntimeError(f"--device {spec} asks for MPS, but it isn't available here")
     return device

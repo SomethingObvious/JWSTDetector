@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Classic AnomalyDINO scoring: an explicit train/ reference folder and a test/ folder to score.
+"""AnomalyDINO scoring with a train/ folder of tiles known to be normal and a test/ folder to score.
 
-Use this when you already know which tiles are normal. If you do not, which is the
-usual case for JWST, use run_query_bootstrap.py instead.
+Use this when you already know which tiles are normal. When you don't, which is the
+usual case for JWST, use run_query_bootstrap.py.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    p.add_argument("--data_root", required=True, help="Root holding train/ and test/.")
+    p.add_argument("--data_root", required=True, help="Folder holding train/ and test/.")
     p.add_argument("--model_name", default="dinov3-vitl16-pretrain-sat493m")
     p.add_argument("--resolution", type=int, default=448)
     p.add_argument("--batch_size", type=int, default=8)
@@ -48,7 +48,7 @@ def parse_args(argv: list[str] | None = None):
         nargs="+",
         type=int,
         default=[1],
-        help="Reference tiles to draw from train/. -1 uses all of them.",
+        help="How many reference tiles to draw from train/, or -1 for all of them.",
     )
     p.add_argument("--num_seeds", type=int, default=1)
     p.add_argument("--just_seed", type=int, default=None)
@@ -62,7 +62,7 @@ def parse_args(argv: list[str] | None = None):
 
     p.add_argument("--device", default="auto")
     p.add_argument("--deterministic", default=False, action=argparse.BooleanOptionalAction)
-    p.add_argument("--results_dir", default=None, help="Overrides the results_single/ path.")
+    p.add_argument("--results_dir", default=None, help="Write here instead of results_single/.")
     p.add_argument("--tag", default=None)
     p.add_argument("--recursive_ref", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--recursive_query", default=True, action=argparse.BooleanOptionalAction)
@@ -77,12 +77,14 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # huggingface_hub logs every HTTP request it makes at INFO.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     data_root = Path(args.data_root).resolve()
     train_dir, test_dir = data_root / "train", data_root / "test"
     for d in (train_dir, test_dir):
         if not d.is_dir():
-            raise SystemExit(f"Missing directory: {d}")
+            raise SystemExit(f"There is no folder at {d}")
 
     backbone = get_backbone(
         args.model_name,
@@ -96,17 +98,19 @@ def main(argv: list[str] | None = None) -> int:
     seeds = [args.just_seed] if args.just_seed is not None else list(range(args.num_seeds))
 
     for shot in args.shots:
-        base = (
-            Path(args.results_dir)
-            if args.results_dir
-            else Path(f"results_single/{args.model_name}_{backbone.resolution}/{shot}-shot")
-        )
+        if not args.results_dir:
+            base = Path(f"results_single/{args.model_name}_{backbone.resolution}/{shot}-shot")
+        elif len(args.shots) > 1:
+            # Otherwise each shot count would overwrite the one before it.
+            base = Path(args.results_dir) / f"{shot}-shot"
+        else:
+            base = Path(args.results_dir)
         results_dir = Path(f"{base}_{args.tag}" if args.tag else base)
         results_dir.mkdir(parents=True, exist_ok=True)
         (results_dir / "args.yaml").write_text(yaml.safe_dump(vars(args)), encoding="utf-8")
 
         for seed in seeds:
-            logger.info("shot=%s seed=%s", shot, seed)
+            logger.info("Running %d-shot with seed %d", shot, seed)
             set_seed(seed, deterministic=args.deterministic)
 
             if shot == -1:
@@ -151,13 +155,10 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             write_measurements_csv(run_dir / "measurements.csv", scores, memorybank_sec, seconds)
-            # summarize_results.py picks runs up by seed-tagged filename.
+            # summarize_results.py finds per-seed runs by this file name.
             write_measurements_csv(
                 results_dir / f"measurements_seed={seed}.csv", scores, memorybank_sec, seconds
             )
-            logger.info("wrote %s", run_dir)
-
-    logger.info("done")
     return 0
 
 

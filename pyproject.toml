@@ -1,6 +1,6 @@
 [project]
 name = "jwstdetector"
-version = "0.2.0"
+version = "0.3.0"
 description = "Unsupervised anomaly detection on JWST imagery with DINO patch embeddings"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,10 +8,10 @@ requires-python = ">=3.11"
 dependencies = [
   "numpy",
   "torch",
-  "torchvision",
-  "transformers",     # DINOv3 backbones
+  "transformers>=4.56",  # the first release with DINOv3
+  "huggingface_hub",
   "astropy",
-  "Pillow",
+  "Pillow>=9.1",
   "scipy",
   "tifffile",
   "pandas",
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# viewer.py opens a desktop window; nothing else needs a GUI toolkit.
+# viewer.py opens a Qt window when PyQt6 is there, and a Tk one otherwise.
 viewer = ["PyQt6"]
 
 [build-system]
@@ -30,7 +30,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["src"]
-py-modules = ["prep_data", "run_query_bootstrap", "run_anomalydino", "summarize_results", "viewer"]
+py-modules = [
+  "prep_data",
+  "run_query_bootstrap",
+  "run_anomalydino",
+  "summarize_results",
+  "unzipper",
+  "viewer",
+]
 
 [tool.ruff]
 line-length = 100

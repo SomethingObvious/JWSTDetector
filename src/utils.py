@@ -1,4 +1,4 @@
-"""Small helpers for turning patch distances into something you can look at."""
+"""Turning patch distances into something you can look at."""
 
 from __future__ import annotations
 
@@ -8,19 +8,25 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, zoom
 
 
+def _to_pixels(grid: np.ndarray, shape: tuple[int, int], order: int) -> np.ndarray:
+    # grid_mode lines each patch up with the pixels it covers. Without it scipy pins
+    # the first and last patch centres to the image corners, which is up to half a
+    # patch off at the edges.
+    factors = (shape[0] / grid.shape[0], shape[1] / grid.shape[1])
+    return zoom(grid, factors, order=order, grid_mode=True, mode="nearest")
+
+
 def dists2map(dists: np.ndarray, img_shape: tuple[int, int], sigma: float = 4.0) -> np.ndarray:
-    """Blow the patch-distance grid up to pixel space and smooth it."""
-    h, w = img_shape[:2]
+    """The patch-distance grid scaled up to pixels and smoothed."""
     grid = np.asarray(dists, dtype=np.float32)
-    scaled = zoom(grid, (h / grid.shape[0], w / grid.shape[1]), order=1)
-    return gaussian_filter(scaled, sigma=sigma)
+    return gaussian_filter(_to_pixels(grid, img_shape[:2], order=1), sigma=sigma)
 
 
 def plot_reference_masks(backbone, paths: list[Path], root: Path, out_path: Path, limit: int = 8):
-    """Render a few reference tiles beside their PCA embedding and background mask.
+    """Draw a few reference tiles beside their embedding PCA and background mask.
 
-    Only worth running when you are tuning --masking, which is otherwise invisible
-    until you notice the scores looking wrong.
+    It's only worth it while tuning --masking, which otherwise stays invisible until
+    the scores start looking wrong.
     """
     import matplotlib
 
@@ -48,11 +54,10 @@ def plot_reference_masks(backbone, paths: list[Path], root: Path, out_path: Path
         axs[row][0].imshow(tile)
         axs[row][0].set_title(relative_key(path, root), fontsize=8)
         axs[row][1].imshow(rgb)
-        axs[row][1].set_title("PCA of patch embeddings", fontsize=8)
-        scale = (tile.shape[0] / grid[0], tile.shape[1] / grid[1])
+        axs[row][1].set_title("PCA of Patch Embeddings", fontsize=8)
         axs[row][2].imshow(tile)
-        axs[row][2].imshow(zoom(mask.astype(np.float32), scale, order=0), alpha=0.5)
-        axs[row][2].set_title("background mask", fontsize=8)
+        axs[row][2].imshow(_to_pixels(mask.astype(np.float32), tile.shape[:2], order=0), alpha=0.5)
+        axs[row][2].set_title("Background Mask", fontsize=8)
         for ax in axs[row]:
             ax.axis("off")
 

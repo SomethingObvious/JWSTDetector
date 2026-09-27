@@ -1,8 +1,9 @@
-"""Decompress gzipped FITS mosaics in a directory (COSMOS-Web WHT files ship as .gz).
+"""Expands every .gz in a folder and deletes the archive, for the COSMOS-Web weight maps.
 
-Each ``<name>.gz`` is expanded to ``<name>`` and the ``.gz`` is removed.
+astropy can read a .fits.gz directly, but it can't memmap one, so a big mosaic would
+have to fit in RAM.
 
-Usage: python unzipper.py [directory]   (defaults to the current directory)
+Usage: python unzipper.py [folder]
 """
 
 from __future__ import annotations
@@ -19,10 +20,10 @@ logger = logging.getLogger("unzipper")
 
 
 def decompress_dir(base_dir: Path) -> int:
-    """Expand every ``*.gz`` in ``base_dir`` in place, removing the archive. Returns the count."""
+    """Expand each x.gz in `base_dir` to x, delete x.gz, and return how many there were."""
     gz_paths = sorted(base_dir.glob("*.gz"))
     for gz_path in tqdm(gz_paths, desc="Decompressing", unit="file"):
-        out_path = gz_path.with_suffix("")  # drop the .gz extension
+        out_path = gz_path.with_suffix("")
         with gzip.open(gz_path, "rb") as f_in, out_path.open("wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
         gz_path.unlink()
@@ -31,10 +32,10 @@ def decompress_dir(base_dir: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="Decompress every *.gz in a directory (removes the .gz afterwards)."
+        description="Expand every .gz in a folder and delete the .gz afterwards."
     )
     p.add_argument(
-        "directory", nargs="?", default=".", help="Directory to scan (default: current)."
+        "directory", nargs="?", default=".", help="Folder to expand, the current one by default."
     )
     p.add_argument("--verbose", action="store_true", help="Debug-level logging.")
     args = p.parse_args(argv)
@@ -43,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     n = decompress_dir(Path(args.directory))
-    logger.info("Decompressed %d file(s) in %s", n, args.directory)
+    logger.info("Expanded %d files in %s", n, args.directory)
     return 0
 
 

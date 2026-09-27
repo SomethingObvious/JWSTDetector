@@ -1,6 +1,6 @@
 """Turning one tile's patch distances into one anomaly score.
 
-Kept free of torch so the scoring rule can be checked on any machine.
+This stays free of torch so the scoring rules can be checked on any machine.
 """
 
 from __future__ import annotations
@@ -20,14 +20,13 @@ def aggregate_score(
 ) -> float:
     """Collapse the patch distances of one tile into a single anomaly score.
 
-    top1p             mean of the top 1% of patches. The AnomalyDINO default and a
-                      good all-rounder.
-    topk_mean         same idea with top_frac under your control.
-    max               single worst patch. Most sensitive to a small needle, noisiest.
-    quantile          a high quantile. Needle-sensitive but steadier than max.
-    peak_minus_median peak above the tile's own background, so a uniformly odd tile
-                      does not outrank a normal tile with one strange object in it.
-    peak_z            same idea normalised by the spread of the tile.
+    top1p              mean of the top 1% of patches, the AnomalyDINO default
+    topk_mean          the same with top_frac as the fraction
+    max                the single worst patch, most sensitive to a small needle and noisiest
+    quantile           a high quantile, nearly as sensitive as max but steadier
+    peak_minus_median  how far the worst patch stands above the tile's own median, so a
+                       tile that is odd all over doesn't outrank one strange object
+    peak_z             the same peak in standard deviations of the tile
     """
     d = np.asarray(dists, dtype=np.float32).reshape(-1)
     d = d[np.isfinite(d)]
@@ -49,4 +48,4 @@ def aggregate_score(
     if mode == "peak_z":
         return float((np.max(d) - np.mean(d)) / (np.std(d) + eps))
 
-    raise ValueError(f"Unknown score_mode={mode!r}, expected one of {SCORE_MODES}")
+    raise ValueError(f"Unknown score_mode {mode!r}, expected one of {SCORE_MODES}")

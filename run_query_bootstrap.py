@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Label-free anomaly scoring for JWST tiles.
 
-Pass 1 draws a random reference subset from the query set and scores everything
-against it. Pass 2 rebuilds the reference from the lowest-scoring tiles, the ones
-pass 1 judged most ordinary, and scores again. Nothing here needs labels, which is
-the point: JWST tiles do not come with any.
+Pass 1 draws a random reference set from the query tiles and scores every tile
+against it. Pass 2 rebuilds the reference from the tiles pass 1 found most ordinary
+and scores again. A tile that is in the reference is scored against the other
+reference tiles, never its own patches.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ logger = logging.getLogger("run_query_bootstrap")
 
 
 def subset_size(n: int, frac: float, minimum: int, maximum: int | None) -> int:
-    """How many tiles to keep: a fraction of the set, clamped both ways."""
+    """How many tiles to keep, a fraction of `n` clamped to [minimum, maximum] and to n."""
     k = max(minimum, round(n * frac))
     if maximum is not None:
         k = min(k, maximum)
@@ -45,23 +45,25 @@ def parse_args(argv: list[str] | None = None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    p.add_argument("--data_root", required=True, help="Folder containing the query/ subdirectory.")
+    p.add_argument("--data_root", required=True, help="Folder holding the query folder.")
     p.add_argument("--query_subdir", default="query")
     p.add_argument("--recursive_query", default=True, action=argparse.BooleanOptionalAction)
 
     p.add_argument(
         "--model_name",
         default="dinov3-vitl16-pretrain-sat493m",
-        help="dinov3-* (transformers, gated weights) or dinov2_* (torch.hub).",
+        help="A dinov3-* name (gated), a dinov2_* name, or a Hugging Face repo id.",
     )
-    p.add_argument("--resolution", type=int, default=448, help="Snapped down to a patch multiple.")
+    p.add_argument(
+        "--resolution", type=int, default=448, help="Rounded down to a multiple of the patch size."
+    )
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--num_workers", type=int, default=4, help="Tile decoding workers.")
+    p.add_argument("--num_workers", type=int, default=4, help="Processes decoding the PNGs.")
     p.add_argument(
         "--autocast",
         default=True,
         action=argparse.BooleanOptionalAction,
-        help="Run the backbone in bf16/fp16 on CUDA. Distances stay in fp32.",
+        help="Run the backbone in bf16 or fp16 on CUDA. Distances stay in fp32.",
     )
 
     p.add_argument("--knn_metric", default="L2_normalized", choices=METRICS)
@@ -70,12 +72,12 @@ def parse_args(argv: list[str] | None = None):
         "--max_bank_patches",
         type=int,
         default=1_000_000,
-        help="Cap on memory-bank patches. ~4 GB of fp32 at 1024 dims.",
+        help="Most patches the memory bank holds, about 4 GB of fp32 at 1024 dims.",
     )
 
     p.add_argument("--score_mode", default="top1p", choices=SCORE_MODES)
-    p.add_argument("--score_top_frac", type=float, default=0.01, help="For --score_mode topk_mean.")
-    p.add_argument("--score_quantile", type=float, default=0.9995, help="For score_mode quantile.")
+    p.add_argument("--score_top_frac", type=float, default=0.01, help="For topk_mean.")
+    p.add_argument("--score_quantile", type=float, default=0.9995, help="For quantile.")
 
     p.add_argument("--masking", default=False, action=argparse.BooleanOptionalAction)
     p.add_argument("--mask_ref_images", default=False, action=argparse.BooleanOptionalAction)
@@ -89,18 +91,18 @@ def parse_args(argv: list[str] | None = None):
         "--save_examples",
         default=False,
         action=argparse.BooleanOptionalAction,
-        help="Render a few reference tiles with their background masks.",
+        help="Draw a few reference tiles with their background masks.",
     )
     p.add_argument("--save_patch_dists", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--save_tiffs", default=False, action=argparse.BooleanOptionalAction)
 
-    p.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:1, mps.")
+    p.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:1 or mps.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--deterministic",
         default=False,
         action=argparse.BooleanOptionalAction,
-        help="Force cuDNN deterministic mode. Slower, so off by default.",
+        help="Put cuDNN in deterministic mode, which is slower.",
     )
 
     p.add_argument("--init_ref_frac", type=float, default=0.1)
@@ -112,7 +114,7 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--bootstrap_keep_max", type=int, default=5000)
 
     p.add_argument("--out_dir", default="results_query_only")
-    p.add_argument("--tag", default=None)
+    p.add_argument("--tag", default=None, help="Appended to --out_dir after an underscore.")
     p.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     return p.parse_args(argv)
@@ -124,11 +126,13 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # huggingface_hub logs every HTTP request it makes at INFO.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     set_seed(args.seed, deterministic=args.deterministic)
 
     query_dir = Path(args.data_root).resolve() / args.query_subdir
     if not query_dir.is_dir():
-        raise SystemExit(f"Missing query folder: {query_dir}")
+        raise SystemExit(f"There is no query folder at {query_dir}")
 
     out_dir = Path(f"{args.out_dir}_{args.tag}" if args.tag else args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     query_paths = list_images(query_dir, recursive=args.recursive_query)
-    logger.info("%d query tiles under %s", len(query_paths), query_dir)
+    logger.info("Found %d query tiles under %s", len(query_paths), query_dir)
     rng = np.random.default_rng(args.seed)
 
     def detect(ref_paths: list[Path], pass_dir: Path):
@@ -173,11 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         write_measurements_csv(pass_dir / "measurements.csv", scores, memorybank_sec, seconds)
         return scores
 
-    # Pass 1: a random slice of the query set stands in for "normal".
     n = len(query_paths)
     k1 = subset_size(n, args.init_ref_frac, args.init_ref_min, args.init_ref_max)
     ref1 = [query_paths[i] for i in sorted(rng.choice(n, size=k1, replace=False).tolist())]
-    logger.info("pass 1: %d random reference tiles of %d", k1, n)
+    logger.info("Pass 1 uses %d random tiles of %d as the reference", k1, n)
 
     if args.save_examples:
         from src.utils import plot_reference_masks
@@ -186,19 +189,18 @@ def main(argv: list[str] | None = None) -> int:
 
     scores1 = detect(ref1, out_dir / "pass1")
 
-    # Pass 2: rebuild the reference from whatever pass 1 called most ordinary.
     by_score = sorted(scores1, key=scores1.__getitem__)
     k2 = subset_size(
         len(by_score), args.bootstrap_keep_frac, args.bootstrap_keep_min, args.bootstrap_keep_max
     )
     lookup = {relative_key(p, query_dir): p for p in query_paths}
     ref2 = [lookup[key] for key in by_score[:k2]]
-    logger.info("pass 2: %d lowest-scoring tiles as the reference", len(ref2))
+    logger.info("Pass 2 uses the %d lowest-scoring tiles as the reference", len(ref2))
 
     detect(ref2, out_dir / "pass2")
 
     shutil.copyfile(out_dir / "pass2/measurements.csv", out_dir / "measurements_final.csv")
-    logger.info("done: %s", out_dir / "measurements_final.csv")
+    logger.info("Final scores are in %s", out_dir / "measurements_final.csv")
     return 0
 
 
