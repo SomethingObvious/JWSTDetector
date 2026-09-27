@@ -14,11 +14,11 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from src.backbones import get_backbone
-from src.data import list_images, resolve_device, write_measurements_csv, write_ref_list
-from src.detection import METRICS, run_anomaly_detection
-from src.scoring import SCORE_MODES
-from src.seeding import set_seed
+from jwstdetector.backbones import get_backbone
+from jwstdetector.data import list_images, resolve_device, write_measurements_csv, write_ref_list
+from jwstdetector.detection import METRICS, run_anomaly_detection
+from jwstdetector.scoring import SCORE_MODES
+from jwstdetector.seeding import set_seed
 
 logger = logging.getLogger("run_anomalydino")
 
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             write_ref_list(run_dir / "ref_list.txt", train_dir, ref_paths)
 
             if args.save_examples:
-                from src.utils import plot_reference_masks
+                from jwstdetector.utils import plot_reference_masks
 
                 plot_reference_masks(
                     backbone, ref_paths, train_dir, run_dir / "reference_samples.png"

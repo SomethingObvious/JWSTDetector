@@ -18,9 +18,9 @@ import torch
 from torch.nn import functional as tnf
 from tqdm import tqdm
 
-from src.backbones import Backbone, background_mask
-from src.data import tile_loader
-from src.scoring import aggregate_score
+from jwstdetector.backbones import Backbone, background_mask
+from jwstdetector.data import tile_loader
+from jwstdetector.scoring import aggregate_score
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ def score_queries(
     if save_tiffs:
         import tifffile
 
-        from src.utils import dists2map
+        from jwstdetector.utils import dists2map
 
     loader = tile_loader(
         query_paths,

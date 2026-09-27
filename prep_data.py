@@ -317,8 +317,8 @@ class MiriSensor(Sensor):
                 wht_path = self.sci_to_wht_path(sci_path)
                 if not Path(wht_path).is_file():
                     raise FileNotFoundError(
-                        f"--min_wht_frac needs a weight map for {sci_path}, "
-                        f"and {wht_path} isn't there"
+                        f"--min_wht_frac needs a weight map for {sci_path}, and {wht_path} "
+                        "isn't there. Pass --min_wht_frac 0 to tile it without one."
                     )
             yield MosaicSpec(tile_id=tile_id, sci_path=sci_path, wht_path=wht_path)
 
@@ -461,8 +461,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--minwhtfrac",
         dest="min_wht_frac",
         type=float,
-        default=0.0,
-        help="Drop tiles where less than this fraction of pixels has a positive weight.",
+        default=1.0,
+        help="Drop tiles where less than this fraction of pixels has a positive weight. "
+        "Below 1, tiles on the edge of the coverage get in and rank near the top.",
     )
     p.add_argument(
         "--source_sigma",

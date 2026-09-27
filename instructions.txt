@@ -3,7 +3,7 @@ source .venv/bin/activate
 find . -name "*:Zone.Identifier" -type f -delete
 
 
-# Lots of mosaics, so smaller tiles and a tighter coverage cut.
+# Lots of mosaics, so smaller tiles.
 python prep_data.py \
   --sensor miri \
   --indir rawfits \
@@ -12,7 +12,7 @@ python prep_data.py \
   --sci_ext SCI \
   --wht_ext WHT \
   --tile_size 448 --upscale 1 --stride 420 \
-  --min_wht_frac 0.80 \
+  --min_wht_frac 1 \
   --source_sigma 5 --min_source_frac 2e-4 \
   --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
   --stretch_scope mosaic \
@@ -27,7 +27,7 @@ python prep_data.py \
   --sci_ext SCI \
   --wht_ext WHT \
   --tile_size 672 --upscale 1 --stride 644 \
-  --min_wht_frac 0.5 \
+  --min_wht_frac 1 \
   --source_sigma 5 --min_source_frac 2e-4 \
   --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
   --stretch_scope mosaic \
@@ -35,7 +35,7 @@ python prep_data.py \
 
 # This shows what the thresholds would keep without writing anything.
 python prep_data.py --sensor miri --indir rawfits --out datasets/miri \
-  --pattern "*sci.fits" --tile_size 672 --stride 644 --min_wht_frac 0.5 --dry-run --limit 2
+  --pattern "*sci.fits" --tile_size 672 --stride 644 --dry-run --limit 2
 
 # A few mosaics, with ViT-L at 672 px and every rotation and flip of the reference tiles.
 python run_query_bootstrap.py \

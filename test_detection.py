@@ -13,9 +13,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-import src.detection as detection
-from src.backbones import Backbone, hub_repo
-from src.detection import MemoryBank, build_memory_bank, dihedral, run_anomaly_detection
+import jwstdetector.detection as detection
+from jwstdetector.backbones import Backbone, hub_repo
+from jwstdetector.detection import MemoryBank, build_memory_bank, dihedral, run_anomaly_detection
 
 PATCH, RESOLUTION, DIM = 16, 128, 32
 GRID = RESOLUTION // PATCH
