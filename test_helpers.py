@@ -20,6 +20,8 @@ from astropy.wcs import WCS
 from PIL import Image
 
 import prep_data
+from jwstdetector.scoring import SCORE_MODES, aggregate_score
+from jwstdetector.seeding import set_seed
 from prep_data import (
     MiriSensor,
     MosaicStats,
@@ -32,8 +34,6 @@ from prep_data import (
     measure_mosaic,
     tile_starts,
 )
-from src.scoring import SCORE_MODES, aggregate_score
-from src.seeding import set_seed
 
 SKY, NOISE = 0.0, 1.0
 
@@ -253,6 +253,13 @@ def test_wht_gate() -> None:
     half = no_coverage.copy()
     half[:, :100] = 1.0
     assert _cut(_sky_with_sources(200, 200), args, wht=half)[1:] == (2, 0, 2)
+
+    # On the SMACS 0723 MIRI mosaic a tile missing half a percent of its pixels still
+    # ranked second, so by default a notch of 1% has to cost the tile.
+    args.min_wht_frac = prep_data.parse_args(["--indir", "x"]).min_wht_frac
+    notched = np.ones((200, 200), np.float32)
+    notched[:10, :10] = 0.0
+    assert _cut(_sky_with_sources(200, 200), args, wht=notched)[1:] == (3, 0, 1)
 
 
 # --- FITS handling -----------------------------------------------------------

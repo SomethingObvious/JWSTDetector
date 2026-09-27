@@ -34,8 +34,8 @@ def plot_reference_masks(backbone, paths: list[Path], root: Path, out_path: Path
     import matplotlib.pyplot as plt
     from PIL import Image
 
-    from src.backbones import background_mask, embedding_rgb
-    from src.data import TileDataset, relative_key
+    from jwstdetector.backbones import background_mask, embedding_rgb
+    from jwstdetector.data import TileDataset, relative_key
 
     paths = paths[:limit]
     dataset = TileDataset(paths, root, backbone.transform())

@@ -17,17 +17,17 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from src.backbones import get_backbone
-from src.data import (
+from jwstdetector.backbones import get_backbone
+from jwstdetector.data import (
     list_images,
     relative_key,
     resolve_device,
     write_measurements_csv,
     write_ref_list,
 )
-from src.detection import METRICS, run_anomaly_detection
-from src.scoring import SCORE_MODES
-from src.seeding import set_seed
+from jwstdetector.detection import METRICS, run_anomaly_detection
+from jwstdetector.scoring import SCORE_MODES
+from jwstdetector.seeding import set_seed
 
 logger = logging.getLogger("run_query_bootstrap")
 
@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Pass 1 uses %d random tiles of %d as the reference", k1, n)
 
     if args.save_examples:
-        from src.utils import plot_reference_masks
+        from jwstdetector.utils import plot_reference_masks
 
         plot_reference_masks(backbone, ref1, query_dir, out_dir / "reference_samples.png")
 
