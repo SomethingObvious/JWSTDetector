@@ -77,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # huggingface_hub logs every HTTP request it makes at INFO.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     data_root = Path(args.data_root).resolve()
     train_dir, test_dir = data_root / "train", data_root / "test"
@@ -96,17 +98,19 @@ def main(argv: list[str] | None = None) -> int:
     seeds = [args.just_seed] if args.just_seed is not None else list(range(args.num_seeds))
 
     for shot in args.shots:
-        base = (
-            Path(args.results_dir)
-            if args.results_dir
-            else Path(f"results_single/{args.model_name}_{backbone.resolution}/{shot}-shot")
-        )
+        if not args.results_dir:
+            base = Path(f"results_single/{args.model_name}_{backbone.resolution}/{shot}-shot")
+        elif len(args.shots) > 1:
+            # Otherwise each shot count would overwrite the one before it.
+            base = Path(args.results_dir) / f"{shot}-shot"
+        else:
+            base = Path(args.results_dir)
         results_dir = Path(f"{base}_{args.tag}" if args.tag else base)
         results_dir.mkdir(parents=True, exist_ok=True)
         (results_dir / "args.yaml").write_text(yaml.safe_dump(vars(args)), encoding="utf-8")
 
         for seed in seeds:
-            logger.info("Running %s-shot with seed %s", shot, seed)
+            logger.info("Running %d-shot with seed %d", shot, seed)
             set_seed(seed, deterministic=args.deterministic)
 
             if shot == -1:
@@ -155,9 +159,6 @@ def main(argv: list[str] | None = None) -> int:
             write_measurements_csv(
                 results_dir / f"measurements_seed={seed}.csv", scores, memorybank_sec, seconds
             )
-            logger.info("Wrote %s", run_dir)
-
-    logger.info("Done")
     return 0
 
 

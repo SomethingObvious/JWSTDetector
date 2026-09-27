@@ -1,26 +1,70 @@
 """Loading DINO backbones and reading patch embeddings out of them.
 
-DINOv2 comes from torch.hub and DINOv3 through transformers. DINOv3 is the one worth
-reaching for, as its dense features hold up well (Gram anchoring) and its SAT-493M
-checkpoints were trained on overhead imagery, which a JWST mosaic tile looks a lot
-more like than it does a web photo. DINOv3 weights are gated, though, so accept the
-licence on the model page and run `hf auth login` once.
+Everything loads through transformers from the Hugging Face Hub. DINOv3 is the one
+worth reaching for, as its dense features hold up well (Gram anchoring) and its
+SAT-493M checkpoints were trained on overhead imagery, which a JWST mosaic tile looks
+a lot more like than it does a web photo. DINOv3 weights are gated, though, so accept
+the licence on the model page and run `hf auth login` once. DINOv2 isn't gated.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
 import torch
+from PIL import Image
 from torch.nn import functional as tnf
-from torchvision import transforms
 
 logger = logging.getLogger(__name__)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# The torch.hub names from the DINOv2 repo still work and map to the same weights on the Hub.
+_DINOV2_HUB_NAME = re.compile(r"dinov2_vit([sblg])14(_reg)?$")
+_DINOV2_SIZES = {"s": "small", "b": "base", "l": "large", "g": "giant"}
+
+
+def hub_repo(model_name: str) -> str:
+    """The Hugging Face repo id or local folder for a --model_name."""
+    if "/" in model_name or "\\" in model_name:
+        return model_name
+    m = _DINOV2_HUB_NAME.match(model_name)
+    if m:
+        size = _DINOV2_SIZES[m.group(1)]
+        return f"facebook/dinov2-with-registers-{size}" if m.group(2) else f"facebook/dinov2-{size}"
+    if model_name.startswith(("dinov2-", "dinov3-")):
+        return f"facebook/{model_name}"
+    raise ValueError(
+        f"Unknown model name {model_name!r}. Use a dinov3-* or dinov2_* name, or a Hub repo id."
+    )
+
+
+@dataclass(frozen=True)
+class TileTransform:
+    """RGB tile to a normalised (3, R, R) tensor.
+
+    It's a class rather than a closure so DataLoader workers can pickle it on Windows.
+    """
+
+    resolution: int
+    mean: tuple[float, ...]
+    std: tuple[float, ...]
+
+    def __call__(self, img: Image.Image) -> torch.Tensor:
+        size = (self.resolution, self.resolution)
+        if img.size != size:
+            img = img.resize(size, Image.Resampling.BICUBIC)
+        x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+        mean = torch.tensor(self.mean).view(3, 1, 1)
+        std = torch.tensor(self.std).view(3, 1, 1)
+        return (x - mean) / std
 
 
 @dataclass
@@ -32,8 +76,8 @@ class Backbone:
     forward_patches: Callable[[torch.Tensor], torch.Tensor]
     patch_size: int
     resolution: int
-    mean: tuple[float, float, float]
-    std: tuple[float, float, float]
+    mean: tuple[float, ...]
+    std: tuple[float, ...]
     device: torch.device
     autocast_dtype: torch.dtype | None
 
@@ -47,19 +91,8 @@ class Backbone:
         h, w = self.grid_size
         return h * w
 
-    def transform(self):
-        """RGB tile to a normalised (3, R, R) tensor."""
-        return transforms.Compose(
-            [
-                transforms.Resize(
-                    (self.resolution, self.resolution),
-                    interpolation=transforms.InterpolationMode.BICUBIC,
-                    antialias=True,
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=self.mean, std=self.std),
-            ]
-        )
+    def transform(self) -> TileTransform:
+        return TileTransform(self.resolution, self.mean, self.std)
 
     @torch.inference_mode()
     def embed(self, batch: torch.Tensor) -> torch.Tensor:
@@ -83,46 +116,18 @@ def _snap_resolution(resolution: int, patch_size: int) -> int:
     return snapped
 
 
-def _first_int(value) -> int:
-    return int(value[0]) if isinstance(value, (list, tuple)) else int(value)
+def _normalisation(repo: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    # Read straight from the processor config, since the satellite checkpoints have
+    # their own constants and the DINOv3 processor class won't load without torchvision.
+    from huggingface_hub import hf_hub_download
 
-
-def _load_dinov2(name: str, device: torch.device):
-    model = torch.hub.load("facebookresearch/dinov2", name).eval().to(device)
-
-    def forward_patches(x: torch.Tensor) -> torch.Tensor:
-        return model.forward_features(x)["x_norm_patchtokens"]
-
-    return model, forward_patches, int(model.patch_size), IMAGENET_MEAN, IMAGENET_STD
-
-
-def _load_dinov3(name: str, device: torch.device):
-    try:
-        from transformers import AutoImageProcessor, AutoModel
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "DINOv3 needs transformers. Install it and run `hf auth login` "
-            "once, as the facebook/dinov3-* weights are gated."
-        ) from exc
-
-    repo = name if "/" in name else f"facebook/{name}"
-    model = AutoModel.from_pretrained(repo).eval().to(device)
-    # Only the processor's mean and std get used, as the satellite checkpoints have their own.
-    processor = AutoImageProcessor.from_pretrained(repo)
-
-    # The CLS token and any register tokens sit in front of the patch tokens.
-    n_prefix = 1 + int(getattr(model.config, "num_register_tokens", 0))
-
-    def forward_patches(x: torch.Tensor) -> torch.Tensor:
-        return model(pixel_values=x).last_hidden_state[:, n_prefix:, :]
-
-    return (
-        model,
-        forward_patches,
-        _first_int(model.config.patch_size),
-        tuple(processor.image_mean),
-        tuple(processor.image_std),
-    )
+    path = Path(repo) / "preprocessor_config.json"
+    if not path.is_file():
+        path = Path(hf_hub_download(repo, "preprocessor_config.json"))
+    config = json.loads(path.read_text(encoding="utf-8"))
+    mean = tuple(config.get("image_mean", IMAGENET_MEAN))
+    std = tuple(config.get("image_std", IMAGENET_STD))
+    return mean, std
 
 
 def get_backbone(
@@ -132,19 +137,29 @@ def get_backbone(
     *,
     autocast: bool = True,
 ) -> Backbone:
-    """Load a backbone by name, dinov3-* through transformers or dinov2_* through torch.hub."""
+    """Load a backbone by name, dinov3-*, dinov2_*, a Hub repo id or a local checkpoint folder."""
+    from transformers import AutoModel
+
     device = torch.device(device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("The device is cuda, but torch can't see a CUDA GPU.")
+    repo = hub_repo(model_name)
+    try:
+        model = AutoModel.from_pretrained(repo).eval().to(device)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Couldn't load {repo}. If it's a DINOv3 model, the weights are gated, so accept "
+            f"the licence on https://huggingface.co/{repo} and run `hf auth login`, or use "
+            "dinov2_vitl14, which isn't gated."
+        ) from exc
+    mean, std = _normalisation(repo)
 
-    if model_name.startswith("dinov3"):
-        loaded = _load_dinov3(model_name, device)
-    elif model_name.startswith("dinov2"):
-        loaded = _load_dinov2(model_name, device)
-    else:
-        raise ValueError(f"Unknown model name {model_name!r}. Use a dinov3-* or dinov2_* name.")
+    # The CLS token and any register tokens sit in front of the patch tokens.
+    n_prefix = 1 + int(getattr(model.config, "num_register_tokens", 0))
 
-    model, forward_patches, patch_size, mean, std = loaded
+    def forward_patches(x: torch.Tensor) -> torch.Tensor:
+        return model(pixel_values=x).last_hidden_state[:, n_prefix:, :]
+
+    patch_size = model.config.patch_size
+    patch_size = int(patch_size[0] if isinstance(patch_size, (list, tuple)) else patch_size)
 
     dtype = None
     if autocast and device.type == "cuda":
@@ -156,14 +171,14 @@ def get_backbone(
         forward_patches=forward_patches,
         patch_size=patch_size,
         resolution=_snap_resolution(resolution, patch_size),
-        mean=tuple(mean),
-        std=tuple(std),
+        mean=mean,
+        std=std,
         device=device,
         autocast_dtype=dtype,
     )
     logger.info(
         "Loaded %s on %s, %d px patches at %d px, a %dx%d grid, autocast %s",
-        model_name,
+        repo,
         device,
         backbone.patch_size,
         backbone.resolution,

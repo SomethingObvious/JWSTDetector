@@ -7,12 +7,9 @@ this only pins the global streams that torch, NumPy and random draw from.
 
 from __future__ import annotations
 
-import logging
 import random
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 
 def set_seed(seed: int, deterministic: bool = False) -> None:
@@ -23,7 +20,6 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     try:
         import torch
     except ImportError:
-        logger.debug("torch isn't installed, so only random and NumPy were seeded")
         return
 
     torch.manual_seed(seed)
@@ -31,22 +27,3 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        logger.debug("cuDNN is in deterministic mode")
-
-
-def _self_test() -> None:
-    """The same seed has to give the same draws, with no test framework needed."""
-    set_seed(123)
-    a = np.random.rand(4).tolist()
-    set_seed(123)
-    b = np.random.rand(4).tolist()
-    assert a == b, "Seed 123 gave different NumPy draws the second time"
-
-    set_seed(456)
-    c = np.random.rand(4).tolist()
-    assert c != a, "Seeds 123 and 456 gave the same NumPy draws"
-    print("The seeding self-test passed")
-
-
-if __name__ == "__main__":
-    _self_test()

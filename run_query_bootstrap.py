@@ -3,7 +3,8 @@
 
 Pass 1 draws a random reference set from the query tiles and scores every tile
 against it. Pass 2 rebuilds the reference from the tiles pass 1 found most ordinary
-and scores again. None of it needs labels, as JWST tiles don't come with any.
+and scores again. A tile that is in the reference is scored against the other
+reference tiles, never its own patches.
 """
 
 from __future__ import annotations
@@ -51,9 +52,11 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument(
         "--model_name",
         default="dinov3-vitl16-pretrain-sat493m",
-        help="A dinov3-* name (gated) or a dinov2_* name from torch.hub.",
+        help="A dinov3-* name (gated), a dinov2_* name, or a Hugging Face repo id.",
     )
-    p.add_argument("--resolution", type=int, default=448, help="Rounded down to a multiple of the patch size.")
+    p.add_argument(
+        "--resolution", type=int, default=448, help="Rounded down to a multiple of the patch size."
+    )
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=4, help="Processes decoding the PNGs.")
     p.add_argument(
@@ -111,7 +114,7 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--bootstrap_keep_max", type=int, default=5000)
 
     p.add_argument("--out_dir", default="results_query_only")
-    p.add_argument("--tag", default=None)
+    p.add_argument("--tag", default=None, help="Appended to --out_dir after an underscore.")
     p.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     return p.parse_args(argv)
@@ -123,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # huggingface_hub logs every HTTP request it makes at INFO.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     set_seed(args.seed, deterministic=args.deterministic)
 
     query_dir = Path(args.data_root).resolve() / args.query_subdir

@@ -16,12 +16,12 @@ def list_images(root: Path, recursive: bool = True) -> list[Path]:
     """Every image under `root`, sorted so a run can be repeated."""
     root = Path(root)
     if not root.is_dir():
-        raise RuntimeError(f"There is no folder at {root}")
+        raise FileNotFoundError(f"There is no folder at {root}")
 
     walk = root.rglob("*") if recursive else root.iterdir()
     paths = sorted(p for p in walk if p.is_file() and p.suffix.lower() in IMG_EXTS)
     if not paths:
-        raise RuntimeError(f"There are no images under {root} (recursive={recursive})")
+        raise FileNotFoundError(f"There are no images under {root} (recursive={recursive})")
     return paths
 
 
@@ -63,9 +63,6 @@ def tile_loader(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        # Workers are slow to start, so they only pay off when they stay up.
-        persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
     )
 
 
