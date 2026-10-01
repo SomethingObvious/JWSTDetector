@@ -1,6 +1,6 @@
 # JWSTDetector
 
-JWSTDetector looks for strange things in JWST images without any labels. It cuts FITS mosaics into PNG tiles, embeds every tile with a DINO backbone, and ranks the tiles by how far their patches sit from a reference set of ordinary ones, so a person can look through the top of the list for artifacts, odd morphologies or whatever else the reference doesn't account for. The detector is adapted from [AnomalyDINO](https://github.com/dammsi/AnomalyDINO) (Damm et al., WACV 2025).
+JWSTDetector is unsupervised anomaly detection for James Webb Space Telescope (JWST) images, so it looks for strange things without any labels. It cuts FITS mosaics into PNG tiles, embeds every tile with a DINO backbone, and ranks the tiles by how far their patches sit from a reference set of ordinary ones, so a person can look through the top of the list for artifacts, odd morphologies or whatever else the reference doesn't account for. The detector is adapted from [AnomalyDINO](https://github.com/dammsi/AnomalyDINO) (Damm et al., WACV 2025).
 
 ## Install
 
