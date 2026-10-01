@@ -46,3 +46,7 @@ python test_detection.py
 ```
 
 Neither needs a GPU or any downloaded weights.
+
+## Licence
+
+It's under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You can use it, change it and share it, forks included, for anything noncommercial, like research or study. Commercial use isn't allowed.
