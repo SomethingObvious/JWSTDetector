@@ -14,8 +14,16 @@ import torch
 from PIL import Image
 
 import jwstdetector.detection as detection
-from jwstdetector.backbones import Backbone, hub_repo
-from jwstdetector.detection import MemoryBank, build_memory_bank, dihedral, run_anomaly_detection
+from jwstdetector.backbones import Backbone, background_mask, hub_repo, parse_layers
+from jwstdetector.detection import (
+    Footprint,
+    MemoryBank,
+    SubspaceModel,
+    build_memory_bank,
+    dihedral,
+    excluded_refs,
+    run_anomaly_detection,
+)
 
 PATCH, RESOLUTION, DIM = 16, 128, 32
 GRID = RESOLUTION // PATCH
@@ -109,33 +117,71 @@ def test_memory_bank_metrics() -> None:
     assert torch.allclose(bank.distances(far, k=1), torch.ones(1))
 
 
-def test_distances_skip_the_querys_own_tile() -> None:
+def test_distances_skip_excluded_tiles() -> None:
     features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]])
     bank = MemoryBank(features.clone(), "L2_normalized", torch.tensor([0, 1, 2], dtype=torch.int32))
     query = features[:1].clone()
+    rows = torch.zeros(1, dtype=torch.long)
     # Its own patch is an exact match. Skipped, the nearest is [0.6, 0.8] at 1 - 0.6.
     assert torch.allclose(bank.distances(query, 1), torch.zeros(1))
-    own = bank.distances(query, 1, torch.tensor([0], dtype=torch.int32))
+    own = bank.distances(query, 1, rows, torch.tensor([[True, False, False]]))
     assert torch.allclose(own, torch.tensor([0.4])), own
-    assert torch.allclose(
-        bank.distances(query, 1, torch.tensor([-1], dtype=torch.int32)), torch.zeros(1)
-    )
+    # Tile 2 overlaps it as well, which leaves only [0, 1] at 1 - 0.
+    both = bank.distances(query, 1, rows, torch.tensor([[True, False, True]]))
+    assert torch.allclose(both, torch.tensor([1.0])), both
+    none = bank.distances(query, 1, rows, torch.tensor([[False, False, False]]))
+    assert torch.allclose(none, torch.zeros(1))
+
+
+def test_too_few_candidates_average_what_is_left() -> None:
+    bank = MemoryBank(torch.eye(3), "L2_normalized", torch.tensor([0, 0, 1], dtype=torch.int32))
+    query = torch.tensor([[1.0, 0.0, 0.0]])
+    rows = torch.zeros(1, dtype=torch.long)
+    # k=3 with tile 0 excluded leaves one patch, at 1 - 0. It used to be inf, then 0.
+    one_left = bank.distances(query, 3, rows, torch.tensor([[True, False]]))
+    assert torch.allclose(one_left, torch.ones(1)), one_left
+    nothing = bank.distances(query, 3, rows, torch.tensor([[True, True]]))
+    assert torch.isnan(nothing).all(), nothing
+
+
+def test_l2_matches_cdist() -> None:
+    torch.manual_seed(0)
+    bank_features = torch.randn(50, 8)
+    queries = torch.randn(30, 8)
+    expected = torch.cdist(queries, bank_features).topk(4, dim=1, largest=False).values.mean(1)
+    got = MemoryBank(bank_features.clone(), "L2").distances(queries, 4)
+    assert torch.allclose(got, expected, atol=1e-4), (got - expected).abs().max()
 
 
 def test_chunking_matches_a_single_pass() -> None:
     torch.manual_seed(0)
     bank = MemoryBank(torch.randn(64, 16), "L2", torch.arange(64, dtype=torch.int32) % 5)
     queries = torch.randn(200, 16)
-    owners = torch.arange(200, dtype=torch.int32) % 7 - 1
-    full = bank.distances(queries, k=3, owners=owners)
+    rows = torch.arange(200) % 7
+    excluded = torch.rand(7, 5, generator=torch.Generator().manual_seed(1)) < 0.4
+    full = bank.distances(queries, 3, rows, excluded)
 
     original = detection._MAX_DISTANCE_ELEMENTS
     try:
         detection._MAX_DISTANCE_ELEMENTS = 64 * 7  # several ragged chunks
-        chunked = bank.distances(queries, k=3, owners=owners)
+        chunked = bank.distances(queries, 3, rows, excluded)
     finally:
         detection._MAX_DISTANCE_ELEMENTS = original
-    assert torch.allclose(full, chunked, atol=1e-6)
+    assert torch.allclose(full, chunked, atol=1e-6, equal_nan=True)
+
+
+def test_excluded_refs_follow_the_footprints() -> None:
+    q = [Path(f"q{i}") for i in range(4)]
+    refs = [q[0], q[2], Path("r")]
+    feet = {
+        q[0]: Footprint("A", 0, 0, 100),
+        q[1]: Footprint("A", 90, 0, 100),  # shares a 10 px strip with q0
+        q[2]: Footprint("A", 300, 0, 100),
+        q[3]: Footprint("B", 0, 0, 100),  # same pixels, other mosaic
+        Path("r"): Footprint("A", 50, 50, 100),
+    }
+    assert excluded_refs(q, refs) == [[0], [], [1], []]
+    assert excluded_refs(q, refs, feet) == [[0, 2], [0, 2], [1], []]
 
 
 def test_dihedral_is_lossless() -> None:
@@ -193,7 +239,8 @@ def test_end_to_end_options() -> None:
             score_mode="peak_minus_median",
             save_tiffs=True,
         )
-        assert all(np.isfinite(v) for v in scores.values())
+        assert len(scores) == 13
+        assert all(np.isfinite(v) for v in scores.values()), scores
         tiff = tmp / f"out/anomaly_maps/seed=0/{ANOMALOUS[:-4]}.tiff"
         assert tiff.exists()
 
@@ -235,6 +282,58 @@ def test_masked_bank_still_fills_the_cap() -> None:
     everything = len(_bank(10**9, masking=True))
     assert everything < 13 * GRID * GRID
     assert len(_bank(everything // 2, masking=True)) == everything // 2
+
+
+def test_background_mask_ignores_sign_and_random_state() -> None:
+    # A bright square off the centre: the side picked can't depend on the PCA sign or
+    # on how many random numbers were drawn before.
+    torch.manual_seed(0)
+    grid = (12, 12)
+    feats = torch.randn(1, 144, 32) * 0.1
+    subject = torch.zeros(12, 12, dtype=torch.bool)
+    subject[3:8, 2:9] = True
+    feats[0, subject.flatten()] += torch.randn(32) * 3
+    first = background_mask(feats, grid)
+    torch.rand(1000)
+    assert torch.equal(background_mask(feats, grid), first)
+    assert torch.equal(background_mask(-feats, grid), first)
+    assert first[0].reshape(grid)[subject].float().mean() > 0.9
+
+
+def test_subspace_scores_the_off_plane_patch() -> None:
+    torch.manual_seed(0)
+    # Normal patches span the first 3 of 10 dimensions, with a little noise.
+    normal = torch.zeros(2000, 10)
+    normal[:, :3] = torch.randn(2000, 3) * 5
+    normal += torch.randn(2000, 10) * 0.01
+    model = SubspaceModel(normal, variance=0.99)
+    assert model.rank == 3
+    on = torch.tensor([[4.0, -2.0, 1.0] + [0.0] * 7])
+    off = torch.tensor([[0.0] * 9 + [2.0]])
+    d = model.distances(torch.cat([on, off]), 5, None, None)
+    assert d[0] < 1e-2, d
+    assert abs(d[1].item() - 4.0) < 0.05, d
+
+
+def test_end_to_end_subspace() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        scores = _run(Path(td), detector="subspace")
+        ranked = sorted(scores, key=scores.__getitem__, reverse=True)
+        assert ranked[0] == ANOMALOUS, ranked[:3]
+
+
+def test_parse_layers() -> None:
+    assert parse_layers("last", 24) is None
+    assert parse_layers("mid", 40) == list(range(22, 29))
+    assert parse_layers("mid", 24) == [13, 14, 15, 16, 17]
+    assert parse_layers("14-16", 24) == [14, 15, 16]
+    assert parse_layers("3,5", 24) == [3, 5]
+    for bad in ("0-3", "20-30", "x"):
+        try:
+            parse_layers(bad, 24)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
 
 
 def main() -> None:

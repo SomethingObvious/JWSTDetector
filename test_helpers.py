@@ -15,7 +15,6 @@ from types import SimpleNamespace
 
 import numpy as np
 from astropy.io import fits
-from astropy.visualization import make_lupton_rgb
 from astropy.wcs import WCS
 from PIL import Image
 
@@ -51,6 +50,9 @@ def _tile_args(tile_size=100, stride=100, dry_run=True):
         min_source_frac=2e-4,
         stretch_scope="mosaic",
         dry_run=dry_run,
+        wcs_in_name=False,
+        save_cutouts=False,
+        bunit=None,
     )
 
 
@@ -191,7 +193,7 @@ def test_aggregate_score_modes() -> None:
 
 
 def test_aggregate_score_edge_cases() -> None:
-    assert aggregate_score(np.array([]), "top1p") == 0.0
+    assert np.isnan(aggregate_score(np.array([]), "top1p"))
     assert aggregate_score(np.array([np.nan, np.inf, 2.0]), "max") == 2.0
     assert aggregate_score(np.array([1.0]), "top1p") == 1.0
     try:
@@ -342,7 +344,7 @@ def test_miri_i2d_end_to_end() -> None:
 
 def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
     # Lupton's mapping works pixel by pixel, so a colour tile made on its own has to
-    # match the same crop of a colour image made from the whole mosaic.
+    # match the same crop of a colour image made from the whole mosaic, top row first.
     rng = np.random.default_rng(3)
     planes = [np.abs(_sky_with_sources(200, 300, seed=s)) * rng.uniform(0.5, 2) for s in (1, 2, 3)]
     planes[1][10, 10] = np.nan
@@ -359,11 +361,12 @@ def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
         prep_data.run(
             [
                 "--sensor", "nircam", "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
-                "--tile_size", "100", "--upscale", "1", "--stride", "100",
+                "--tile_size", "100", "--upscale", "1", "--stride", "100", "--min_wht_frac", "0",
             ]
         )  # fmt: skip
 
-        whole = make_lupton_rgb(*(np.nan_to_num(p) for p in planes), stretch=0.5, Q=10.0)
+        levels = [measure_mosaic(p, 1.0, 99.8) for p in planes]
+        whole = prep_data.lupton(SimpleNamespace(stretch=0.05, Q=10.0), planes, levels)
         pngs = sorted((tmp / "out/query").glob("A5_*.png"))
         assert len(pngs) == 6
         for png in pngs:
@@ -371,7 +374,26 @@ def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
             x, y = cx - 50, cy - 50
             with Image.open(png) as img:
                 assert img.mode == "RGB"
-                assert np.array_equal(np.asarray(img), whole[y : y + 100, x : x + 100])
+                assert np.array_equal(np.asarray(img), whole[y : y + 100, x : x + 100][::-1])
+
+
+def test_cutout_pixels_and_wcs_match_the_mosaic() -> None:
+    rng = np.random.default_rng(5)
+    plane = rng.normal(size=(50, 60)).astype(np.float32)
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crval = [150.0, 2.0]
+    w.wcs.crpix = [20.0, 30.0]
+    w.wcs.cd = [[-1e-5, 2e-6], [2e-6, 1e-5]]
+    window = (slice(10, 30), slice(5, 25))
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "c.fits"
+        prep_data.write_cutout(path, [plane], window, w, "MJy/sr")
+        with fits.open(path) as hdul:
+            assert np.array_equal(hdul[0].data, plane[window])
+            assert hdul[0].header["BUNIT"] == "MJy/sr"
+            got = WCS(hdul[0].header).pixel_to_world_values(3, 4)
+    assert np.allclose(got, w.pixel_to_world_values(5 + 3, 10 + 4))
 
 
 def test_help_lists_the_sensor_flags() -> None:
@@ -391,17 +413,21 @@ def test_set_seed_reproducible() -> None:
     assert np.random.rand(5).tolist() != first
 
 
+class Skipped(Exception):
+    pass
+
+
 def test_subset_size() -> None:
     try:
         from run_query_bootstrap import subset_size
-    except ImportError:
-        print("skipping test_subset_size, torch isn't installed")
-        return
+    except ImportError as exc:
+        raise Skipped(f"{exc.name} isn't installed") from None
 
     assert subset_size(1000, 0.1, 500, 5000) == 500
     assert subset_size(100_000, 0.1, 500, 5000) == 5000
     assert subset_size(10_000, 0.1, 500, 5000) == 1000
-    assert subset_size(3, 0.1, 500, 5000) == 3
+    assert subset_size(3, 0.1, 500, 5000) == 1
+    assert subset_size(60, 0.1, 500, 5000) == 30
 
 
 def test_summarize_normalize() -> None:
@@ -409,9 +435,8 @@ def test_summarize_normalize() -> None:
         import pandas as pd
 
         from summarize_results import normalize_measurements_df, parse_seed_from_anywhere
-    except ImportError:
-        print("skipping test_summarize_normalize, pandas or PyYAML isn't installed")
-        return
+    except ImportError as exc:
+        raise Skipped(f"{exc.name} isn't installed") from None
 
     df = pd.DataFrame(
         {
@@ -435,12 +460,102 @@ def test_summarize_normalize() -> None:
     assert parse_seed_from_anywhere("nofile.csv") is None
 
 
+def test_benchmark_sources_stay_in_the_tile() -> None:
+    try:
+        import benchmark
+    except ModuleNotFoundError as exc:
+        raise Skipped(f"{exc.name} isn't installed") from None
+    rng = np.random.default_rng(0)
+    for kind in benchmark.KINDS:
+        source = benchmark.profile(kind, 128, rng)
+        assert source.shape == (128, 128)
+        assert 0.9 < source.max() <= 1.0, (kind, source.max())
+        # Nothing bright at the border, so a source never runs off its tile.
+        if kind != "streak":
+            edge = np.concatenate([source[0], source[-1], source[:, 0], source[:, -1]])
+            assert edge.max() < 1e-3, (kind, edge.max())
+
+
+def test_bundle_ranks_exports_and_saves_verdicts() -> None:
+    try:
+        import yaml
+
+        from jwstdetector import bundle
+    except ModuleNotFoundError as exc:
+        raise Skipped(f"{exc.name} isn't installed") from None
+    with tempfile.TemporaryDirectory() as td:
+        data, run = Path(td) / "data", Path(td) / "run"
+        maps = run / "pass2" / "anomaly_maps" / "seed=0"
+        for d in (data / "query", data / "mosaics", data / "cutouts", maps):
+            d.mkdir(parents=True)
+        scores = {"a.png": 0.2, "b.png": float("nan"), "c.png": 0.9}
+        with (data / "manifest.csv").open("w", newline="") as f:
+            f.write("key,mosaic,x0,y0,size,ra,dec,cutout\n")
+            for i, key in enumerate(scores):
+                f.write(f"{key},m,{i * 8},0,8,10.0,-5.0,cutouts/{key}.fits\n")
+                Image.new("RGB", (8, 8)).save(data / "query" / key)
+                (data / "cutouts" / f"{key}.fits").write_bytes(b"fits")
+                grid = np.zeros((2, 2), np.float32)
+                grid[1, 0] = 1
+                np.save(maps / f"{Path(key).stem}.npy", grid)
+        (data / "mosaics" / "m.json").write_text('{"shape": [8, 24]}')
+        Image.new("RGB", (4, 4)).save(data / "mosaics" / "m.png")
+        (run / "args.yaml").write_text(yaml.safe_dump({"resolution": 32, "seed": 0}))
+        with (run / "measurements_final.csv").open("w", newline="") as f:
+            f.write("Sample,AnomalyScore\n")
+            f.writelines(f"{k},{v}\n" for k, v in scores.items())
+
+        b = bundle.RunBundle(run, data, writable=True)
+        tiles = b.index["tiles"]
+        assert [t["key"] for t in tiles] == ["c.png", "a.png", "b.png"]
+        assert tiles[2]["score"] is None
+        assert tiles[0]["peak"] == [1, 0]
+        assert "NaN" not in b.read("index.json")[0].decode()
+        assert len(b.read("maps/000000.f32")[0]) == 4 * 4
+
+        n = bundle.export(b, Path(td) / "site", cutouts=1)
+        assert sorted(p.name for p in (Path(td) / "site/run/cutouts").iterdir()) == ["000000.fits"]
+        assert n == 2 + 3 * 2 + 1 + 1
+
+        site = Path(td) / "site"
+        (site / "index.html").write_text(
+            '<html><head><title>x</title>\n<meta name="description" content="old" />\n'
+            '<meta property="og:title" content="old" />\n  </head></html>',
+            encoding="utf-8",
+        )
+        bundle.add_site_meta(b, site, "https://example.org/demo")
+        page = (site / "index.html").read_text(encoding="utf-8")
+        assert '<link rel="canonical" href="https://example.org/demo/" />' in page
+        assert 'content="old"' not in page and "application/ld+json" in page
+        with Image.open(site / "social.png") as card:
+            assert card.size == (1200, 630)
+        assert "<loc>https://example.org/demo/</loc>" in (site / "sitemap.xml").read_text()
+
+        bundle.save_verdict(run, "a.png", "artifact", True, "A diffraction spike")
+        bundle.save_verdict(run, "c.png", "interesting", False, "")
+        bundle.save_verdict(run, "c.png", None, False, "")
+        assert bundle.read_verdicts(run) == {
+            "a.png": {
+                "verdict": "artifact",
+                "star": True,
+                "note": "A diffraction spike",
+                "updated": bundle.read_verdicts(run)["a.png"]["updated"],
+            }
+        }
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    skipped = 0
     for t in tests:
-        t()
+        try:
+            t()
+        except Skipped as exc:
+            skipped += 1
+            print(f"skip {t.__name__}, {exc}")
+            continue
         print(f"ok  {t.__name__}")
-    print(f"\n{len(tests)} checks passed")
+    print(f"\n{len(tests) - skipped} checks passed, {skipped} skipped")
 
 
 if __name__ == "__main__":

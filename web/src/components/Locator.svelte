@@ -1,0 +1,161 @@
+<script lang="ts">
+  import type { Bundle, Theme, TileInfo } from '../lib/types';
+
+  let {
+    bundle,
+    base,
+    current,
+    order,
+    theme,
+    onselect,
+  }: {
+    bundle: Bundle;
+    base: string;
+    current: number;
+    order: Int32Array;
+    theme: Theme;
+    onselect: (index: number) => void;
+  } = $props();
+
+  const images = new Map<string, HTMLImageElement>();
+  let loaded = $state(0);
+  let failed = $state<string | null>(null);
+  let canvas: HTMLCanvasElement | undefined = $state();
+  let width = $state(316);
+
+  const tile = $derived(bundle.tiles[current]);
+  const mosaic = $derived(bundle.mosaics[tile.mosaic]);
+  const shape = $derived(mosaic?.shape ?? [1, 1]);
+  const height = $derived(Math.round((width * shape[0]) / shape[1]));
+  const scale = $derived(width / shape[1]);
+  // The preview is the right way up, so mosaic row 0 is its bottom edge.
+  const px = (t: TileInfo) => (t.x0 + t.size / 2) * scale;
+  const py = (t: TileInfo) => (shape[0] - t.y0 - t.size / 2) * scale;
+
+  // Dots for the other candidates in the current list that sit on this mosaic.
+  const dots = $derived.by(() => {
+    const out: number[] = [];
+    for (const i of order) if (bundle.tiles[i].mosaic === tile.mosaic && i !== current) out.push(i);
+    return out;
+  });
+
+  function image(name: string): HTMLImageElement | null {
+    let img = images.get(name);
+    if (!img) {
+      const m = bundle.mosaics[name];
+      if (!m) return null;
+      img = new Image();
+      img.decoding = 'async';
+      img.onload = () => loaded++;
+      img.onerror = () => (failed = `Couldn't load ${m.preview}.`);
+      img.src = base + m.preview;
+      images.set(name, img);
+    }
+    return img.complete && img.naturalWidth ? img : null;
+  }
+
+  $effect(() => {
+    void loaded;
+    void theme;
+    if (!canvas || !mosaic) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const ctx = canvas.getContext('2d')!;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const css = getComputedStyle(document.documentElement);
+    const v = (k: string) => css.getPropertyValue(k).trim();
+    ctx.fillStyle = v('--ground-sunk');
+    ctx.fillRect(0, 0, width, height);
+    const img = image(tile.mosaic);
+    if (img) {
+      ctx.globalAlpha = theme === 'plate' ? 0.55 : 0.8;
+      if (theme === 'plate') ctx.filter = 'invert(1) grayscale(1)';
+      ctx.drawImage(img, 0, 0, width, height);
+      ctx.filter = 'none';
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = v('--anno');
+    ctx.globalAlpha = 0.85;
+    for (const i of dots) {
+      const t = bundle.tiles[i];
+      ctx.fillRect(px(t) - 1.5, py(t) - 1.5, 3, 3);
+    }
+    ctx.globalAlpha = 1;
+    const s = tile.size * scale;
+    // Chalk, as red is kept for the ring on the plate.
+    ctx.strokeStyle = v('--chalk');
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(px(tile) - s / 2 + 0.5, py(tile) - s / 2 + 0.5, s, s);
+  });
+
+  function click(e: MouseEvent) {
+    const r = canvas!.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    const my = e.clientY - r.top;
+    let best = -1;
+    let bestD = 9 * 9;
+    for (const i of dots) {
+      const t = bundle.tiles[i];
+      const d = (px(t) - mx) ** 2 + (py(t) - my) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    if (best >= 0) onselect(best);
+  }
+</script>
+
+<div class="locator" bind:clientWidth={width}>
+  <!-- The keyboard reaches the same tiles through the index, so the map is a pointer shortcut. -->
+  <canvas
+    bind:this={canvas}
+    style:height="{height}px"
+    onclick={click}
+    aria-label="Where this tile sits on the mosaic, with {dots.length} other candidates marked"
+  ></canvas>
+  <div class="legend">
+    <span><i class="foot"></i>This tile</span>
+    <span><i class="dot"></i>{dots.length} more in the list</span>
+  </div>
+  {#if failed}<p class="err">{failed}</p>{/if}
+</div>
+
+<style>
+  .locator {
+    display: grid;
+    gap: 6px;
+  }
+  canvas {
+    width: 100%;
+    display: block;
+    cursor: pointer;
+    border: 1px solid var(--rule);
+  }
+  .legend {
+    display: flex;
+    gap: 14px;
+    font-size: 11px;
+    color: var(--chalk-2);
+  }
+  .legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .foot {
+    width: 9px;
+    height: 9px;
+    border: 1.5px solid var(--chalk);
+  }
+  .dot {
+    width: 3px;
+    height: 3px;
+    background: var(--anno);
+  }
+  .err {
+    margin: 0;
+    color: var(--chalk-2);
+  }
+</style>

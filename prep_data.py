@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import gc
+import json
 import logging
 import re
+import shutil
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -24,6 +27,7 @@ from astropy.io import fits
 from astropy.visualization import make_lupton_rgb
 from astropy.wcs import WCS, FITSFixedWarning
 from PIL import Image
+from scipy.ndimage import binary_fill_holes
 from tqdm import tqdm
 
 logger = logging.getLogger("prep_data")
@@ -99,9 +103,11 @@ def asinh_to_uint8(
     The limits are arguments on purpose. Stretching each tile between its own
     percentiles brings faint sky and a bright source up to the same range, which
     hides the very difference the detector is looking for. Holes get the sky level
-    so they don't turn into black shapes that the detector then flags.
+    so they don't turn into black shapes that the detector then flags, and so does
+    zero fill, which is how COSMOS-Web marks the same thing.
     """
-    img = np.nan_to_num(img, nan=fill, posinf=fill, neginf=fill).astype(np.float32, copy=False)
+    img = np.asarray(img, dtype=np.float32)
+    img = np.where(np.isfinite(img) & (img != 0), img, np.float32(fill))
     x = np.clip((img - lo) / (hi - lo + 1e-12), 0.0, 1.0)
     # Rounding rather than truncating, which would put the upper limit itself at 254.
     return np.rint(255.0 * np.arcsinh(asinh_q * x) / np.arcsinh(asinh_q)).astype(np.uint8)
@@ -118,10 +124,23 @@ def has_signal(
     mosaic edge would otherwise pass on a single noisy pixel.
     """
     finite = np.isfinite(cut)
+    if not np.any(finite & (cut != 0)):
+        return False
     if stats.sigma <= 0.0:
         return bool(np.any(finite & (cut != stats.sky)))
     above = finite & (cut > stats.sky + source_sigma * stats.sigma)
     return float(above.sum()) / cut.size >= min_frac
+
+
+def covered_fraction(wht: np.ndarray) -> float:
+    """Share of a window with a positive weight, counting enclosed holes as covered.
+
+    A saturated star core has zero weight inside the footprint. Counting it as missing
+    would throw away every tile over the star, and edge tiles are what the check is
+    for. A gap that reaches the window's border isn't enclosed, so it still counts.
+    """
+    covered = np.isfinite(wht) & (wht > 0)
+    return float(binary_fill_holes(covered).mean())
 
 
 def tile_starts(length: int, crop: int, stride: int) -> list[int]:
@@ -157,13 +176,16 @@ def _safe_float_tag(x: float, ndp: int = 6) -> str:
     return "m" + s[1:] if s.startswith("-") else s
 
 
-def celestial_wcs(header: fits.Header, source: str) -> WCS:
+def celestial_wcs(header: fits.Header, source: str, required: bool = True) -> WCS | None:
+    """The header's sky WCS, or None for a header without one unless it's `required`."""
     with warnings.catch_warnings():
         # JWST headers get a few harmless date and unit fixes that astropy warns about.
         warnings.simplefilter("ignore", FITSFixedWarning)
         wcs = WCS(header).celestial
     if not wcs.has_celestial:
-        raise ValueError(f"{source} has no sky coordinates in its header. Drop --wcs_in_name.")
+        if required:
+            raise ValueError(f"{source} has no sky coordinates in its header. Drop --wcs_in_name.")
+        return None
     return wcs
 
 
@@ -186,18 +208,30 @@ def cut_tiles(
     args: argparse.Namespace,
     tile_id: str,
     signal: np.ndarray,
-    wht: np.ndarray | None,
+    wht: np.ndarray | Sequence[np.ndarray] | None,
     wcs: WCS | None,
     query_dir: Path,
     global_idx: int,
     colour: Callable[[tuple[slice, slice]], np.ndarray] | None = None,
+    planes: Sequence[np.ndarray] | None = None,
+    records: list[dict] | None = None,
 ) -> tuple[int, int, int, int]:
     """Cut, filter and save the tiles of one mosaic.
 
     `signal` is the raw flux that the emptiness cut and the grey stretch read, and
-    `colour` renders the saved tile for a window in place of the grey stretch.
+    `colour` renders the saved tile for a window in place of the grey stretch. With
+    several weight maps a window has to be covered in all of them. `planes` are the
+    float planes a --save_cutouts FITS file holds, `signal` alone by default, and
+    each saved tile appends its manifest row to `records`.
     Returns the next global index and the saved, empty and low-WHT counts.
     """
+    whts = [] if wht is None else list(wht) if isinstance(wht, (list, tuple)) else [wht]
+    for w in whts:
+        if w.shape != signal.shape:
+            raise ValueError(
+                f"[{tile_id}] the weight map is {w.shape[1]}x{w.shape[0]} but the image is "
+                f"{signal.shape[1]}x{signal.shape[0]}, so they can't be from the same mosaic"
+            )
     crop = int(args.tile_size / args.upscale)
     stride = args.stride if args.stride is not None else max(1, crop // 2)
     stats = measure_mosaic(signal, args.p_lo, args.p_hi)
@@ -215,11 +249,11 @@ def cut_tiles(
     for y in tile_starts(h, crop, stride):
         for x in tile_starts(w, crop, stride):
             window = np.s_[y : y + crop, x : x + crop]
-            if wht is not None and args.min_wht_frac > 0:
-                wcut = wht[window]
-                if np.mean(np.isfinite(wcut) & (wcut > 0)) < args.min_wht_frac:
-                    skipped_wht += 1
-                    continue
+            if args.min_wht_frac > 0 and any(
+                covered_fraction(np.asarray(w[window])) < args.min_wht_frac for w in whts
+            ):
+                skipped_wht += 1
+                continue
 
             # Judge emptiness on raw flux, before a stretch flattens the difference
             # between blank sky and a tile with something in it.
@@ -241,10 +275,33 @@ def cut_tiles(
                 if wcs is not None:
                     ra, dec = wcs.all_pix2world(cx, cy, 0)
                     radec = (float(ra), float(dec))
-                img = Image.fromarray(tile)
+                # FITS row 1 is the bottom of the sky, so it goes at the bottom of the PNG.
+                img = Image.fromarray(np.ascontiguousarray(tile[::-1]))
                 if img.size != (args.tile_size, args.tile_size):
                     img = img.resize((args.tile_size, args.tile_size), Image.Resampling.BICUBIC)
-                img.save(query_dir / make_output_name(tile_id, cx, cy, global_idx, radec))
+                name = make_output_name(
+                    tile_id, cx, cy, global_idx, radec if args.wcs_in_name else None
+                )
+                img.save(query_dir / name)
+                cutout = None
+                if getattr(args, "save_cutouts", False):
+                    cutout = Path("cutouts") / f"{Path(name).stem}.fits"
+                    write_cutout(
+                        query_dir.parent / cutout, planes or [signal], window, wcs, args.bunit
+                    )
+                if records is not None:
+                    records.append(
+                        {
+                            "key": name,
+                            "mosaic": tile_id,
+                            "x0": x,
+                            "y0": y,
+                            "size": crop,
+                            "ra": f"{radec[0]:.7f}" if radec else "",
+                            "dec": f"{radec[1]:.7f}" if radec else "",
+                            "cutout": cutout.as_posix() if cutout else "",
+                        }
+                    )
             global_idx += 1
             saved += 1
 
@@ -257,6 +314,121 @@ def cut_tiles(
         skipped_wht,
     )
     return global_idx, saved, skipped_empty, skipped_wht
+
+
+def write_cutout(
+    path: Path,
+    planes: Sequence[np.ndarray],
+    window: tuple[slice, slice],
+    wcs: WCS | None,
+    bunit: str | None,
+) -> None:
+    """The raw float pixels under one tile, as a FITS file with its own WCS.
+
+    Zero fill becomes NaN, which is what FITS readers take as no data.
+    """
+    data = np.stack([np.asarray(p[window], dtype=np.float32) for p in planes])
+    data[data == 0] = np.nan
+    header = fits.Header()
+    if wcs is not None:
+        ys, xs = window
+        sub_wcs = wcs.deepcopy()
+        sub_wcs.wcs.crpix = [wcs.wcs.crpix[0] - xs.start, wcs.wcs.crpix[1] - ys.start]
+        header.update(sub_wcs.to_header())
+    if bunit:
+        header["BUNIT"] = bunit
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdu = fits.PrimaryHDU(data[0] if len(planes) == 1 else data, header=header)
+    hdu.writeto(path, overwrite=True)
+
+
+def describe_mosaic(
+    out: Path,
+    tile_id: str,
+    signal: np.ndarray,
+    wcs: WCS | None,
+    headers: Sequence[fits.Header],
+    filters: Sequence[str],
+    preview: Callable[[np.ndarray, np.ndarray], np.ndarray],
+) -> None:
+    """mosaics/<id>.json and a preview PNG, which the web viewer reads."""
+    h, w = signal.shape
+    step = max(1, int(np.ceil(max(h, w) / 2048)))
+    ys, xs = np.arange(0, h, step), np.arange(0, w, step)
+    # Top row first, so the preview is the right way up like the tiles.
+    Image.fromarray(preview(ys[::-1], xs)).save(out / "mosaics" / f"{tile_id}.png")
+
+    meta: dict = {
+        "shape": [h, w],
+        "preview_scale": len(xs) / w,
+        "filters": [f.upper() for f in filters],
+    }
+    if wcs is not None:
+        cd = np.diag(wcs.wcs.cdelt) @ wcs.wcs.get_pc()
+        meta["wcs"] = {
+            "CTYPE1": wcs.wcs.ctype[0],
+            "CTYPE2": wcs.wcs.ctype[1],
+            "CRPIX1": float(wcs.wcs.crpix[0]),
+            "CRPIX2": float(wcs.wcs.crpix[1]),
+            "CRVAL1": float(wcs.wcs.crval[0]),
+            "CRVAL2": float(wcs.wcs.crval[1]),
+            "CD1_1": float(cd[0, 0]),
+            "CD1_2": float(cd[0, 1]),
+            "CD2_1": float(cd[1, 0]),
+            "CD2_2": float(cd[1, 1]),
+        }
+        scale = np.sqrt(abs(np.linalg.det(cd))) * 3600
+        meta["pixel_scale_arcsec"] = round(float(scale), 5)
+    cards = {}
+    for header in headers:
+        for card in header.cards:
+            if card.keyword and card.keyword not in ("HISTORY", "COMMENT", "") and len(cards) < 400:
+                cards.setdefault(card.keyword, str(card.value))
+    meta["header"] = cards
+    (out / "mosaics" / f"{tile_id}.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+
+
+class Reprojected:
+    """One plane of a mosaic seen on another plane's pixel grid, a window at a time.
+
+    JWST level-3 mosaics of one field come out on slightly different grids per filter
+    (a pixel wider here, twice the pixel scale for the short-wave channel there), and
+    stacking the arrays as they are would put different sky in each colour.
+    """
+
+    def __init__(self, data: np.ndarray, wcs: WCS, target: WCS, shape: tuple[int, int]):
+        self.data, self.wcs, self.target, self.shape = data, wcs, target, shape
+
+    def __getitem__(self, window: tuple[slice, slice]) -> np.ndarray:
+        from reproject import reproject_interp
+
+        ys, xs = window
+        out_wcs = self.target[ys, xs]
+        out_shape = (ys.stop - ys.start, xs.stop - xs.start)
+        # Only the part of this plane under the window gets read off the memmap.
+        corners_y = [ys.start, ys.start, ys.stop, ys.stop]
+        corners_x = [xs.start, xs.stop, xs.start, xs.stop]
+        ra, dec = self.target.all_pix2world(corners_x, corners_y, 0)
+        px, py = self.wcs.all_world2pix(ra, dec, 0)
+        h, w = self.data.shape
+        x0, x1 = max(0, int(np.floor(px.min())) - 4), min(w, int(np.ceil(px.max())) + 5)
+        y0, y1 = max(0, int(np.floor(py.min())) - 4), min(h, int(np.ceil(py.max())) + 5)
+        if x1 <= x0 or y1 <= y0:
+            return np.full(out_shape, np.nan, np.float32)
+        src = np.asarray(self.data[y0:y1, x0:x1], dtype=np.float32)
+        out, _ = reproject_interp((src, self.wcs[y0:y1, x0:x1]), out_wcs, out_shape, order=1)
+        return out.astype(np.float32)
+
+
+def on_grid(data: np.ndarray, wcs: WCS, target: WCS, shape: tuple[int, int]):
+    """`data` itself when it already shares the target grid, otherwise a Reprojected view."""
+    same = (
+        data.shape == shape
+        and np.allclose(wcs.wcs.crpix, target.wcs.crpix)
+        and np.allclose(wcs.pixel_scale_matrix, target.pixel_scale_matrix, rtol=1e-6, atol=0)
+        and np.allclose(wcs.wcs.crval, target.wcs.crval, rtol=0, atol=1e-9)
+    )
+    return data if same else Reprojected(data, wcs, target, shape)
 
 
 @dataclass
@@ -276,7 +448,12 @@ class Sensor:
         raise NotImplementedError
 
     def process_one_mosaic(
-        self, args: argparse.Namespace, spec: MosaicSpec, query_dir: Path, global_idx: int
+        self,
+        args: argparse.Namespace,
+        spec: MosaicSpec,
+        query_dir: Path,
+        global_idx: int,
+        records: list[dict],
     ) -> int:
         raise NotImplementedError
 
@@ -323,7 +500,12 @@ class MiriSensor(Sensor):
             yield MosaicSpec(tile_id=tile_id, sci_path=sci_path, wht_path=wht_path)
 
     def process_one_mosaic(
-        self, args: argparse.Namespace, spec: MosaicSpec, query_dir: Path, global_idx: int
+        self,
+        args: argparse.Namespace,
+        spec: MosaicSpec,
+        query_dir: Path,
+        global_idx: int,
+        records: list[dict],
     ) -> int:
         # Everything is cut while the files are open, since the arrays are memmaps.
         with contextlib.ExitStack() as stack:
@@ -331,12 +513,34 @@ class MiriSensor(Sensor):
             sci, header = find_image(sci_hdul, (args.sci_ext, "SCI"))
             wht = None
             if spec.wht_path == spec.sci_path:
-                wht, _ = find_image(sci_hdul, (args.wht_ext, "WHT"), fallback=False)
+                try:
+                    wht, _ = find_image(sci_hdul, (args.wht_ext, "WHT"), fallback=False)
+                except ValueError:
+                    raise ValueError(
+                        f"{spec.sci_path} has no {args.wht_ext} extension for --min_wht_frac. "
+                        "Pass --min_wht_frac 0 to tile it without one."
+                    ) from None
             elif spec.wht_path is not None:
                 wht_hdul = stack.enter_context(fits.open(spec.wht_path, memmap=True))
                 wht, _ = find_image(wht_hdul, (args.wht_ext, "WHT", "SCI"))
-            wcs = celestial_wcs(header, spec.sci_path) if args.wcs_in_name else None
-            return cut_tiles(args, spec.tile_id, sci, wht, wcs, query_dir, global_idx)[0]
+            wcs = celestial_wcs(header, spec.sci_path, required=args.wcs_in_name)
+            args.bunit = header.get("BUNIT")
+            if not args.dry_run:
+                stats = measure_mosaic(sci, args.p_lo, args.p_hi)
+                describe_mosaic(
+                    query_dir.parent,
+                    spec.tile_id,
+                    sci,
+                    wcs,
+                    [sci_hdul[0].header, header],
+                    [str(sci_hdul[0].header.get("FILTER", header.get("FILTER", "")))],
+                    lambda ys, xs: asinh_to_uint8(
+                        sci[ys[:, None], xs[None, :]], stats.lo, stats.hi, args.asinh_q, stats.sky
+                    ),
+                )
+            return cut_tiles(
+                args, spec.tile_id, sci, wht, wcs, query_dir, global_idx, records=records
+            )[0]
 
 
 class NircamSensor(Sensor):
@@ -363,9 +567,12 @@ class NircamSensor(Sensor):
         p.add_argument("--tiles", nargs="*", default=None)
         p.add_argument("--sci_ext", default="SCI")
         p.add_argument("--wht_ext", default="WHT")
-        p.add_argument("--nircam_load_wht", default=False, action=argparse.BooleanOptionalAction)
-        p.add_argument("--wht_filter", type=str, default=None)
-        p.add_argument("--stretch", type=float, default=0.5, help="Lupton stretch.")
+        p.add_argument(
+            "--stretch",
+            type=float,
+            default=0.05,
+            help="Lupton stretch, in units of each filter's sky to --p_hi range.",
+        )
         p.add_argument("--Q", type=float, default=10.0, help="Lupton softening.")
 
     def _infer_tiles_from_dir(self, indir: str) -> list[str]:
@@ -389,16 +596,35 @@ class NircamSensor(Sensor):
         for tile_id in args.tiles or self._infer_tiles_from_dir(args.indir):
             yield MosaicSpec(tile_id=tile_id, sci_path="")
 
+    def _weights(self, args, stack, hdul, path: str, filt: str) -> np.ndarray:
+        try:
+            return find_image(hdul, (args.wht_ext, "WHT"), fallback=False)[0]
+        except ValueError:
+            pass
+        # COSMOS-Web ships the weights as a separate file named like the science one.
+        wht_path = Path(path.replace(f"_{args.ext}.fits", "_wht.fits"))
+        if wht_path == Path(path) or not wht_path.is_file():
+            raise FileNotFoundError(
+                f"--min_wht_frac needs a weight map for {filt}, and {path} has no "
+                f"{args.wht_ext} extension and there is no {wht_path.name} beside it. "
+                "Pass --min_wht_frac 0 to tile it without one."
+            )
+        wht_hdul = stack.enter_context(fits.open(wht_path, memmap=True))
+        return find_image(wht_hdul, (args.wht_ext, "WHT", "SCI"))[0]
+
     def process_one_mosaic(
-        self, args: argparse.Namespace, spec: MosaicSpec, query_dir: Path, global_idx: int
+        self,
+        args: argparse.Namespace,
+        spec: MosaicSpec,
+        query_dir: Path,
+        global_idx: int,
+        records: list[dict],
     ) -> int:
         if len(args.rgb_filters) not in (1, 3):
             raise ValueError(f"--rgb_filters takes 1 or 3 filters, not {len(args.rgb_filters)}")
-        load_wht = args.nircam_load_wht and args.min_wht_frac > 0
-        wht_filter = args.wht_filter or args.rgb_filters[0]
 
         with contextlib.ExitStack() as stack:
-            planes, header, wht = [], None, None
+            planes, whts, headers, target, levels = [], [], [], None, []
             for filt in args.rgb_filters:
                 path = self._build_path(args, spec.tile_id, filt)
                 if not Path(path).is_file():
@@ -407,26 +633,111 @@ class NircamSensor(Sensor):
                     )
                 hdul = stack.enter_context(fits.open(path, memmap=True))
                 data, hdr = find_image(hdul, (args.sci_ext, "SCI"))
+                levels.append(measure_mosaic(data, args.p_lo, args.p_hi))
+                wht = (
+                    self._weights(args, stack, hdul, path, filt) if args.min_wht_frac > 0 else None
+                )
+                if target is None:
+                    # The first filter sets the pixel grid and is the detection plane.
+                    target = celestial_wcs(hdr, path, required=args.wcs_in_name)
+                    shape = data.shape
+                    headers = [hdul[0].header, hdr]
+                    args.bunit = hdr.get("BUNIT")
+                elif target is not None:
+                    wcs = celestial_wcs(hdr, path)
+                    data = on_grid(data, wcs, target, shape)
+                    if wht is not None:
+                        wht = on_grid(wht, wcs, target, shape)
                 planes.append(data)
-                header = hdr if header is None else header
-                if load_wht and filt == wht_filter:
-                    wht, _ = find_image(hdul, (args.wht_ext, "WHT"), fallback=False)
-            if load_wht and wht is None:
-                raise ValueError(f"--wht_filter {wht_filter} isn't one of --rgb_filters")
+                if wht is not None:
+                    whts.append(wht)
 
             colour = None
             if len(planes) == 3:
 
                 def colour(window: tuple[slice, slice]) -> np.ndarray:
-                    r, g, b = (np.nan_to_num(np.asarray(p[window], np.float32)) for p in planes)
-                    return make_lupton_rgb(r, g, b, stretch=args.stretch, Q=args.Q)
+                    return lupton(args, [p[window] for p in planes], levels)
 
-            wcs = celestial_wcs(header, spec.tile_id) if args.wcs_in_name else None
             signal = planes[0]
-            return cut_tiles(args, spec.tile_id, signal, wht, wcs, query_dir, global_idx, colour)[0]
+            if not args.dry_run:
+                describe_mosaic(
+                    query_dir.parent,
+                    spec.tile_id,
+                    signal,
+                    target,
+                    headers,
+                    args.rgb_filters,
+                    lambda ys, xs: self._preview(args, planes, levels, ys, xs),
+                )
+            return cut_tiles(
+                args,
+                spec.tile_id,
+                signal,
+                whts,
+                target,
+                query_dir,
+                global_idx,
+                colour,
+                planes=planes,
+                records=records,
+            )[0]
+
+    @staticmethod
+    def _preview(args, planes, levels, ys, xs) -> np.ndarray:
+        def sample(p):
+            if isinstance(p, Reprojected):
+                full = p[np.s_[0 : p.shape[0], 0 : p.shape[1]]]
+                return full[ys[:, None], xs[None, :]]
+            return np.nan_to_num(np.asarray(p[ys[:, None], xs[None, :]], np.float32))
+
+        if len(planes) == 3:
+            return lupton(args, [sample(p) for p in planes], levels)
+        stats = levels[0]
+        return asinh_to_uint8(sample(planes[0]), stats.lo, stats.hi, args.asinh_q, stats.sky)
+
+
+def lupton(
+    args: argparse.Namespace, planes: Sequence[np.ndarray], levels: Sequence[MosaicStats]
+) -> np.ndarray:
+    """Lupton colour from three planes, each first put on its own mosaic's sky and range.
+
+    Pipeline mosaics keep their sky, and it differs a lot between filters (F444W sits
+    far above F277W), so feeding raw flux to Lupton's mapping turns the whole field one
+    colour. The levels are per mosaic, not per tile, so tiles stay comparable.
+    """
+    scaled = []
+    for p, level in zip(planes, levels, strict=True):
+        x = np.asarray(p, dtype=np.float32)
+        x = np.where(np.isfinite(x) & (x != 0), x, level.sky)
+        scaled.append((x - level.sky) / max(level.hi - level.sky, 1e-12))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return make_lupton_rgb(*scaled, stretch=args.stretch, Q=args.Q)
 
 
 SENSORS: dict[str, Sensor] = {"miri": MiriSensor(), "nircam": NircamSensor()}
+
+
+def clear_previous_output(out: Path, overwrite: bool) -> None:
+    """Stop when --out holds an earlier run's tiles, or clear them with --overwrite.
+
+    Tile names carry a counter that starts at 0 every run, so a second run into the same
+    folder leaves the first run's tiles beside its own, including exact copies under new
+    names that the detector then treats as separate tiles vouching for each other.
+    """
+    old = [out / name for name in ("query", "cutouts", "mosaics", "manifest.csv")]
+    old = [p for p in old if p.exists()]
+    if not old:
+        return
+    if not overwrite:
+        raise SystemExit(
+            f"{out} already holds tiles from an earlier run. Pass --overwrite to clear them, "
+            "or choose another --out."
+        )
+    for p in old:
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -504,6 +815,17 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         help="Run the garbage collector after each mosaic.",
     )
+    p.add_argument(
+        "--save_cutouts",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Also save each tile's raw float pixels as FITS with its WCS, for the web viewer.",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Clear tiles left in --out by an earlier run instead of stopping.",
+    )
     p.add_argument("--limit", type=int, default=None, help="Stop after this many mosaics.")
     p.add_argument(
         "--dry-run",
@@ -543,18 +865,29 @@ def run(argv: list[str] | None = None) -> None:
         )
     if args.limit is not None and args.limit < 0:
         raise SystemExit(f"--limit can't be negative, got {args.limit}")
+    if args.asinh_q <= 0:
+        raise SystemExit(f"--asinh_q has to be above 0, got {args.asinh_q}")
 
-    query_dir = Path(args.out) / "query"
+    out = Path(args.out)
+    query_dir = out / "query"
     if not args.dry_run:
-        query_dir.mkdir(parents=True, exist_ok=True)
+        clear_previous_output(out, args.overwrite)
+        query_dir.mkdir(parents=True)
+        (out / "mosaics").mkdir()
     sensor = SENSORS[args.sensor]
     specs = list(sensor.iter_mosaic_specs(args))[: args.limit]
 
     global_idx = 0
+    records: list[dict] = []
     for spec in tqdm(specs, desc="Mosaics", unit="mosaic"):
-        global_idx = sensor.process_one_mosaic(args, spec, query_dir, global_idx)
+        global_idx = sensor.process_one_mosaic(args, spec, query_dir, global_idx, records)
         if args.gc_each_mosaic:
             gc.collect()
+    if not args.dry_run:
+        with (out / "manifest.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(records[0]) if records else ["key"])
+            writer.writeheader()
+            writer.writerows(records)
 
     logger.info(
         "%s %d tiles from %d mosaics in %s",

@@ -1,0 +1,309 @@
+@font-face {
+  font-family: 'Archivo';
+  src: url('./assets/fonts/archivo.woff2') format('woff2');
+  font-weight: 400 600;
+  font-stretch: 100% 125%;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Plex Mono';
+  src: url('./assets/fonts/plex-mono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Plex Mono';
+  src: url('./assets/fonts/plex-mono-500.woff2') format('woff2');
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Newsreader';
+  src: url('./assets/fonts/newsreader-italic.woff2') format('woff2');
+  font-weight: 300 500;
+  font-style: italic;
+  font-display: swap;
+}
+
+/* Atlas: the chart ground, chalk data, amber annotation, red only for the ring. */
+:root,
+:root[data-theme='atlas'] {
+  color-scheme: dark;
+  --ground: #0b1220;
+  --ground-2: #0e1729;
+  --ground-3: #15213a;
+  --ground-sunk: #070c16;
+  --rule: rgb(255 179 71 / 0.22);
+  --rule-strong: rgb(255 179 71 / 0.5);
+  --chalk: #ece6d8;
+  --chalk-2: #a9b0bf;
+  --chalk-3: #7d869a;
+  --anno: #ffb347;
+  --anno-2: #d99a45;
+  --anno-wash: rgb(255 179 71 / 0.09);
+  --anno-ink: #0b1220;
+  --ring: #ff4d4d;
+  --nan: #1a2437;
+  --v-interesting: #7cc7ff;
+  --v-artifact: #c9a6ff;
+  --v-known: #7fd8a6;
+  --v-not: #8e97ab;
+  --v-ring: 0;
+  --sel: rgb(255 179 71 / 0.13);
+  --hover: rgb(236 230 216 / 0.05);
+  --bar: rgb(255 179 71 / 0.75);
+  --bar-track: rgb(255 179 71 / 0.12);
+  --font-label: 'Archivo', system-ui, sans-serif;
+  --font-num: 'Plex Mono', ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --font-name: 'Newsreader', Georgia, serif;
+  --name-style: italic;
+  --name-weight: 350;
+  --label-stretch: 112%;
+  --label-track: 0.14em;
+}
+
+/* Plate: a negative on clear glass, ink notation, verdicts circled in ink. */
+:root[data-theme='plate'] {
+  color-scheme: light;
+  --ground: #e9e7e1;
+  --ground-2: #e1ded6;
+  --ground-3: #d5d1c6;
+  --ground-sunk: #f3f2ee;
+  --rule: rgb(28 30 36 / 0.2);
+  --rule-strong: rgb(28 30 36 / 0.5);
+  --chalk: #17181c;
+  --chalk-2: #45474e;
+  --chalk-3: #63656c;
+  --anno: #1f3a6e;
+  --anno-2: #2f4c82;
+  --anno-wash: rgb(31 58 110 / 0.08);
+  --anno-ink: #f3f2ee;
+  --ring: #c8221a;
+  --nan: #d3cfc4;
+  --v-interesting: #1f3a6e;
+  --v-artifact: #5b2f86;
+  --v-known: #1d5e3f;
+  --v-not: #55575e;
+  --v-ring: 1;
+  --sel: rgb(31 58 110 / 0.12);
+  --hover: rgb(23 24 28 / 0.05);
+  --bar: rgb(23 24 28 / 0.7);
+  --bar-track: rgb(23 24 28 / 0.1);
+  --font-label: 'Archivo', system-ui, sans-serif;
+  --font-num: 'Plex Mono', ui-monospace, Consolas, monospace;
+  --font-name: 'Newsreader', Georgia, serif;
+  --name-style: italic;
+  --name-weight: 400;
+  --label-stretch: 100%;
+  --label-track: 0.1em;
+}
+
+/* Classic: the neutral grey instrument panel astronomers already know. */
+:root[data-theme='classic'] {
+  color-scheme: dark;
+  --ground: #2a2c30;
+  --ground-2: #313338;
+  --ground-3: #3c3f45;
+  --ground-sunk: #1f2023;
+  --rule: #474a51;
+  --rule-strong: #63676f;
+  --chalk: #e8e8e8;
+  --chalk-2: #b4b7bc;
+  --chalk-3: #92959b;
+  --anno: #8fd694;
+  --anno-2: #74bb7a;
+  --anno-wash: rgb(143 214 148 / 0.1);
+  --anno-ink: #1f2023;
+  --ring: #ff5a50;
+  --nan: #3a3d42;
+  --v-interesting: #6fb8ff;
+  --v-artifact: #d0a8ff;
+  --v-known: #8fd694;
+  --v-not: #9a9da3;
+  --v-ring: 0;
+  --sel: rgb(111 184 255 / 0.18);
+  --hover: rgb(255 255 255 / 0.05);
+  --bar: #9da1a8;
+  --bar-track: #3c3f45;
+  --font-label: system-ui, 'Segoe UI', sans-serif;
+  --font-num: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --font-name: system-ui, 'Segoe UI', sans-serif;
+  --name-style: normal;
+  --name-weight: 400;
+  --label-stretch: 100%;
+  --label-track: 0.04em;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--ground);
+  color: var(--chalk);
+  font-family: var(--font-label);
+  font-size: 12.5px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--anno);
+  color: var(--anno-ink);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
+  caret-color: var(--anno);
+}
+
+:focus-visible {
+  outline: 1px solid var(--anno);
+  outline-offset: 1px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+.num {
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-size: 11.5px;
+  letter-spacing: 0;
+}
+
+.name {
+  font-family: var(--font-name);
+  font-style: var(--name-style);
+  font-weight: var(--name-weight);
+}
+
+.label {
+  font-family: var(--font-label);
+  font-stretch: var(--label-stretch);
+  text-transform: uppercase;
+  letter-spacing: var(--label-track);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+/* Controls share one vocabulary: hairline box, 2px corners, amber when on. */
+.ctl {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  color: var(--chalk-2);
+  height: 24px;
+  padding: 0 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctl:hover {
+  border-color: var(--rule-strong);
+  color: var(--chalk);
+}
+.ctl[aria-pressed='true'],
+.ctl.on {
+  border-color: var(--anno);
+  color: var(--anno);
+  background: var(--anno-wash);
+}
+.ctl:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+select.ctl {
+  padding-right: 20px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--chalk-3) 50%), linear-gradient(135deg, var(--chalk-3) 50%, transparent 50%);
+  background-position: calc(100% - 11px) 10px, calc(100% - 7px) 10px;
+  background-size: 4px 4px;
+  background-repeat: no-repeat;
+}
+select.ctl option {
+  background: var(--ground-2);
+  color: var(--chalk);
+}
+
+input.ctl {
+  cursor: text;
+  color: var(--chalk);
+}
+input.ctl::placeholder,
+textarea::placeholder {
+  color: var(--chalk-3);
+}
+
+input[type='range'] {
+  appearance: none;
+  background: transparent;
+  height: 18px;
+  margin: 0;
+  cursor: pointer;
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 1px;
+  background: var(--rule-strong);
+}
+input[type='range']::-moz-range-track {
+  height: 1px;
+  background: var(--rule-strong);
+}
+input[type='range']::-webkit-slider-thumb {
+  appearance: none;
+  width: 9px;
+  height: 9px;
+  margin-top: -4px;
+  background: var(--anno);
+  border: 0;
+  border-radius: 0;
+  transform: rotate(45deg);
+}
+input[type='range']::-moz-range-thumb {
+  width: 8px;
+  height: 8px;
+  background: var(--anno);
+  border: 0;
+  border-radius: 0;
+  transform: rotate(45deg);
+}
+
+kbd {
+  font-family: var(--font-num);
+  font-variant-numeric: slashed-zero;
+  font-size: 10px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  color: var(--chalk-2);
+  line-height: 1;
+}
+
+a {
+  color: var(--anno);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

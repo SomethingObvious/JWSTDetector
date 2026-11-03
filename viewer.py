@@ -1,190 +1,154 @@
 #!/usr/bin/env python3
-"""Steps through ranked tiles, showing each PNG beside its raw patch-distance grid.
+"""Opens a run in the web viewer, or exports it as a static site.
 
-It reads samples_sorted_by_anomaly_score.csv, or any CSV with Sample and AnomalyScore
-columns, and loads the .npy map saved for each tile. Every view is also saved to
---render_dir unless a render for it is already there. Press Enter in the terminal for
-the next tile and q to stop.
+    python viewer.py results_miri datasets/miri
+    python viewer.py results_miri datasets/miri --export site/
 
-    python viewer.py --maps_dir results/pass2/anomaly_maps/seed=0 \\
-        --png_dir datasets/miri/query --csv_path samples_sorted_by_anomaly_score.csv
+The first serves the viewer on localhost and saves verdicts to verdicts.csv in the run
+folder. The second writes the viewer and the whole run to a folder that any static
+host can serve, GitHub Pages included, where verdicts stay in each visitor's browser.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import csv
-import re
+import json
+import logging
+import mimetypes
+import threading
+import webbrowser
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
-import matplotlib
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
+from jwstdetector.bundle import RunBundle, add_site_meta, export, save_verdict
 
+logger = logging.getLogger("viewer")
 
-def _slugify(s: str) -> str:
-    s = s.replace("\\", "/").strip().strip("/")
-    s = re.sub(r"[^A-Za-z0-9._/-]+", "_", s)
-    return s.replace("/", "__") or "sample"
+APP_DIR = Path(__file__).resolve().parent / "jwstdetector" / "viewer_static"
 
 
-def _read_sorted_samples(csv_path: Path) -> list[tuple[str, float]]:
-    rows: list[tuple[str, float]] = []
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        if not r.fieldnames:
-            raise ValueError(f"{csv_path} has no header row")
+def make_handler(bundle: RunBundle):
+    lock = threading.Lock()
 
-        cols = {c.lower(): c for c in r.fieldnames}
-        sample_col = cols.get("sample")
-        score_col = cols.get("anomalyscore") or cols.get("anomaly_score") or cols.get("score")
-        if not sample_col or not score_col:
-            raise ValueError(
-                f"{csv_path} needs Sample and AnomalyScore columns, not {r.fieldnames}"
-            )
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            logger.debug(fmt, *args)
 
-        for row in r:
-            sample = (row.get(sample_col) or "").strip()
+        def _send(self, status: int, body: bytes, ctype: str, cache: bool = False) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _error(self, status: int, message: str) -> None:
+            self._send(status, json.dumps({"error": message}).encode(), "application/json")
+
+        def do_GET(self) -> None:
+            path = unquote(urlsplit(self.path).path).lstrip("/") or "index.html"
+            if path.startswith("run/"):
+                try:
+                    body, ctype = bundle.read(path[4:])
+                except (FileNotFoundError, OSError):
+                    self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
+                    return
+                static = not path.endswith(("index.json", "verdicts.json"))
+                self._send(HTTPStatus.OK, body, ctype, cache=static)
+                return
+
+            target = (APP_DIR / path).resolve()
+            if not target.is_relative_to(APP_DIR) or not target.is_file():
+                self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
+                return
+            ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            self._send(HTTPStatus.OK, target.read_bytes(), ctype, cache=path != "index.html")
+
+        def do_POST(self) -> None:
+            if urlsplit(self.path).path != "/run/api/verdict":
+                self._error(HTTPStatus.NOT_FOUND, "Only run/api/verdict takes writes")
+                return
             try:
-                score = float(row[score_col])
-            except (ValueError, TypeError):
-                continue
-            if sample:
-                rows.append((sample, score))
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(min(length, 1 << 20)))
+                key = str(body["key"])
+                if key not in {t.key for t in bundle.tiles}:
+                    raise KeyError(f"{key} isn't a tile in this run")
+                with lock:
+                    saved = save_verdict(
+                        bundle.run_dir,
+                        key,
+                        body.get("verdict"),
+                        bool(body.get("star")),
+                        str(body.get("note") or ""),
+                    )
+            except (ValueError, KeyError, TypeError) as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self._send(HTTPStatus.OK, json.dumps({"saved": saved}).encode(), "application/json")
 
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return rows
-
-
-def _load_map(maps_dir: Path, sample_rel: str) -> tuple[np.ndarray, Path]:
-    """The .npy patch-distance grid saved for a tile.
-
-    There is no TIFF fallback, on purpose. A missing .npy usually means --maps_dir
-    points at the wrong run, and quietly showing something else would hide that.
-    """
-    stem = Path(sample_rel).with_suffix("")
-    path = maps_dir / f"{stem}.npy"
-    if not path.exists():
-        # The CSV may name tiles relative to a different root than the maps.
-        hits = list(maps_dir.rglob(f"{stem.name}.npy"))
-        if not hits:
-            raise FileNotFoundError(f"There is no map for {sample_rel} under {maps_dir}")
-        path = hits[0]
-    return np.load(path), path
-
-
-def _normalize01(a: np.ndarray) -> np.ndarray:
-    a = np.nan_to_num(np.asarray(a, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    lo, hi = float(a.min()), float(a.max())
-    if hi <= lo:
-        return np.zeros_like(a)
-    return (a - lo) / (hi - lo)
-
-
-def _maximize(fig) -> None:
-    # Only Qt windows have showMaximized, and a window that stays small is fine.
-    with contextlib.suppress(AttributeError):
-        fig.canvas.manager.window.showMaximized()
+    return Handler
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--maps_dir", required=True, help="Folder holding the .npy maps.")
-    ap.add_argument("--png_dir", required=True, help="Folder the CSV's Sample paths are under.")
-    ap.add_argument("--csv_path", required=True, help="samples_sorted_by_anomaly_score.csv")
-    ap.add_argument("--top", default=500, type=int, help="Most tiles to step through.")
-    ap.add_argument("--render_dir", default="viewer_renders", help="Where renders are saved.")
-    ap.add_argument("--render_dpi", default=150, type=int)
-    ap.add_argument("--no_maximize", default=False, action=argparse.BooleanOptionalAction)
+    ap.add_argument("run_dir", type=Path, help="A run_query_bootstrap.py output folder.")
+    ap.add_argument("data_root", type=Path, help="The prep_data.py --out folder it scored.")
+    ap.add_argument("--port", type=int, default=8765)
     ap.add_argument(
-        "--map_display",
-        choices=["patchgrid", "upsampled"],
-        default="patchgrid",
-        help="Show the raw patch grid, or blow it up to the tile size. Both stay blocky.",
+        "--no-browser", dest="browser", action="store_false", help="Don't open a browser tab."
     )
+    ap.add_argument("--export", type=Path, default=None, help="Write a static site here instead.")
+    ap.add_argument(
+        "--cutouts",
+        type=int,
+        default=None,
+        help="With --export, keep the FITS cutouts of only the top N tiles, as they're big.",
+    )
+    ap.add_argument("--name", default=None, help="The run's name in the viewer, its tag otherwise.")
+    ap.add_argument(
+        "--site_url",
+        default=None,
+        help="With --export, where the site will be hosted, for its social card and sitemap.",
+    )
+    ap.add_argument("--verbose", action="store_true", help="Log every request.")
     args = ap.parse_args(argv)
-
-    maps_dir = Path(args.maps_dir).resolve()
-    png_dir = Path(args.png_dir).resolve()
-    csv_path = Path(args.csv_path).resolve()
-    render_dir = Path(args.render_dir).resolve()
-    render_dir.mkdir(parents=True, exist_ok=True)
-
-    samples = _read_sorted_samples(csv_path)
-    print(
-        f"Loaded {len(samples)} tiles from {csv_path}, showing them in {matplotlib.get_backend()}"
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
     )
-    print("Press Enter for the next tile, or q then Enter to stop.")
 
-    plt.ion()
-    shown = 0
-    for rank, (sample_rel, score) in enumerate(samples):
-        if shown >= args.top:
-            break
-
-        png_path = png_dir / sample_rel
-        if not png_path.exists():
-            print(f"Skipping {sample_rel}, as {png_path} doesn't exist")
-            continue
-        try:
-            amap, amap_path = _load_map(maps_dir, sample_rel)
-        except (FileNotFoundError, ValueError) as e:
-            print(f"Skipping {sample_rel}. {e}")
-            continue
-
-        with Image.open(png_path) as im:
-            img = np.asarray(im.convert("RGB"))
-        h, w = img.shape[:2]
-        print(f"{amap_path} {amap.shape} from {amap.min():.4g} to {amap.max():.4g}")
-        amap_disp = _normalize01(amap)
-
-        fig, axs = plt.subplots(1, 2, figsize=(16, 9))
-        with contextlib.suppress(AttributeError):
-            fig.canvas.manager.set_window_title("JWSTDetector Viewer")
-
-        axs[0].imshow(img)
-        axs[0].set_title("Tile")
-        if args.map_display == "patchgrid":
-            axs[1].imshow(amap_disp, cmap="magma", interpolation="nearest")
-            axs[1].set_title(f"Patch Distances {amap.shape}")
-        else:
-            big = Image.fromarray((255.0 * amap_disp).astype(np.uint8)).resize(
-                (w, h), resample=Image.Resampling.NEAREST
-            )
-            axs[1].imshow(np.asarray(big) / 255.0, cmap="magma", interpolation="nearest")
-            axs[1].set_title(f"Patch Distances at {w}x{h}")
-        for ax in axs:
-            ax.axis("off")
-
-        out_render = render_dir / f"{rank:05d}_{_slugify(sample_rel)}.png"
-        fig.suptitle(f"Rank {rank}, score {score:.6f}, {sample_rel}", fontsize=12)
-        fig.text(
-            0.01,
-            0.01,
-            f"PNG: {png_path}\nNPY: {amap_path}\nOUT: {out_render}",
-            ha="left",
-            va="bottom",
-            fontsize=8,
+    if not (APP_DIR / "index.html").is_file():
+        raise SystemExit(
+            f"The viewer isn't built, as {APP_DIR / 'index.html'} is missing. "
+            "Run `npm ci && npm run build` in web/."
         )
-        plt.tight_layout()
-        if not out_render.exists():
-            fig.savefig(out_render, dpi=args.render_dpi)
+    bundle = RunBundle(args.run_dir, args.data_root, writable=args.export is None)
+    if args.name:
+        bundle.index["run"]["name"] = args.name
 
-        plt.show(block=False)
-        plt.pause(0.001)
-        if not args.no_maximize:
-            _maximize(fig)
+    if args.export is not None:
+        n = export(bundle, args.export, APP_DIR, cutouts=args.cutouts)
+        if args.site_url:
+            add_site_meta(bundle, args.export, args.site_url)
+        logger.info("Wrote the viewer and %d run files to %s", n, args.export)
+        return 0
 
-        cmd = input().strip().lower()
-        plt.close(fig)
-        if cmd in ("q", "quit", "exit"):
-            break
-        shown += 1
-
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(bundle))
+    url = f"http://127.0.0.1:{server.server_port}/"
+    logger.info("Serving %d tiles at %s, Ctrl+C to stop", len(bundle.tiles), url)
+    if args.browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
     return 0
 
 

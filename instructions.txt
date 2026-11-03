@@ -16,7 +16,8 @@ python prep_data.py \
   --source_sigma 5 --min_source_frac 2e-4 \
   --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
   --stretch_scope mosaic \
-  --wcs_in_name
+  --wcs_in_name \
+  --save_cutouts
 
 # Just a few mosaics.
 python prep_data.py \
@@ -31,11 +32,21 @@ python prep_data.py \
   --source_sigma 5 --min_source_frac 2e-4 \
   --p_lo 1 --p_hi 99.8 --asinh_q 10.0 \
   --stretch_scope mosaic \
-  --wcs_in_name
+  --wcs_in_name \
+  --save_cutouts
 
 # This shows what the thresholds would keep without writing anything.
 python prep_data.py --sensor miri --indir rawfits --out datasets/miri \
-  --pattern "*sci.fits" --tile_size 672 --stride 644 --dry-run --limit 2
+  --pattern "*sci.fits" --sci_ext SCI --wht_ext WHT \
+  --tile_size 672 --upscale 1 --stride 644 \
+  --min_wht_frac 1 --source_sigma 5 --min_source_frac 2e-4 \
+  --dry-run --limit 2
+
+# Colour tiles from three NIRCam filters of one field, the way the demo was made.
+python prep_data.py --sensor nircam --indir rawfits/smacs0723 --out datasets/smacs_nircam \
+  --pattern "jw02736-o001_t001_nircam_clear-{filter}_i2d.fits" --tiles smacs0723 \
+  --rgb_filters f444w f356w f277w \
+  --tile_size 320 --upscale 1 --stride 160 --wcs_in_name --save_cutouts
 
 # A few mosaics, with ViT-L at 672 px and every rotation and flip of the reference tiles.
 python run_query_bootstrap.py \
@@ -99,7 +110,4 @@ python summarize_results.py \
   --results_root results_query_only_miri_672_big \
   --outdir results_summary
 
-python viewer.py \
-  --maps_dir results_query_only_miri_672_big/pass2/anomaly_maps/seed=0 \
-  --png_dir datasets/miri/query \
-  --csv_path results_summary/results_query_only_miri_672_big/samples_sorted_by_anomaly_score.csv
+python viewer.py results_query_only_miri_672_big datasets/miri

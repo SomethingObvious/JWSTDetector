@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -65,18 +66,28 @@ class MemoryBank:
 
     @torch.inference_mode()
     def distances(
-        self, queries: torch.Tensor, k: int, owners: torch.Tensor | None = None
+        self,
+        queries: torch.Tensor,
+        k: int,
+        rows: torch.Tensor | None = None,
+        excluded: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Mean distance from each of the (N, D) queries to its k nearest bank patches.
 
-        `owners` gives the reference tile each query patch belongs to, or -1, and bank
-        patches from that same tile are skipped.
+        `rows` gives each query patch a row of the (R, n_ref_tiles) bool `excluded`, and
+        bank patches from the tiles marked there are skipped. A patch left with fewer
+        than k candidates averages the ones it has, and one with none gets NaN.
         """
         k = max(1, min(k, len(self)))
         cosine = self.metric == "L2_normalized"
         if cosine:
             queries = tnf.normalize(queries, dim=1)
-        skip_own = owners is not None and self.owners is not None and bool((owners >= 0).any())
+        else:
+            bank_sq = self.features.square().sum(dim=1)
+        skip = rows is not None and excluded is not None and self.owners is not None
+        if skip:
+            # Gathered once per call, so each chunk only indexes its own rows.
+            excluded = excluded[:, self.owners.long()]
 
         # Every chunk of queries reads the whole bank, which is probably memory-bound on a
         # GPU once the bank runs to a million patches. Splitting the bank into blocks as
@@ -85,17 +96,129 @@ class MemoryBank:
         out = []
         for start in range(0, queries.shape[0], chunk):
             q = queries[start : start + chunk]
+            # Both branches build the distances in one (chunk, bank) matrix in place.
+            # torch.cdist needs several of those at once and runs out of memory on an
+            # 8 GB card with a million-patch ViT-L bank.
+            d = torch.mm(q, self.features.T)
             if cosine:
                 # Unit vectors, so half the squared L2 distance is `1 - cos`, which is
                 # the scale AnomalyDINO reports.
-                d = torch.mm(q, self.features.T).neg_().add_(1.0)
+                d.neg_().add_(1.0)
             else:
-                d = torch.cdist(q, self.features)
-            if skip_own:
-                own = owners[start : start + chunk, None] == self.owners[None, :]
-                d.masked_fill_(own, float("inf"))
-            out.append(d.topk(k, dim=1, largest=False).values.mean(dim=1))
+                d.mul_(-2.0).add_(q.square().sum(dim=1, keepdim=True)).add_(bank_sq)
+                d.clamp_(min=0.0).sqrt_()
+            if skip:
+                d.masked_fill_(excluded[rows[start : start + chunk].long()], float("inf"))
+            top = d.topk(k, dim=1, largest=False).values
+            finite = torch.isfinite(top)
+            total = torch.where(finite, top, torch.zeros_like(top)).sum(dim=1)
+            out.append(total / finite.sum(dim=1))  # 0 / 0 is NaN, which is the point
         return torch.cat(out)
+
+
+@dataclass(frozen=True)
+class Footprint:
+    """Where a tile was cut from, in mosaic pixels."""
+
+    mosaic: str
+    x0: int
+    y0: int
+    size: int
+
+
+def excluded_refs(
+    query_paths: list[Path],
+    ref_paths: list[Path],
+    footprints: dict[Path, Footprint] | None = None,
+) -> list[list[int]]:
+    """For each query tile, the reference tiles it must not be matched against.
+
+    That is the tile itself and every reference tile overlapping it on the sky. Tiles
+    overlap by design (half a crop by default, and the crop flush with each far edge
+    can share almost all of its pixels), and an object in the shared strip would
+    otherwise find itself in the bank and score as ordinary.
+    """
+    ref_index = {p: i for i, p in enumerate(ref_paths)}
+    out = [[ref_index[p]] if p in ref_index else [] for p in query_paths]
+    if not footprints:
+        return out
+
+    by_mosaic: dict[str, list[int]] = {}
+    for i, p in enumerate(ref_paths):
+        if p in footprints:
+            by_mosaic.setdefault(footprints[p].mosaic, []).append(i)
+    boxes = {
+        m: (
+            np.array(idx),
+            np.array(
+                [
+                    [
+                        footprints[ref_paths[i]].x0,
+                        footprints[ref_paths[i]].y0,
+                        footprints[ref_paths[i]].size,
+                    ]
+                    for i in idx
+                ]
+            ),
+        )
+        for m, idx in by_mosaic.items()
+    }
+    for q, p in enumerate(query_paths):
+        f = footprints.get(p)
+        if f is None or f.mosaic not in boxes:
+            continue
+        idx, b = boxes[f.mosaic]
+        hit = (
+            (b[:, 0] < f.x0 + f.size)
+            & (f.x0 < b[:, 0] + b[:, 2])
+            & (b[:, 1] < f.y0 + f.size)
+            & (f.y0 < b[:, 1] + b[:, 2])
+        )
+        out[q] = sorted(set(out[q]) | set(idx[hit].tolist()))
+    return out
+
+
+class SubspaceModel:
+    """SubspaceAD (Lendering et al., 2026): normal patches live near a PCA subspace.
+
+    It keeps the mean and the top principal directions that explain `variance` of the
+    reference patches, and scores a patch by its squared distance to that subspace.
+    Nothing is matched patch to patch, so there is no own-tile problem to work
+    around, and one tile's patches barely move a covariance built from thousands.
+    """
+
+    def __init__(self, features: torch.Tensor, variance: float = 0.99):
+        if not 0 < variance <= 1:
+            raise ValueError(f"--subspace_variance has to be in (0, 1], got {variance}")
+        x = features.double()
+        self.mean = x.mean(dim=0)
+        cov = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float64, device=x.device)
+        for start in range(0, x.shape[0], 1 << 16):
+            c = x[start : start + (1 << 16)] - self.mean
+            cov += c.T @ c
+        cov /= max(1, x.shape[0] - 1)
+        eigvals, eigvecs = torch.linalg.eigh(cov)  # ascending
+        eigvals, eigvecs = eigvals.flip(0).clamp_min(0), eigvecs.flip(1)
+        share = eigvals.cumsum(0) / eigvals.sum()
+        self.rank = min(int((share < variance).sum().item()) + 1, share.numel())
+        self.basis = eigvecs[:, : self.rank].float()
+        self.mean = self.mean.float()
+        logger.info(
+            "Subspace keeps %d of %d directions for %.1f%% of the variance",
+            self.rank,
+            x.shape[1],
+            100 * variance,
+        )
+
+    def __len__(self) -> int:
+        return self.basis.shape[0]
+
+    @torch.inference_mode()
+    def distances(self, queries: torch.Tensor, *_unused) -> torch.Tensor:
+        """Squared residual of each (N, D) query off the subspace. It takes, and ignores,
+        the bank's k and exclusion arguments so score_queries can call either."""
+        c = queries.float() - self.mean
+        return (c.square().sum(dim=1) - (c @ self.basis).square().sum(dim=1)).clamp_min(0)
 
 
 def _last_of_each(slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -192,12 +315,13 @@ def build_memory_bank(
 @torch.inference_mode()
 def score_queries(
     backbone: Backbone,
-    bank: MemoryBank,
+    bank: MemoryBank | SubspaceModel,
     query_paths: list[Path],
     query_root: Path,
     maps_dir: Path | None,
     *,
-    query_owners: list[int] | None = None,
+    exclude: list[list[int]] | None = None,
+    n_ref: int = 0,
     masking: bool = False,
     k_neighbors: int = 1,
     score_mode: str = "top1p",
@@ -210,8 +334,8 @@ def score_queries(
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Score every query tile. Returns the scores and the seconds spent per tile.
 
-    `query_owners` gives, for each query tile, its index among the reference tiles or
-    -1, so a reference tile is scored against the other tiles only.
+    `exclude` lists, for each query tile, the indices of the `n_ref` reference tiles it
+    must not be matched against: itself, and any tile sharing pixels with it.
     """
     if save_tiffs:
         import tifffile
@@ -226,9 +350,6 @@ def score_queries(
         num_workers=num_workers,
         pin_memory=backbone.device.type == "cuda",
     )
-    owners_all = torch.tensor(
-        query_owners if query_owners is not None else [-1] * len(query_paths), dtype=torch.int32
-    )
     grid = backbone.grid_size
     scores: dict[str, float] = {}
     seconds: dict[str, float] = {}
@@ -236,19 +357,27 @@ def score_queries(
     start = 0
     for keys, images in tqdm(loader, desc="Scoring query tiles"):
         started = time.perf_counter()
-        owners = owners_all[start : start + len(keys)]
-        owners = owners.repeat_interleave(backbone.n_patches).to(backbone.device)
+        rows = excluded = None
+        batch_exclude = exclude[start : start + len(keys)] if exclude else []
+        if any(batch_exclude):
+            excluded = torch.zeros((len(keys), max(n_ref, 1)), dtype=torch.bool)
+            for i, refs in enumerate(batch_exclude):
+                excluded[i, refs] = True
+            excluded = excluded.to(backbone.device)
+            rows = torch.arange(len(keys), device=backbone.device)
+            rows = rows.repeat_interleave(backbone.n_patches)
         start += len(keys)
 
         feats = backbone.embed(images)
         flat = feats.reshape(-1, feats.shape[-1])
         keep = background_mask(feats, grid) if masking else None
         if keep is None:
-            dists = bank.distances(flat, k_neighbors, owners)
+            dists = bank.distances(flat, k_neighbors, rows, excluded)
         else:
             valid = keep.reshape(-1)
             dists = torch.zeros(flat.shape[0], device=flat.device, dtype=torch.float32)
-            dists[valid] = bank.distances(flat[valid], k_neighbors, owners[valid])
+            sub_rows = rows[valid] if rows is not None else None
+            dists[valid] = bank.distances(flat[valid], k_neighbors, sub_rows, excluded)
 
         _sync(backbone.device)
         elapsed = (time.perf_counter() - started) / len(keys)
@@ -310,14 +439,20 @@ def run_anomaly_detection(
     seed: int = 0,
     save_patch_dists: bool = True,
     save_tiffs: bool = False,
+    footprints: dict[Path, Footprint] | None = None,
+    detector: str = "knn",
+    subspace_variance: float = 0.99,
 ) -> tuple[dict[str, float], float, dict[str, float]]:
     """Build the bank from `ref_paths` and score `query_paths` against it.
 
     Returns the scores, the seconds spent on the bank and the seconds spent per tile.
     A query path that is also in `ref_paths` is scored against the other reference
-    tiles only. The bank build runs the model many times before any timing
-    starts, so the CUDA kernels are warm by the time the scoring is timed.
+    tiles only, and with `footprints` against the ones it shares no pixels with
+    either. The bank build runs the model many times before any timing starts, so
+    the CUDA kernels are warm by the time the scoring is timed.
     """
+    if mask_ref_images and not masking:
+        logger.warning("--mask_ref_images only works with --masking, so it is ignored here")
     started = time.perf_counter()
     bank = build_memory_bank(
         backbone,
@@ -325,23 +460,28 @@ def run_anomaly_detection(
         ref_root,
         masking=masking and mask_ref_images,
         rotation=rotation,
-        metric=knn_metric,
+        # The subspace is fitted to the raw features, which L2_normalized would rescale.
+        metric=knn_metric if detector == "knn" else "L2",
         max_patches=max_bank_patches,
         batch_size=batch_size,
         num_workers=num_workers,
         seed=seed,
     )
+    if detector == "subspace":
+        bank = SubspaceModel(bank.features, subspace_variance)
+    elif detector != "knn":
+        raise ValueError(f"Unknown detector {detector!r}, expected knn or subspace")
     _sync(backbone.device)
     memorybank_sec = time.perf_counter() - started
 
-    ref_index = {p: i for i, p in enumerate(ref_paths)}
     scores, seconds = score_queries(
         backbone,
         bank,
         query_paths,
         query_root,
         Path(out_dir) / f"anomaly_maps/seed={seed}",
-        query_owners=[ref_index.get(p, -1) for p in query_paths],
+        exclude=excluded_refs(query_paths, ref_paths, footprints),
+        n_ref=len(ref_paths),
         masking=masking,
         k_neighbors=k_neighbors,
         score_mode=score_mode,

@@ -31,7 +31,8 @@ def aggregate_score(
     d = np.asarray(dists, dtype=np.float32).reshape(-1)
     d = d[np.isfinite(d)]
     if d.size == 0:
-        return 0.0
+        # No patch could be compared with anything, which isn't the same as normal.
+        return float("nan")
 
     if mode == "top1p":
         top_frac, mode = 0.01, "topk_mean"

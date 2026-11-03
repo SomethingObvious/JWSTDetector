@@ -35,6 +35,8 @@ results*/
 paper_plots*/
 paper_tables*/
 viewer_renders*/
+bench_*/
+*.log
 
 # Notebooks kept out of the repo
 *personal.ipynb
