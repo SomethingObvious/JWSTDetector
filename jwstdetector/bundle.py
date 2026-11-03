@@ -22,11 +22,53 @@ import numpy as np
 import yaml
 from PIL import Image
 
-from jwstdetector.data import read_manifest, read_measurements
+from jwstdetector.data import owned_patches, read_manifest, read_measurements
+from jwstdetector.detection import Footprint
+
+EMBED_DIMS = 32
 
 
 def _tile_id(i: int) -> str:
     return f"{i:06d}"
+
+
+def mosaic_wcs(meta: dict):
+    """The celestial WCS mosaics/<id>.json records."""
+    from astropy.wcs import WCS
+
+    return WCS(meta["wcs"])
+
+
+def patch_pixels(entries: list[dict], grid: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Mosaic pixel coordinates, 0-based, of the centre of each entry's peak patch.
+
+    The patch grid covers the PNG with its top row first, and the PNG's top row is the
+    tile's highest FITS row, so rows count down from y0 + size.
+    """
+    r = np.array([e["peak"][0] for e in entries], dtype=np.float64)
+    c = np.array([e["peak"][1] for e in entries], dtype=np.float64)
+    size = np.array([e["size"] for e in entries], dtype=np.float64)
+    x = np.array([e["x0"] for e in entries]) + (c + 0.5) * size / grid[1] - 0.5
+    y = np.array([e["y0"] for e in entries]) + size - (r + 0.5) * size / grid[0] - 0.5
+    return x, y
+
+
+def descriptor_embedding(path: Path, keys: list[str], dims: int = EMBED_DIMS) -> np.ndarray:
+    """Each key's descriptor from descriptors.npz, reduced by PCA and scaled to unit length.
+
+    A 1024-dim float per tile is 4 KB, which adds up for a browser, and the top few
+    dozen components keep nearly all of what cosine similarity sees.
+    """
+    with np.load(path) as f:
+        lookup = {str(k): i for i, k in enumerate(f["keys"])}
+        x = f["vectors"].astype(np.float64)[[lookup[k] for k in keys]]
+    x -= x.mean(axis=0)
+    _, _, vt = np.linalg.svd(x, full_matrices=False)
+    z = x @ vt[: min(dims, vt.shape[0])].T
+    z /= np.linalg.norm(z, axis=1, keepdims=True).clip(1e-12)
+    out = np.zeros((len(keys), dims), dtype=np.float32)
+    out[:, : z.shape[1]] = z
+    return out
 
 
 def _map_path(maps_dir: Path, key: str) -> Path:
@@ -44,7 +86,7 @@ class Tile:
 
 
 class RunBundle:
-    """Joins a run folder from run_query_bootstrap.py with the dataset prep_data.py wrote."""
+    """Joins a folder from `jwstdetector run` with the dataset `jwstdetector prep` wrote."""
 
     def __init__(self, run_dir: Path, data_root: Path, *, writable: bool):
         self.run_dir = Path(run_dir)
@@ -70,6 +112,18 @@ class RunBundle:
         values = []
         # A tile with nothing to compare against scored NaN. It goes last, as null.
         ranked = sorted(scores, key=lambda k: (scores[k] != scores[k], -scores[k]))
+        owned = {}
+        # Runs from before --score_region scored every patch.
+        if self.args.get("score_region", "all") == "owned" and ranked:
+            first = np.load(
+                _map_path(self.run_dir / "pass2" / f"anomaly_maps/seed={seed}", ranked[0])
+            )
+            footprints = {
+                k: Footprint(m["mosaic"], m["x0"], m["y0"], m["size"])
+                for k, m in manifest.items()
+                if k in scores
+            }
+            owned = owned_patches(footprints, first.shape)
         for rank, key in enumerate(ranked, start=1):
             meta = manifest.get(key)
             if meta is None:
@@ -85,7 +139,9 @@ class RunBundle:
 
             grid = np.load(map2)
             values.append(grid.ravel())
-            peak = np.unravel_index(int(np.argmax(grid)), grid.shape)
+            mine = owned.get(key)
+            scored = np.where(mine, grid, -np.inf) if mine is not None else grid
+            peak = np.unravel_index(int(np.argmax(scored)), grid.shape)
             entry = {
                 "key": key,
                 "rank": rank,
@@ -102,6 +158,10 @@ class RunBundle:
             }
             if _finite(pass1.get(key)) is not None:
                 entry["score_pass1"] = pass1[key]
+            if mine is not None and not mine.all():
+                r, c = np.nonzero(mine)
+                # First and last row and column the tile scored, for the plate's outline.
+                entry["owned"] = [int(r.min()), int(r.max()), int(c.min()), int(c.max())]
             entries.append(entry)
 
         if not entries:
@@ -115,6 +175,29 @@ class RunBundle:
             meta = json.loads((self.data_root / "mosaics" / f"{mosaic_id}.json").read_text("utf-8"))
             meta["preview"] = f"mosaics/{mosaic_id}.png"
             mosaics[mosaic_id] = meta
+
+        for mosaic_id, meta in mosaics.items():
+            if "wcs" not in meta:
+                continue
+            mine = [e for e in entries if e["mosaic"] == mosaic_id]
+            x, y = patch_pixels(mine, grid_shape)
+            ra, dec = mosaic_wcs(meta).all_pix2world(x, y, 0)
+            for e, a, d in zip(mine, ra.tolist(), dec.tolist(), strict=True):
+                e["peak_sky"] = [round(a, 7), round(d, 7)]
+
+        xmatch = None
+        xmatch_path = self.run_dir / "crossmatch.json"
+        if xmatch_path.is_file():
+            xmatch = json.loads(xmatch_path.read_text(encoding="utf-8"))
+            for e in entries:
+                if e["key"] in xmatch["tiles"]:
+                    e["xmatch"] = xmatch["tiles"][e["key"]]
+
+        self.embedding = None
+        desc_path = self.run_dir / "pass2" / "descriptors.npz"
+        if desc_path.is_file():
+            self.embedding = descriptor_embedding(desc_path, [e["key"] for e in entries])
+        self._sources: dict[str, tuple] = {}
 
         resolution = int(self.args.get("resolution", 448))
         self.index = {
@@ -133,6 +216,16 @@ class RunBundle:
                 "n_reference": len(refs),
                 "created": datetime.fromtimestamp(final.stat().st_mtime, UTC).isoformat(),
                 "args": self.args,
+                "embedding_dims": EMBED_DIMS if self.embedding is not None else 0,
+                "xmatch": (
+                    {
+                        "radius_arcsec": xmatch["radius_arcsec"],
+                        "checked": xmatch["checked"],
+                        "failed": sorted(xmatch["failed"]),
+                    }
+                    if xmatch
+                    else None
+                ),
             },
             "mosaics": mosaics,
             "tiles": entries,
@@ -164,13 +257,59 @@ class RunBundle:
             if cutout is None:
                 raise FileNotFoundError(path)
             return cutout.read_bytes(), "application/fits"
+        if path == "embedding.f32" and self.embedding is not None:
+            return self.embedding.astype("<f4").tobytes(), "application/octet-stream"
+        if folder == "cats" and self.index["run"]["xmatch"]:
+            i = int(Path(name).stem) if Path(name).stem.isdigit() else -1
+            if not 0 <= i < len(self.tiles):
+                raise FileNotFoundError(path)
+            return json.dumps(self.tile_sources(i)).encode(), "application/json"
         if folder == "mosaics" and name.endswith(".png") and "/" not in name:
             return (self.data_root / "mosaics" / name).read_bytes(), "image/png"
         raise FileNotFoundError(path)
 
+    def tile_sources(self, i: int) -> list[list]:
+        """Catalogued sources over tile i as [catalogue, name, type, note, u, v].
+
+        u and v run from 0 to 1 across the tile from its top left corner, which maps
+        onto the PNG and the cutout alike whatever their pixel sizes.
+        """
+        entry = self.index["tiles"][i]
+        mosaic = entry["mosaic"]
+        if mosaic not in self._sources:
+            cache = self.run_dir / "catalogues" / f"{mosaic}.json"
+            rows = []
+            if cache.is_file() and "wcs" in self.index["mosaics"][mosaic]:
+                cats = json.loads(cache.read_text(encoding="utf-8"))["catalogues"]
+                rows = [[c, *r] for c, v in cats.items() if v["ok"] for r in v["rows"]]
+            if rows:
+                wcs = mosaic_wcs(self.index["mosaics"][mosaic])
+                x, y = wcs.all_world2pix([r[2] for r in rows], [r[3] for r in rows], 0)
+            else:
+                x = y = np.zeros(0)
+            self._sources[mosaic] = (rows, np.asarray(x), np.asarray(y))
+        rows, x, y = self._sources[mosaic]
+        x0, y0, size = entry["x0"], entry["y0"], entry["size"]
+        u = (x - x0 + 0.5) / size
+        v = (y0 + size - 0.5 - y) / size
+        inside = np.flatnonzero((u >= 0) & (u <= 1) & (v >= 0) & (v <= 1))
+        return [
+            [
+                rows[k][0],
+                rows[k][1],
+                rows[k][4],
+                rows[k][5],
+                round(float(u[k]), 5),
+                round(float(v[k]), 5),
+            ]
+            for k in inside
+        ]
+
     def paths(self):
         yield "index.json"
         yield "verdicts.json"
+        if self.embedding is not None:
+            yield "embedding.f32"
         for i, tile in enumerate(self.tiles):
             yield f"tiles/{_tile_id(i)}.png"
             yield f"maps/{_tile_id(i)}.f32"
@@ -178,6 +317,8 @@ class RunBundle:
                 yield f"maps1/{_tile_id(i)}.f32"
             if self.index["tiles"][i]["has_cutout"]:
                 yield f"cutouts/{_tile_id(i)}.fits"
+            if self.index["run"]["xmatch"]:
+                yield f"cats/{_tile_id(i)}.json"
         for mosaic_id in self.index["mosaics"]:
             yield f"mosaics/{mosaic_id}.png"
 
@@ -258,6 +399,8 @@ def export(
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
         n += 1
+    # GitHub Pages runs Jekyll otherwise, which is slow on a thousand files and does nothing here.
+    (out_dir / ".nojekyll").touch()
     return n
 
 
@@ -330,6 +473,21 @@ def add_site_meta(bundle: RunBundle, out_dir: Path, site_url: str) -> None:
     )
 
 
+def _lit_span(lit: np.ndarray, centre: float, length: int) -> tuple[int, int]:
+    """The run of indices around `centre` lit at least a quarter as much as the median,
+    over 5 at a time, or the whole axis when that run is shorter than `length`."""
+    good = np.convolve(lit, np.ones(5) / 5, mode="same") >= 0.25 * np.median(lit)
+    i = min(max(int(centre), 0), len(lit) - 1)
+    if not good[i]:
+        return 0, len(lit)
+    start, end = i, i + 1
+    while start > 0 and good[start - 1]:
+        start -= 1
+    while end < len(lit) and good[end]:
+        end += 1
+    return (start, end) if end - start >= length else (0, len(lit))
+
+
 def _social_card(bundle: RunBundle, path: Path) -> None:
     """A 1200 by 630 crop of the top tile's mosaic preview, centred on that tile."""
     top = bundle.index["tiles"][0]
@@ -344,7 +502,11 @@ def _social_card(bundle: RunBundle, path: Path) -> None:
         # gaps between detectors, and still shows plenty of sky around it.
         h = min(im.height // 2, round(im.width * 630 / 1200))
         w = round(h * 1200 / 630)
-        left = int(min(max(cx - w / 2, 0), im.width - w))
-        upper = int(min(max(cy - h / 2, 0), im.height - h))
+        # Kept off blank columns and rows, like the gap between NIRCam's modules.
+        lit = np.asarray(im.convert("L")) > 0
+        x0, x1 = _lit_span(lit.mean(axis=0), cx, w)
+        y0, y1 = _lit_span(lit.mean(axis=1), cy, h)
+        left = int(min(max(cx - w / 2, x0), x1 - w))
+        upper = int(min(max(cy - h / 2, y0), y1 - h))
         card = im.crop((left, upper, left + w, upper + h)).resize((1200, 630), Image.LANCZOS)
     card.save(path, optimize=True)

@@ -43,6 +43,7 @@
   --anno-wash: rgb(255 179 71 / 0.09);
   --anno-ink: #0b1220;
   --ring: #ff4d4d;
+  --cat: #4fe3d9;
   --nan: #1a2437;
   --v-interesting: #7cc7ff;
   --v-artifact: #c9a6ff;
@@ -79,6 +80,7 @@
   --anno-wash: rgb(31 58 110 / 0.08);
   --anno-ink: #f3f2ee;
   --ring: #c8221a;
+  --cat: #00707a;
   --nan: #d3cfc4;
   --v-interesting: #1f3a6e;
   --v-artifact: #5b2f86;
@@ -115,6 +117,7 @@
   --anno-wash: rgb(143 214 148 / 0.1);
   --anno-ink: #1f2023;
   --ring: #ff5a50;
+  --cat: #4fe3d9;
   --nan: #3a3d42;
   --v-interesting: #6fb8ff;
   --v-artifact: #d0a8ff;

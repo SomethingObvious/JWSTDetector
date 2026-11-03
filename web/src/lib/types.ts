@@ -14,6 +14,9 @@ export interface RunInfo {
   n_reference: number;
   created: string;
   args: Record<string, unknown>;
+  /** Width of each row of embedding.f32, or 0 when the run saved no descriptors. */
+  embedding_dims?: number;
+  xmatch?: { radius_arcsec: number; checked: string[]; failed: string[] } | null;
 }
 
 export interface MosaicInfo {
@@ -40,8 +43,29 @@ export interface TileInfo {
   ra: number;
   dec: number;
   peak: [number, number];
+  /** RA and Dec of the peak patch's centre. */
+  peak_sky?: [number, number];
+  /** First and last patch row and column the tile was scored on, when it wasn't all of them. */
+  owned?: [number, number, number, number];
   has_cutout: boolean;
+  xmatch?: TileMatch;
 }
+
+export interface CatalogueMatch {
+  name: string;
+  type: string;
+  note: string;
+  /** Arcseconds from the peak patch. */
+  sep: number;
+}
+
+export interface TileMatch {
+  nearest: Record<string, CatalogueMatch>;
+  uncatalogued: boolean;
+}
+
+/** A catalogued source over a tile, as [catalogue, name, type, note, u, v] from the top left. */
+export type TileSource = [string, string, string, string, number, number];
 
 export interface Bundle {
   version: number;
@@ -89,6 +113,7 @@ export interface Display {
   threshold: number;
   source: MapSource;
   contours: boolean;
+  catalogues: boolean;
 }
 
 export type Theme = 'atlas' | 'plate' | 'classic';

@@ -6,7 +6,8 @@
   import { TileFrame } from './lib/frame';
   import type { Renderer } from './lib/gl';
   import { TileCache, computeLimits, type Limits, type TileData } from './lib/tiles';
-  import type { Bundle, Display, Theme, Verdict } from './lib/types';
+  import { VERDICT_VALUE, learnedValue, priority, similar, valueAt } from './lib/learn';
+  import { tileId, type Bundle, type Display, type Theme, type TileSource, type Verdict } from './lib/types';
   import { Verdicts } from './lib/verdicts.svelte';
   import { Tan } from './lib/wcs';
 
@@ -31,6 +32,7 @@
     threshold: 0.6,
     source: 'pass2',
     contours: false,
+    catalogues: true,
   };
   const saved = (() => {
     try {
@@ -52,7 +54,10 @@
   let display = $state<Display>(initial);
   let theme = $state<Theme>(saved.theme && ['atlas', 'plate', 'classic'].includes(saved.theme) ? saved.theme : 'atlas');
   let advance = $state(saved.advance ?? true);
-  let filters = $state<Filters>({ text: '', verdict: 'all', mosaic: '', scoreMin: null, scoreMax: null, sort: 'rank', desc: false });
+  let filters = $state<Filters>({ text: '', verdict: 'all', match: 'all', mosaic: '', scoreMin: null, scoreMax: null, sort: 'rank', desc: false });
+  let embedding = $state.raw<Float32Array | null>(null);
+  let sources = $state.raw<TileSource[]>([]);
+  const sourceCache = new Map<number, TileSource[]>();
 
   let current = $state(0);
   let data = $state.raw<TileData | null>(null);
@@ -108,6 +113,17 @@
       wcs = new Map(Object.entries(b.mosaics).map(([k, m]) => [k, new Tan(m.wcs)]));
       const v = new Verdicts(b, base);
       await v.load();
+      const width = b.run.embedding_dims ?? 0;
+      if (width) {
+        // Similar tiles and learning from verdicts need it, and the rest of the viewer doesn't.
+        fetch(`${base}embedding.f32`)
+          .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+          .then((buf) => {
+            const e = new Float32Array(buf);
+            if (e.length === b.tiles.length * width) embedding = e;
+          })
+          .catch(() => {});
+      }
       verdicts = v;
       cache = new TileCache(
         base,
@@ -136,6 +152,7 @@
     for (let i = 0; i < tiles.length; i++) {
       const t = tiles[i];
       if (f.mosaic && t.mosaic !== f.mosaic) continue;
+      if (f.match !== 'all' && (!t.xmatch || t.xmatch.uncatalogued !== (f.match === 'uncatalogued'))) continue;
       if (f.scoreMin !== null && (t.score === null || t.score < f.scoreMin)) continue;
       if (f.scoreMax !== null && (t.score === null || t.score > f.scoreMax)) continue;
       if (f.verdict !== 'all' || q) {
@@ -148,8 +165,11 @@
       out.push(i);
     }
     if (f.sort !== 'rank' || f.desc) {
+      const pr = f.sort === 'priority' ? priorities : null;
       const key: (i: number) => number =
-        f.sort === 'score'
+        pr
+          ? (i) => -pr[i]
+          : f.sort === 'score'
           ? (i) => tiles[i].score ?? -Infinity
           : f.sort === 'delta'
             ? (i) => (tiles[i].score ?? 0) - (tiles[i].score_pass1 ?? tiles[i].score ?? 0)
@@ -162,6 +182,48 @@
       out.sort((a, b) => (key(a) - key(b)) * dir || tiles[a].rank - tiles[b].rank);
     }
     return Int32Array.from(out);
+  });
+
+  const indexOfKey = $derived(new Map(bundle?.tiles.map((t, i) => [t.key, i]) ?? []));
+
+  // Verdicts as values to learn from, by tile index.
+  const labels = $derived.by(() => {
+    const m = new Map<number, number>();
+    if (!verdicts) return m;
+    for (const [key, v] of verdicts.map) {
+      const i = indexOfKey.get(key);
+      if (v.verdict && i !== undefined) m.set(i, VERDICT_VALUE[v.verdict]);
+    }
+    return m;
+  });
+  const dims = $derived(bundle?.run.embedding_dims ?? 0);
+  // Only worked out for every tile while the list is sorted by it.
+  const priorities = $derived.by(() => {
+    if (!bundle || !embedding || filters.sort !== 'priority') return null;
+    const value = learnedValue(embedding, dims, labels);
+    return priority(
+      bundle.tiles.map((t) => t.rank),
+      bundle.tiles.map((t) => t.score !== null),
+      value,
+    );
+  });
+  const learned = $derived(embedding ? { value: valueAt(embedding, dims, labels, current), from: labels.size } : null);
+  const alike = $derived(embedding ? similar(embedding, dims, current, 6) : []);
+
+  // Catalogued sources over the current tile, for the plate markers and the readout.
+  $effect(() => {
+    const i = current;
+    if (!bundle?.run.xmatch) return;
+    const hit = sourceCache.get(i);
+    sources = hit ?? [];
+    if (hit) return;
+    fetch(`${base}cats/${tileId(i)}.json`)
+      .then((r) => (r.ok ? (r.json() as Promise<TileSource[]>) : []))
+      .then((s) => {
+        sourceCache.set(i, s);
+        if (current === i) sources = s;
+      })
+      .catch(() => {});
   });
 
   const posOf = $derived.by(() => {
@@ -335,6 +397,7 @@
     } else if (k === 'f') plate?.fit();
     else if (k === '0') plate?.oneToOne();
     else if (k === 'o') display.overlay = !display.overlay;
+    else if (k === 'c') display.catalogues = !display.catalogues;
     else if (k === '?') sheet?.open ? sheet.close() : sheet?.showModal();
     else if (k >= '1' && k <= '4') setVerdict((['interesting', 'artifact', 'known', 'not_anomalous'] as const)[Number(k) - 1]);
     else if (k === 'Delete' || k === 'Backspace') setVerdict(null);
@@ -405,6 +468,8 @@
           {mapRange}
           {theme}
           {cursor}
+          sources={bundle.run.xmatch && display.catalogues ? sources : []}
+          hasCatalogues={!!bundle.run.xmatch}
           onrenderer={(r) => (renderer = r)}
           oncursor={(c) => (cursor = c)}
         />
@@ -422,6 +487,9 @@
           {verdicts}
           {order}
           {theme}
+          {sources}
+          {learned}
+          {alike}
           bind:advance
           bind:noteEl
           onselect={select}
@@ -502,6 +570,7 @@
         <dt><kbd>f</kbd></dt><dd>Fit the tile</dd>
         <dt><kbd>0</kbd></dt><dd>One image pixel per screen pixel</dd>
         <dt><kbd>o</kbd></dt><dd>Overlay on or off</dd>
+        <dt><kbd>c</kbd></dt><dd>Catalogue markers on or off</dd>
         <dt><kbd>?</kbd></dt><dd>This sheet</dd>
       </dl>
       <p class="dim">A verdict moves to the next tile unless you turn that off in the Verdict block. Drag the plate to pan, scroll to zoom and double-click to fit.</p>
