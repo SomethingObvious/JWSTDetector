@@ -15,7 +15,14 @@ import numpy as np
 import yaml
 
 from jwstdetector.backbones import get_backbone
-from jwstdetector.data import list_images, resolve_device, write_measurements_csv, write_ref_list
+from jwstdetector.data import (
+    list_images,
+    prepare_out_dir,
+    resolve_device,
+    tagged_dir,
+    write_measurements_csv,
+    write_ref_list,
+)
 from jwstdetector.detection import METRICS, run_anomaly_detection
 from jwstdetector.scoring import SCORE_MODES
 from jwstdetector.seeding import set_seed
@@ -35,6 +42,24 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--autocast", default=True, action=argparse.BooleanOptionalAction)
 
+    p.add_argument(
+        "--detector",
+        default="knn",
+        choices=("knn", "subspace"),
+        help="knn is AnomalyDINO's nearest-patch distance, subspace is SubspaceAD's PCA residual.",
+    )
+    p.add_argument(
+        "--subspace_variance",
+        type=float,
+        default=0.99,
+        help="Share of the reference variance the subspace keeps.",
+    )
+    p.add_argument(
+        "--layers",
+        default="last",
+        help="Patch features from the last layer, the mid band SubspaceAD uses, a range like "
+        "14-20, or a list.",
+    )
     p.add_argument("--knn_metric", default="L2_normalized", choices=METRICS)
     p.add_argument("--k_neighbors", type=int, default=1)
     p.add_argument("--max_bank_patches", type=int, default=1_000_000)
@@ -64,6 +89,11 @@ def parse_args(argv: list[str] | None = None):
     p.add_argument("--deterministic", default=False, action=argparse.BooleanOptionalAction)
     p.add_argument("--results_dir", default=None, help="Write here instead of results_single/.")
     p.add_argument("--tag", default=None)
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the results already in the output folder instead of stopping.",
+    )
     p.add_argument("--recursive_ref", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--recursive_query", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--verbose", action="store_true")
@@ -91,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         resolve_device(args.device),
         resolution=args.resolution,
         autocast=args.autocast,
+        layers=args.layers,
     )
 
     ref_candidates = list_images(train_dir, recursive=args.recursive_ref)
@@ -99,14 +130,19 @@ def main(argv: list[str] | None = None) -> int:
 
     for shot in args.shots:
         if not args.results_dir:
-            base = Path(f"results_single/{args.model_name}_{backbone.resolution}/{shot}-shot")
+            # A local checkpoint path would otherwise put its own folders, or a drive
+            # letter, into the results path.
+            model = Path(args.model_name.rstrip("/\\")).name
+            base = Path(f"results_single/{model}_{backbone.resolution}/{shot}-shot")
         elif len(args.shots) > 1:
             # Otherwise each shot count would overwrite the one before it.
             base = Path(args.results_dir) / f"{shot}-shot"
         else:
             base = Path(args.results_dir)
-        results_dir = Path(f"{base}_{args.tag}" if args.tag else base)
-        results_dir.mkdir(parents=True, exist_ok=True)
+        results_dir = tagged_dir(base, args.tag)
+        prepare_out_dir(
+            results_dir, ["args.yaml", "measurements_seed=*.csv", "seed=*"], args.overwrite
+        )
         (results_dir / "args.yaml").write_text(yaml.safe_dump(vars(args)), encoding="utf-8")
 
         for seed in seeds:
@@ -152,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
                 seed=seed,
                 save_patch_dists=args.save_patch_dists,
                 save_tiffs=args.save_tiffs,
+                detector=args.detector,
+                subspace_variance=args.subspace_variance,
             )
 
             write_measurements_csv(run_dir / "measurements.csv", scores, memorybank_sec, seconds)

@@ -123,11 +123,40 @@ def _normalisation(repo: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
 
     path = Path(repo) / "preprocessor_config.json"
     if not path.is_file():
+        if Path(repo).is_dir():
+            logger.warning("%s has no preprocessor_config.json, so using ImageNet's", repo)
+            return IMAGENET_MEAN, IMAGENET_STD
         path = Path(hf_hub_download(repo, "preprocessor_config.json"))
     config = json.loads(path.read_text(encoding="utf-8"))
     mean = tuple(config.get("image_mean", IMAGENET_MEAN))
     std = tuple(config.get("image_std", IMAGENET_STD))
     return mean, std
+
+
+def parse_layers(spec: str, depth: int) -> list[int] | None:
+    """Which hidden states to average for --layers, or None for the final output.
+
+    "mid" is the band SubspaceAD found best on DINOv2-G (layers 22 to 28 of 40),
+    scaled to this model's depth. "a-b" takes layers a to b counted from 1, and a
+    comma list takes those layers.
+    """
+    if spec == "last":
+        return None
+    if spec == "mid":
+        return list(range(round(depth * 22 / 40), round(depth * 28 / 40) + 1))
+    try:
+        if "-" in spec:
+            a, b = (int(v) for v in spec.split("-"))
+            picked = list(range(a, b + 1))
+        else:
+            picked = [int(v) for v in spec.split(",")]
+    except ValueError:
+        raise ValueError(
+            f"--layers takes last, mid, a range like 14-20 or a list, not {spec!r}"
+        ) from None
+    if not picked or min(picked) < 1 or max(picked) > depth:
+        raise ValueError(f"--layers {spec} is outside this model's 1 to {depth}")
+    return picked
 
 
 def get_backbone(
@@ -136,6 +165,7 @@ def get_backbone(
     resolution: int = 448,
     *,
     autocast: bool = True,
+    layers: str = "last",
 ) -> Backbone:
     """Load a backbone by name, dinov3-*, dinov2_*, a Hub repo id or a local checkpoint folder."""
     from transformers import AutoModel
@@ -155,8 +185,13 @@ def get_backbone(
     # The CLS token and any register tokens sit in front of the patch tokens.
     n_prefix = 1 + int(getattr(model.config, "num_register_tokens", 0))
 
+    picked = parse_layers(layers, int(model.config.num_hidden_layers))
+
     def forward_patches(x: torch.Tensor) -> torch.Tensor:
-        return model(pixel_values=x).last_hidden_state[:, n_prefix:, :]
+        if picked is None:
+            return model(pixel_values=x).last_hidden_state[:, n_prefix:, :]
+        hidden = model(pixel_values=x, output_hidden_states=True).hidden_states
+        return torch.stack([hidden[i][:, n_prefix:, :] for i in picked]).mean(dim=0)
 
     patch_size = model.config.patch_size
     patch_size = int(patch_size[0] if isinstance(patch_size, (list, tuple)) else patch_size)
@@ -189,12 +224,14 @@ def get_backbone(
 
 
 def _first_components(feats: torch.Tensor, q: int) -> torch.Tensor:
-    """(B, N, D) patch embeddings projected onto their top `q` principal components."""
-    centred = feats - feats.mean(dim=1, keepdim=True)
-    # pca_lowrank wants a little headroom above the rank it's asked for.
-    rank = min(q + 4, centred.shape[1], centred.shape[2])
-    _, _, v = torch.pca_lowrank(centred, q=rank, center=False)
-    return centred @ v[..., :q]
+    """(B, N, D) patch embeddings projected onto their top `q` principal components.
+
+    It's an exact SVD. torch.pca_lowrank starts from a random matrix drawn from the
+    global generator, so a tile's mask used to depend on how many draws came before it.
+    """
+    centred = feats.float() - feats.float().mean(dim=1, keepdim=True)
+    _, _, vh = torch.linalg.svd(centred, full_matrices=False)
+    return centred @ vh[..., :q, :].transpose(-1, -2)
 
 
 @torch.inference_mode()
@@ -208,24 +245,31 @@ def background_mask(
 ) -> torch.Tensor:
     """A (B, N) bool mask of the patches in a (B, N, D) batch that are worth scoring.
 
-    It thresholds the first principal component of the patch embeddings and keeps
-    whichever sign covers the centre of the tile, since the component's sign is
-    arbitrary. The cut is `sigma` standard deviations of that component rather than
-    AnomalyDINO's fixed 10, which was tuned to DINOv2's feature scale and masks
-    out the whole tile on a backbone with smaller embeddings, DINOv3 included.
+    It thresholds the first principal component of the patch embeddings on both
+    sides and keeps the side that crowds into the centre of the tile more than it
+    covers the tile overall, which is where a tile's subject sits. Both sides are
+    judged the same way, so the component's arbitrary sign can't change the answer.
+    The cut is `sigma` standard deviations of that component rather than AnomalyDINO's
+    fixed 10, which was tuned to DINOv2's feature scale and masks out the whole tile
+    on a backbone with smaller embeddings, DINOv3 included.
     """
     b = feats.shape[0]
     h, w = grid_size
     pc1 = _first_components(feats, 1).squeeze(-1)  # (B, N), already mean-centred
     cut = sigma * pc1.std(dim=1, keepdim=True)
 
-    mask = (pc1 > cut).view(b, h, w)
     y0, y1 = int(h * border), int(h * (1 - border))
     x0, x1 = int(w * border), int(w * (1 - border))
-    centre = mask[:, y0:y1, x0:x1]
-    flipped = (-pc1 > cut).view(b, h, w)
-    keep_flipped = centre.flatten(1).float().mean(1) <= 0.35
-    mask = torch.where(keep_flipped[:, None, None], flipped, mask)
+
+    def lean(m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        overall = m.flatten(1).float().mean(1)
+        return m[:, y0:y1, x0:x1].flatten(1).float().mean(1) - overall, overall
+
+    plus, minus = (pc1 > cut).view(b, h, w), (-pc1 > cut).view(b, h, w)
+    (lean_plus, area_plus), (lean_minus, area_minus) = lean(plus), lean(minus)
+    # On an even lean the smaller side wins, as a tile is mostly sky.
+    take_minus = (lean_minus > lean_plus) | ((lean_minus == lean_plus) & (area_minus < area_plus))
+    mask = torch.where(take_minus[:, None, None], minus, plus)
 
     # Dilate, then close, which fills pinholes and grows the mask a little.
     m = mask.unsqueeze(1).float()

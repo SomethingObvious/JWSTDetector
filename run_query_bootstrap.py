@@ -20,8 +20,11 @@ import yaml
 from jwstdetector.backbones import get_backbone
 from jwstdetector.data import (
     list_images,
+    load_footprints,
+    prepare_out_dir,
     relative_key,
     resolve_device,
+    tagged_dir,
     write_measurements_csv,
     write_ref_list,
 )
@@ -33,11 +36,15 @@ logger = logging.getLogger("run_query_bootstrap")
 
 
 def subset_size(n: int, frac: float, minimum: int, maximum: int | None) -> int:
-    """How many tiles to keep, a fraction of `n` clamped to [minimum, maximum] and to n."""
+    """How many tiles to keep, a fraction of `n` clamped to [minimum, maximum].
+
+    It never takes more than half the tiles. With every tile in the reference, pass 2
+    can't leave the strange ones out, and it just repeats pass 1.
+    """
     k = max(minimum, round(n * frac))
     if maximum is not None:
         k = min(k, maximum)
-    return max(1, min(k, n))
+    return max(1, min(k, n // 2))
 
 
 def parse_args(argv: list[str] | None = None):
@@ -66,6 +73,24 @@ def parse_args(argv: list[str] | None = None):
         help="Run the backbone in bf16 or fp16 on CUDA. Distances stay in fp32.",
     )
 
+    p.add_argument(
+        "--detector",
+        default="knn",
+        choices=("knn", "subspace"),
+        help="knn is AnomalyDINO's nearest-patch distance, subspace is SubspaceAD's PCA residual.",
+    )
+    p.add_argument(
+        "--subspace_variance",
+        type=float,
+        default=0.99,
+        help="Share of the reference variance the subspace keeps.",
+    )
+    p.add_argument(
+        "--layers",
+        default="last",
+        help="Patch features from the last layer, the mid band SubspaceAD uses, a range like "
+        "14-20, or a list.",
+    )
     p.add_argument("--knn_metric", default="L2_normalized", choices=METRICS)
     p.add_argument("--k_neighbors", type=int, default=1)
     p.add_argument(
@@ -115,6 +140,11 @@ def parse_args(argv: list[str] | None = None):
 
     p.add_argument("--out_dir", default="results_query_only")
     p.add_argument("--tag", default=None, help="Appended to --out_dir after an underscore.")
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the results already in the output folder instead of stopping.",
+    )
     p.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     return p.parse_args(argv)
@@ -134,8 +164,12 @@ def main(argv: list[str] | None = None) -> int:
     if not query_dir.is_dir():
         raise SystemExit(f"There is no query folder at {query_dir}")
 
-    out_dir = Path(f"{args.out_dir}_{args.tag}" if args.tag else args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = tagged_dir(Path(args.out_dir), args.tag)
+    prepare_out_dir(
+        out_dir,
+        ["args.yaml", "measurements_final.csv", "pass1", "pass2", "reference_samples.png"],
+        args.overwrite,
+    )
     (out_dir / "args.yaml").write_text(yaml.safe_dump(vars(args)), encoding="utf-8")
 
     backbone = get_backbone(
@@ -143,10 +177,12 @@ def main(argv: list[str] | None = None) -> int:
         resolve_device(args.device),
         resolution=args.resolution,
         autocast=args.autocast,
+        layers=args.layers,
     )
 
     query_paths = list_images(query_dir, recursive=args.recursive_query)
     logger.info("Found %d query tiles under %s", len(query_paths), query_dir)
+    footprints = load_footprints(Path(args.data_root), query_dir, query_paths)
     rng = np.random.default_rng(args.seed)
 
     def detect(ref_paths: list[Path], pass_dir: Path):
@@ -173,8 +209,19 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             save_patch_dists=args.save_patch_dists,
             save_tiffs=args.save_tiffs,
+            detector=args.detector,
+            subspace_variance=args.subspace_variance,
+            footprints=footprints,
         )
         write_measurements_csv(pass_dir / "measurements.csv", scores, memorybank_sec, seconds)
+        unscored = sorted(k for k, v in scores.items() if v != v)
+        if unscored:
+            logger.warning(
+                "%d tiles had nothing left to compare with and scored NaN, such as %s. "
+                "A bigger reference fixes that.",
+                len(unscored),
+                unscored[0],
+            )
         return scores
 
     n = len(query_paths)
@@ -189,7 +236,8 @@ def main(argv: list[str] | None = None) -> int:
 
     scores1 = detect(ref1, out_dir / "pass1")
 
-    by_score = sorted(scores1, key=scores1.__getitem__)
+    # NaN sorts last, since a tile nothing could be compared with isn't known to be normal.
+    by_score = sorted(scores1, key=lambda k: (scores1[k] != scores1[k], scores1[k]))
     k2 = subset_size(
         len(by_score), args.bootstrap_keep_frac, args.bootstrap_keep_min, args.bootstrap_keep_max
     )
