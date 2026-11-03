@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """Opens a run in the web viewer, or exports it as a static site.
 
-    python viewer.py results_miri datasets/miri
-    python viewer.py results_miri datasets/miri --export site/
+    jwstdetector view results_miri datasets/miri
+    jwstdetector view results_miri datasets/miri --export site/
 
 The first serves the viewer on localhost and saves verdicts to verdicts.csv in the run
 folder. The second writes the viewer and the whole run to a folder that any static
@@ -24,9 +23,9 @@ from urllib.parse import unquote, urlsplit
 
 from jwstdetector.bundle import RunBundle, add_site_meta, export, save_verdict
 
-logger = logging.getLogger("viewer")
+logger = logging.getLogger(__name__)
 
-APP_DIR = Path(__file__).resolve().parent / "jwstdetector" / "viewer_static"
+APP_DIR = Path(__file__).resolve().parent / "viewer_static"
 
 
 def make_handler(bundle: RunBundle):
@@ -96,8 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("run_dir", type=Path, help="A run_query_bootstrap.py output folder.")
-    ap.add_argument("data_root", type=Path, help="The prep_data.py --out folder it scored.")
+    ap.add_argument("run_dir", type=Path, help="A `jwstdetector run` output folder.")
+    ap.add_argument("data_root", type=Path, help="The `jwstdetector prep` --out folder it scored.")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument(
         "--no-browser", dest="browser", action="store_false", help="Don't open a browser tab."

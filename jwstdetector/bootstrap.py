@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Label-free anomaly scoring for JWST tiles.
 
 Pass 1 draws a random reference set from the query tiles and scores every tile
@@ -29,10 +28,11 @@ from jwstdetector.data import (
     write_ref_list,
 )
 from jwstdetector.detection import METRICS, run_anomaly_detection
+from jwstdetector.features import FeatureCache
 from jwstdetector.scoring import SCORE_MODES
 from jwstdetector.seeding import set_seed
 
-logger = logging.getLogger("run_query_bootstrap")
+logger = logging.getLogger(__name__)
 
 
 def subset_size(n: int, frac: float, minimum: int, maximum: int | None) -> int:
@@ -92,6 +92,13 @@ def parse_args(argv: list[str] | None = None):
         "14-20, or a list.",
     )
     p.add_argument("--knn_metric", default="L2_normalized", choices=METRICS)
+    p.add_argument(
+        "--score_region",
+        default="owned",
+        choices=("owned", "all"),
+        help="Score each tile on the patches no overlapping tile is more central to, which "
+        "keeps objects cut off by a tile's edge from crowding the top, or on all of them.",
+    )
     p.add_argument("--k_neighbors", type=int, default=1)
     p.add_argument(
         "--max_bank_patches",
@@ -119,6 +126,12 @@ def parse_args(argv: list[str] | None = None):
         help="Draw a few reference tiles with their background masks.",
     )
     p.add_argument("--save_patch_dists", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument(
+        "--feature_cache",
+        default=None,
+        help="Where each tile's patch embeddings are kept between runs, DATA_ROOT/.features by "
+        "default. About 1.6 MB a tile for ViT-L at 448 px. Pass none to embed on the fly.",
+    )
     p.add_argument("--save_tiffs", default=False, action=argparse.BooleanOptionalAction)
 
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:1 or mps.")
@@ -180,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         layers=args.layers,
     )
 
+    cache = None
+    if (args.feature_cache or "").lower() != "none":
+        cache_dir = Path(args.feature_cache or Path(args.data_root) / ".features")
+        cache = FeatureCache(cache_dir, backbone)
+        logger.info("Patch embeddings are cached in %s", cache_dir)
+
     query_paths = list_images(query_dir, recursive=args.recursive_query)
     logger.info("Found %d query tiles under %s", len(query_paths), query_dir)
     footprints = load_footprints(Path(args.data_root), query_dir, query_paths)
@@ -199,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             mask_ref_images=args.mask_ref_images,
             rotation=args.rotation,
             knn_metric=args.knn_metric,
+            score_region=args.score_region,
             k_neighbors=args.k_neighbors,
             max_bank_patches=args.max_bank_patches,
             score_mode=args.score_mode,
@@ -212,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             detector=args.detector,
             subspace_variance=args.subspace_variance,
             footprints=footprints,
+            cache=cache,
         )
         write_measurements_csv(pass_dir / "measurements.csv", scores, memorybank_sec, seconds)
         unscored = sorted(k for k, v in scores.items() if v != v)

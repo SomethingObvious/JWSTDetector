@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """AnomalyDINO scoring with a train/ folder of tiles known to be normal and a test/ folder to score.
 
 Use this when you already know which tiles are normal. When you don't, which is the
-usual case for JWST, use run_query_bootstrap.py.
+usual case for JWST, use `jwstdetector run`.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from jwstdetector.detection import METRICS, run_anomaly_detection
 from jwstdetector.scoring import SCORE_MODES
 from jwstdetector.seeding import set_seed
 
-logger = logging.getLogger("run_anomalydino")
+logger = logging.getLogger(__name__)
 
 
 def parse_args(argv: list[str] | None = None):
@@ -193,7 +192,6 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             write_measurements_csv(run_dir / "measurements.csv", scores, memorybank_sec, seconds)
-            # summarize_results.py finds per-seed runs by this file name.
             write_measurements_csv(
                 results_dir / f"measurements_seed={seed}.csv", scores, memorybank_sec, seconds
             )

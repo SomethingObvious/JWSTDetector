@@ -7,6 +7,7 @@ import logging
 import shutil
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -88,7 +89,7 @@ MANIFEST_FIELDS = ["key", "mosaic", "x0", "y0", "size", "ra", "dec", "cutout"]
 
 
 def read_manifest(data_root: Path) -> dict[str, dict]:
-    """manifest.csv from prep_data.py, keyed by tile path under query/, or {} without one."""
+    """manifest.csv from `jwstdetector prep`, keyed by tile path under query/, or {} without one."""
     path = Path(data_root) / "manifest.csv"
     if not path.is_file():
         return {}
@@ -156,7 +157,7 @@ def load_footprints(data_root: Path, query_dir: Path, paths: list[Path]) -> dict
     if not manifest:
         logging.getLogger(__name__).warning(
             "%s has no manifest.csv, so overlapping tiles can match each other's pixels. "
-            "Cutting the tiles again with this version of prep_data.py writes one.",
+            "Cutting the tiles again with `jwstdetector prep` writes one.",
             data_root,
         )
         return {}
@@ -165,6 +166,58 @@ def load_footprints(data_root: Path, query_dir: Path, paths: list[Path]) -> dict
         meta = manifest.get(relative_key(p, query_dir))
         if meta is not None:
             out[p] = Footprint(meta["mosaic"], meta["x0"], meta["y0"], meta["size"])
+    return out
+
+
+def owned_patches(footprints: dict, grid: tuple[int, int]) -> dict:
+    """The patches each tile scores, as a (rows, cols) bool array per key.
+
+    An object cut off by a tile's edge looks odd to the backbone however ordinary it
+    is, and on SMACS 0723 the outermost ring of patches held the peak of 45% of the top
+    20 tiles against 14% by chance. So a patch only counts for the tile whose centre
+    it's nearest, by the larger of its x and y offsets, which hands every bit of sky
+    that tiles share to exactly one of them and drops none. `footprints` maps keys to
+    anything with mosaic, x0, y0 and size, in mosaic pixels.
+    """
+    rows, cols = grid
+    by_mosaic: dict[str, list] = {}
+    for k, f in footprints.items():
+        by_mosaic.setdefault(f.mosaic, []).append(k)
+    # Patch centres as fractions of the tile, with PNG row 0 at the top, which is the
+    # highest FITS row.
+    fx = (np.arange(cols) + 0.5) / cols
+    fy = 1 - (np.arange(rows) + 0.5) / rows
+    out = {}
+    for keys in by_mosaic.values():
+        box = np.array(
+            [[footprints[k].x0, footprints[k].y0, footprints[k].size] for k in keys], float
+        )
+        cx, cy = box[:, 0] + box[:, 2] / 2, box[:, 1] + box[:, 2] / 2
+        # Overlapping tiles have centres less than one tile apart, so they share a cell
+        # or sit in the next one.
+        cell = box[:, 2].max()
+        cells: dict[tuple, list[int]] = {}
+        for i, key in enumerate(zip(cx // cell, cy // cell, strict=True)):
+            cells.setdefault(key, []).append(i)
+        for i, k in enumerate(keys):
+            x0, y0, s = box[i]
+            px = np.broadcast_to(x0 + fx * s, (rows, cols))
+            py = np.broadcast_to((y0 + fy * s)[:, None], (rows, cols))
+            mine = np.maximum(abs(px - cx[i]), abs(py - cy[i]))
+            keep = np.ones((rows, cols), dtype=bool)
+            ci, cj = cx[i] // cell, cy[i] // cell
+            for j in (
+                j
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+                for j in cells.get((ci + dx, cj + dy), ())
+            ):
+                if j == i:
+                    continue
+                inside = (px >= box[j, 0]) & (px < box[j, 0] + box[j, 2])
+                inside &= (py >= box[j, 1]) & (py < box[j, 1] + box[j, 2])
+                keep &= ~(inside & (np.maximum(abs(px - cx[j]), abs(py - cy[j])) < mine))
+            out[k] = keep
     return out
 
 

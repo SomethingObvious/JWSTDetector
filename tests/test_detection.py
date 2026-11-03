@@ -1,7 +1,7 @@
-"""Checks for the memory bank, the search and a whole scoring pass, with a stand-in backbone.
+"""Checks for the memory bank, the search, the feature cache and whole scoring passes.
 
-Run it with `python test_detection.py`, or with pytest. It needs torch but no GPU,
-network or weights, as a small deterministic module takes DINO's place.
+They need torch but no GPU, network or weights, as a small deterministic module
+takes DINO's place.
 """
 
 from __future__ import annotations
@@ -336,13 +336,97 @@ def test_parse_layers() -> None:
         raise AssertionError(bad)
 
 
-def main() -> None:
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    for t in tests:
-        t()
-        print(f"ok  {t.__name__}")
-    print(f"\n{len(tests)} checks passed")
+def test_subset_size() -> None:
+    from jwstdetector.bootstrap import subset_size
+
+    assert subset_size(1000, 0.1, 500, 5000) == 500
+    assert subset_size(100_000, 0.1, 500, 5000) == 5000
+    assert subset_size(10_000, 0.1, 500, 5000) == 1000
+    assert subset_size(3, 0.1, 500, 5000) == 1
+    assert subset_size(60, 0.1, 500, 5000) == 30
 
 
-if __name__ == "__main__":
-    main()
+def test_cached_features_give_the_same_scores_and_embed_once() -> None:
+    from jwstdetector.features import FeatureCache
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        plain = _run(tmp / "plain")
+        backbone = _stub_backbone()
+        calls = []
+        forward = backbone.forward_patches
+        backbone.forward_patches = lambda x: calls.append(len(x)) or forward(x)
+        cache = FeatureCache(tmp / "cache", backbone)
+        query_dir = tmp / "query"
+        names = _write_tiles(query_dir)
+        paths = sorted(query_dir.glob("*.png"))
+        refs = [query_dir / n for n in names if n != ANOMALOUS]
+        opts = {"num_workers": 0, "batch_size": 4, "cache": cache}
+        first, *_ = run_anomaly_detection(
+            backbone, refs, query_dir, paths, query_dir, tmp / "a", **opts
+        )
+        embedded_once = sum(calls)
+        second, *_ = run_anomaly_detection(
+            backbone, refs, query_dir, paths, query_dir, tmp / "b", **opts
+        )
+
+        # The bank and the scoring both read the cache, so each tile went through once.
+        assert embedded_once == len(paths)
+        assert sum(calls) == embedded_once
+        assert len(list((tmp / "cache").rglob("*.npy"))) == len(paths)
+        for key, value in plain.items():
+            assert abs(first[key] - value) < 1e-3 * max(1.0, abs(value))
+            assert first[key] == second[key]
+
+        with np.load(tmp / "a" / "descriptors.npz") as f:
+            keys, vectors = f["keys"].tolist(), f["vectors"].astype(np.float32)
+        assert sorted(keys) == sorted(p.name for p in paths)
+        assert vectors.shape == (len(paths), DIM)
+        # The odd tile's descriptor describes its bright bar, so it sits apart from the rest.
+        odd = vectors[keys.index(ANOMALOUS)]
+        others = np.delete(vectors, keys.index(ANOMALOUS), 0)
+        spread = np.linalg.norm(others - others.mean(0), axis=1).max()
+        assert np.linalg.norm(others - odd, axis=1).min() > 2 * spread
+
+
+def test_overlapping_tiles_share_out_their_patches() -> None:
+    from types import SimpleNamespace
+
+    from jwstdetector.data import owned_patches
+
+    # 320 px tiles at a 160 px stride, and one more flush against the far edge.
+    fp = {
+        (x, y): SimpleNamespace(mosaic="m", x0=x, y0=y, size=320)
+        for x in range(0, 641, 160)
+        for y in (0, 160, 320)
+    }
+    fp["flush"] = SimpleNamespace(mosaic="m", x0=630, y0=320, size=320)
+    owned = owned_patches(fp, (28, 28))
+    rows, cols = np.nonzero(owned[(320, 160)])
+    assert (rows.min(), rows.max(), cols.min(), cols.max()) == (7, 20, 7, 20)
+    # PNG rows run down and FITS rows up, so the bottom tile keeps its bottom rows.
+    rows, _ = np.nonzero(owned[(320, 0)])
+    assert (rows.min(), rows.max()) == (7, 27)
+    # Every bit of covered sky is within one patch of a patch some tile scores.
+    patch = 320 / 28
+    centres = np.array(
+        [
+            (f.x0 + (c + 0.5) * patch, f.y0 + 320 - (r + 0.5) * patch)
+            for k, f in fp.items()
+            for r, c in zip(*np.nonzero(owned[k]), strict=True)
+        ]
+    )
+    xs, ys = np.meshgrid(np.arange(0.5, 950, 7.0), np.arange(0.5, 640, 7.0))
+    points = np.stack([xs.ravel(), ys.ravel()], axis=1)
+    gap = np.abs(points[:, None, :] - centres[None, :, :]).max(axis=2).min(axis=1)
+    assert gap.max() <= patch
+
+
+def test_pixel_backbone_returns_raw_patches() -> None:
+    from jwstdetector.backbones import get_backbone
+
+    b = get_backbone("pixels", "cpu", resolution=32)
+    x = torch.arange(3 * 32 * 32, dtype=torch.float32).reshape(1, 3, 32, 32)
+    out = b.embed(x)
+    assert out.shape == (1, 4, 3 * 16 * 16)
+    assert torch.equal(out[0, 1].reshape(3, 16, 16), x[0, :, :16, 16:])

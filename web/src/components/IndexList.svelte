@@ -1,9 +1,11 @@
 <script lang="ts" module>
-  export type SortKey = 'rank' | 'score' | 'delta' | 'ra' | 'dec';
+  export type SortKey = 'rank' | 'priority' | 'score' | 'delta' | 'ra' | 'dec';
+  export type MatchFilter = 'all' | 'uncatalogued' | 'catalogued';
   export type VerdictFilter = 'all' | 'unreviewed' | 'interesting' | 'artifact' | 'known' | 'not_anomalous' | 'starred';
   export interface Filters {
     text: string;
     verdict: VerdictFilter;
+    match: MatchFilter;
     mosaic: string;
     scoreMin: number | null;
     scoreMax: number | null;
@@ -16,6 +18,7 @@
   import Glyph from './Glyph.svelte';
   import { shortMosaic, type Bundle } from '../lib/types';
   import { raHms, decDms } from '../lib/wcs';
+  import { orList } from '../lib/catalogues';
   import type { Verdicts } from '../lib/verdicts.svelte';
 
   let {
@@ -61,6 +64,9 @@
   const last = $derived(Math.min(order.length, Math.ceil((scrollTop + height) / ROW) + 4));
   const visible = $derived(Array.from({ length: Math.max(0, last - first) }, (_, k) => first + k));
   const mosaicNames = $derived(Object.keys(bundle.mosaics));
+  const xmatch = $derived(bundle.run.xmatch);
+  const unmatched = $derived(bundle.tiles.reduce((n, t) => n + (t.xmatch?.uncatalogued ? 1 : 0), 0));
+  const matched = $derived(bundle.tiles.reduce((n, t) => n + (t.xmatch && !t.xmatch.uncatalogued ? 1 : 0), 0));
 
   // Keeps the current row in view without animating, so stepping never waits on a scroll.
   $effect(() => {
@@ -108,6 +114,15 @@
         {/each}
       </select>
     </div>
+    {#if xmatch}
+      <div class="row2">
+        <select class="ctl" bind:value={filters.match} aria-label="Catalogue filter" title="Uncatalogued means nothing in {orList(xmatch.checked)} within {xmatch.radius_arcsec}&Prime; of the peak">
+          <option value="all">Catalogued or Not</option>
+          <option value="uncatalogued">Uncatalogued ({unmatched.toLocaleString('en-CA')})</option>
+          <option value="catalogued">Catalogued ({matched.toLocaleString('en-CA')})</option>
+        </select>
+      </div>
+    {/if}
     <div class="row2">
       <span class="range">
         <span class="label">Score</span>
@@ -133,6 +148,7 @@
       <span class="sort">
         <select class="ctl" bind:value={filters.sort} aria-label="Sort by">
           <option value="rank">Rank</option>
+          {#if bundle.run.embedding_dims}<option value="priority">Learned</option>{/if}
           <option value="score">Score</option>
           <option value="delta">Pass 1 Change</option>
           <option value="ra">RA</option>
@@ -177,6 +193,7 @@
           <span class="score num">{t.score === null ? 'unscored' : t.score.toFixed(4)}</span>
           <span class="line2">
             <span class="mname name">{shortMosaic(t.mosaic)}</span>
+            {#if t.xmatch?.uncatalogued}<svg class="new" width="9" height="9" viewBox="-4.5 -4.5 9 9" role="img" aria-label="Uncatalogued"><title>Uncatalogued, nothing within {xmatch?.radius_arcsec}&Prime; of the peak</title><circle r="3.4" /></svg>{/if}
             <span class="coord num">{raHms(t.ra, 1)} {decDms(t.dec, 0)}</span>
           </span>
         </button>
@@ -355,6 +372,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .new {
+    flex: none;
+    align-self: center;
+    fill: none;
+    stroke: var(--cat);
+    stroke-width: 1.3;
+    stroke-dasharray: 2.2 1.4;
   }
   .coord {
     flex: none;

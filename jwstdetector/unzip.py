@@ -3,7 +3,7 @@
 astropy can read a .fits.gz directly, but it can't memmap one, so a big mosaic would
 have to fit in RAM.
 
-Usage: python unzipper.py [folder]
+Usage: jwstdetector unzip [folder]
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-logger = logging.getLogger("unzipper")
+logger = logging.getLogger(__name__)
 
 
 def decompress_dir(base_dir: Path) -> int:

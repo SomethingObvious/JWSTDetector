@@ -20,7 +20,8 @@ from torch.nn import functional as tnf
 from tqdm import tqdm
 
 from jwstdetector.backbones import Backbone, background_mask
-from jwstdetector.data import tile_loader
+from jwstdetector.data import owned_patches, tile_loader
+from jwstdetector.features import FeatureCache, embedded
 from jwstdetector.scoring import aggregate_score
 
 logger = logging.getLogger(__name__)
@@ -241,6 +242,7 @@ def build_memory_bank(
     batch_size: int = 8,
     num_workers: int = 4,
     seed: int = 0,
+    cache: FeatureCache | None = None,
 ) -> MemoryBank:
     """Embed the reference tiles and keep a uniform random sample of up to `max_patches` patches.
 
@@ -251,24 +253,40 @@ def build_memory_bank(
     n_views = 8 if rotation else 1
     capacity = min(max_patches, len(ref_paths) * n_views * backbone.n_patches)
     generator = torch.Generator().manual_seed(seed)
-    loader = tile_loader(
-        ref_paths,
-        ref_root,
-        backbone.transform(),
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=backbone.device.type == "cuda",
-    )
+
+    def batches():
+        # The eight views aren't cached, as they'd take eight times the disk.
+        if not rotation:
+            for keys, feats in embedded(
+                backbone,
+                ref_paths,
+                ref_root,
+                cache=cache,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                desc="Building memory bank",
+            ):
+                yield len(keys), (feats,)
+            return
+        loader = tile_loader(
+            ref_paths,
+            ref_root,
+            backbone.transform(),
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=backbone.device.type == "cuda",
+        )
+        for _, images in tqdm(loader, desc="Building memory bank", leave=False):
+            yield len(images), (backbone.embed(v) for v in dihedral(images))
 
     features = owners = None
     filled = seen = first_tile = 0
-    for _, images in tqdm(loader, desc="Building memory bank", leave=False):
-        tile_ids = torch.arange(first_tile, first_tile + len(images), dtype=torch.int32)
+    for n_tiles, views in batches():
+        tile_ids = torch.arange(first_tile, first_tile + n_tiles, dtype=torch.int32)
         tile_ids = tile_ids.repeat_interleave(backbone.n_patches).to(backbone.device)
-        first_tile += len(images)
+        first_tile += n_tiles
 
-        for view in dihedral(images) if rotation else [images]:
-            feats = backbone.embed(view)
+        for feats in views:
             ids = tile_ids
             if masking:
                 keep = background_mask(feats, backbone.grid_size).reshape(-1)
@@ -331,34 +349,44 @@ def score_queries(
     num_workers: int = 4,
     save_patch_dists: bool = True,
     save_tiffs: bool = False,
-) -> tuple[dict[str, float], dict[str, float]]:
-    """Score every query tile. Returns the scores and the seconds spent per tile.
+    cache: FeatureCache | None = None,
+    owned: list[np.ndarray | None] | None = None,
+) -> tuple[dict[str, float], dict[str, float], dict[str, np.ndarray]]:
+    """Score every query tile. Returns the scores, the mean seconds per tile and a
+    descriptor per tile.
 
     `exclude` lists, for each query tile, the indices of the `n_ref` reference tiles it
-    must not be matched against: itself, and any tile sharing pixels with it.
+    must not be matched against: itself, and any tile sharing pixels with it. The
+    descriptor is the mean feature of the tile's most distant 1% of patches, so it
+    describes whatever made the tile score high rather than the sky around it, which
+    is what similarity search and learning from verdicts want to compare.
+
+    `owned` gives, for each query tile, the (rows, cols) patches it scores, from
+    data.owned_patches. The rest still go in its map.
     """
     if save_tiffs:
         import tifffile
 
         from jwstdetector.utils import dists2map
 
-    loader = tile_loader(
-        query_paths,
-        query_root,
-        backbone.transform(),
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=backbone.device.type == "cuda",
-    )
     grid = backbone.grid_size
     scores: dict[str, float] = {}
-    seconds: dict[str, float] = {}
+    descriptors: dict[str, np.ndarray] = {}
 
     start = 0
-    for keys, images in tqdm(loader, desc="Scoring query tiles"):
-        started = time.perf_counter()
+    started = time.perf_counter()
+    for keys, feats in embedded(
+        backbone,
+        query_paths,
+        query_root,
+        cache=cache,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        desc="Scoring query tiles",
+    ):
         rows = excluded = None
         batch_exclude = exclude[start : start + len(keys)] if exclude else []
+        batch_owned = owned[start : start + len(keys)] if owned else [None] * len(keys)
         if any(batch_exclude):
             excluded = torch.zeros((len(keys), max(n_ref, 1)), dtype=torch.bool)
             for i, refs in enumerate(batch_exclude):
@@ -368,7 +396,6 @@ def score_queries(
             rows = rows.repeat_interleave(backbone.n_patches)
         start += len(keys)
 
-        feats = backbone.embed(images)
         flat = feats.reshape(-1, feats.shape[-1])
         keep = background_mask(feats, grid) if masking else None
         if keep is None:
@@ -379,8 +406,18 @@ def score_queries(
             sub_rows = rows[valid] if rows is not None else None
             dists[valid] = bank.distances(flat[valid], k_neighbors, sub_rows, excluded)
 
-        _sync(backbone.device)
-        elapsed = (time.perf_counter() - started) / len(keys)
+        ranked = torch.nan_to_num(dists.reshape(len(keys), -1), nan=float("-inf"))
+        batch_descriptors = []
+        for i, mine in enumerate(batch_owned):
+            row = ranked[i]
+            if mine is not None:
+                row = row.masked_fill(
+                    ~torch.from_numpy(mine.reshape(-1)).to(row.device), -torch.inf
+                )
+            n_top = max(1, round(0.01 * (mine.sum() if mine is not None else row.numel())))
+            batch_descriptors.append(
+                feats[i, row.topk(int(n_top)).indices].mean(dim=0).cpu().numpy()
+            )
 
         grids = dists.reshape(len(keys), *grid).cpu().numpy()
         keeps = keep.reshape(len(keys), *grid).cpu().numpy() if keep is not None else None
@@ -389,14 +426,17 @@ def score_queries(
             # Masked-out patches carry a distance of 0, which would drag a median or
             # mean down, so only the real patches are scored. The saved map keeps the
             # zeros so it still lines up with the tile.
-            patch_dists = grids[i][keeps[i]] if keeps is not None else grids[i]
+            scored = keeps[i] if keeps is not None else np.ones(grid, dtype=bool)
+            if batch_owned[i] is not None:
+                scored = scored & batch_owned[i]
+            patch_dists = grids[i][scored]
             scores[key] = aggregate_score(
                 patch_dists,
                 mode=score_mode,
                 top_frac=score_top_frac,
                 quantile=score_quantile,
             )
-            seconds[key] = elapsed
+            descriptors[key] = batch_descriptors[i]
 
             if maps_dir is not None and (save_patch_dists or save_tiffs):
                 # Appending the suffix by hand, as with_suffix(".npy") on a stem full of
@@ -409,7 +449,12 @@ def score_queries(
                     side = backbone.resolution
                     tifffile.imwrite(f"{stem}.tiff", dists2map(grids[i], (side, side)))
 
-    return scores, seconds
+    # An average, as the feature cache embeds every missing tile before the first batch
+    # comes back, which leaves no honest per-batch time to give each tile.
+    _sync(backbone.device)
+    per_tile = (time.perf_counter() - started) / max(len(scores), 1)
+    seconds = dict.fromkeys(scores, per_tile)
+    return scores, seconds, descriptors
 
 
 def _sync(device: torch.device) -> None:
@@ -442,6 +487,8 @@ def run_anomaly_detection(
     footprints: dict[Path, Footprint] | None = None,
     detector: str = "knn",
     subspace_variance: float = 0.99,
+    cache: FeatureCache | None = None,
+    score_region: str = "owned",
 ) -> tuple[dict[str, float], float, dict[str, float]]:
     """Build the bank from `ref_paths` and score `query_paths` against it.
 
@@ -449,7 +496,9 @@ def run_anomaly_detection(
     A query path that is also in `ref_paths` is scored against the other reference
     tiles only, and with `footprints` against the ones it shares no pixels with
     either. The bank build runs the model many times before any timing starts, so
-    the CUDA kernels are warm by the time the scoring is timed.
+    the CUDA kernels are warm by the time the scoring is timed. Each tile's descriptor
+    goes to descriptors.npz in `out_dir`. With `score_region` "owned" and footprints,
+    a tile only scores the patches no overlapping tile is more central to.
     """
     if mask_ref_images and not masking:
         logger.warning("--mask_ref_images only works with --masking, so it is ignored here")
@@ -466,6 +515,7 @@ def run_anomaly_detection(
         batch_size=batch_size,
         num_workers=num_workers,
         seed=seed,
+        cache=cache,
     )
     if detector == "subspace":
         bank = SubspaceModel(bank.features, subspace_variance)
@@ -474,7 +524,14 @@ def run_anomaly_detection(
     _sync(backbone.device)
     memorybank_sec = time.perf_counter() - started
 
-    scores, seconds = score_queries(
+    owned = None
+    if score_region == "owned" and footprints:
+        mine = owned_patches(footprints, backbone.grid_size)
+        owned = [mine.get(p) for p in query_paths]
+    elif score_region not in ("owned", "all"):
+        raise ValueError(f"Unknown score_region {score_region!r}, expected owned or all")
+
+    scores, seconds, descriptors = score_queries(
         backbone,
         bank,
         query_paths,
@@ -491,5 +548,13 @@ def run_anomaly_detection(
         num_workers=num_workers,
         save_patch_dists=save_patch_dists,
         save_tiffs=save_tiffs,
+        cache=cache,
+        owned=owned,
+    )
+    keys = sorted(descriptors)
+    np.savez(
+        Path(out_dir) / "descriptors.npz",
+        keys=np.array(keys),
+        vectors=np.stack([descriptors[k] for k in keys]).astype(np.float32),
     )
     return scores, memorybank_sec, seconds

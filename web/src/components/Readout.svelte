@@ -4,7 +4,8 @@
   import { CMAPS, cssGradient } from '../lib/colormaps';
   import { rankOf, type Limits, type TileData } from '../lib/tiles';
   import type { TileFrame } from '../lib/frame';
-  import { VERDICTS, type Bundle, type Display, type LimitMode, type Stretch, type Theme, type Verdict } from '../lib/types';
+  import { VERDICTS, tileId, type Bundle, type Display, type LimitMode, type Stretch, type Theme, type TileSource, type Verdict } from '../lib/types';
+  import { catShape, orList, sourceLink } from '../lib/catalogues';
   import { decDms, icrsToGalactic, raHms, signOf, signed } from '../lib/wcs';
   import type { Verdicts } from '../lib/verdicts.svelte';
 
@@ -20,6 +21,9 @@
     verdicts,
     order,
     theme,
+    sources,
+    learned,
+    alike,
     advance = $bindable(),
     noteEl = $bindable(),
     onselect,
@@ -37,6 +41,9 @@
     verdicts: Verdicts;
     order: Int32Array;
     theme: Theme;
+    sources: TileSource[];
+    learned: { value: number; from: number } | null;
+    alike: { index: number; cos: number }[];
     advance: boolean;
     noteEl?: HTMLTextAreaElement;
     onselect: (i: number) => void;
@@ -75,6 +82,20 @@
     const dist1 = data.map1 ? data.map1[pr * cols + pc] : null;
     return { px, py, mx, my, ra, dec, l, b, values, pr, pc, dist, dist1, pct: rankOf(data.map2Sorted, dist) * 100 };
   });
+
+  // The catalogued source nearest the probe, if one is within an arcsecond.
+  const near = $derived.by(() => {
+    if (!probe || !data || !mosaic || !sources.length) return null;
+    const scale = (mosaic.pixel_scale_arcsec * tile.size) / data.width;
+    let best: { s: TileSource; sep: number } | null = null;
+    for (const s of sources) {
+      const sep = Math.hypot(s[4] * data.width - probe.ix, s[5] * data.height - probe.iy) * scale;
+      if (sep <= 1 && (!best || sep < best.sep)) best = { s, sep };
+    }
+    return best;
+  });
+  const fmtSep = (sep: number) => (sep >= 60 ? `${(sep / 60).toFixed(1)}\u2032` : `${sep.toFixed(sep < 10 ? 2 : 1)}\u2033`);
+  const xm = $derived(bundle.run.xmatch ?? null);
 
   const fmtVal = (v: number) => {
     if (!Number.isFinite(v)) return 'no data';
@@ -258,6 +279,10 @@
         </dd>
         <dt>Percentile</dt>
         <dd class="num"><span class="pbar"><i style:width="{read.pct}%"></i></span>{read.pct.toFixed(1)} within tile</dd>
+        {#if near}
+          <dt>Source</dt>
+          <dd><span class="catname">{near.s[0]}</span> {near.s[1]} <span class="dim num">{fmtSep(near.sep)}</span></dd>
+        {/if}
       </dl>
     {:else}
       <p class="quiet">Waiting for the tile to load.</p>
@@ -275,6 +300,13 @@
         <dt>Pass 1</dt>
         <dd class="num">{tile.score_pass1.toFixed(4)} <span class="delta" class:up={delta > 0}>{delta > 0 ? '+' : ''}{signed(delta, 4)}</span></dd>
       {/if}
+      {#if learned}
+        <dt>Learned</dt>
+        <dd class="num">
+          {#if learned.from}<b>{learned.value.toFixed(2)}</b> <span class="dim">from {learned.from} {learned.from === 1 ? 'verdict' : 'verdicts'}, 0.5 is neutral</span>
+          {:else}<span class="dim">No verdicts to learn from yet</span>{/if}
+        </dd>
+      {/if}
       <dt>Reference</dt>
       <dd>{tile.in_reference ? 'In the pass 2 reference set' : 'Not a reference tile'}</dd>
       <dt>Mosaic</dt>
@@ -285,6 +317,14 @@
       <dd class="num">{tile.size} px <span class="gap"></span> {arcsec.toFixed(2)}&Prime;</dd>
       <dt>Peak</dt>
       <dd class="num">r{tile.peak[0]} c{tile.peak[1]} <span class="dim">of {grid[0]} &times; {grid[1]}</span></dd>
+      {#if tile.owned}
+        {@const [r0, r1, c0, c1] = tile.owned}
+        <dt>Scored</dt>
+        <dd>
+          <span class="num">{r1 - r0 + 1} &times; {c1 - c0 + 1}</span> patches inside the dashed outline
+          <span class="dim small under">Overlapping tiles score the rest, each the part nearest its own centre.</span>
+        </dd>
+      {/if}
       <dt>Pixels</dt>
       <dd>
         {#if data}
@@ -296,6 +336,43 @@
       </dd>
     </dl>
   </section>
+
+  {#if xm}
+    <section class="block">
+      {@render head('Catalogues', `${xm.radius_arcsec}\u2033 match radius`)}
+      {#if tile.xmatch}
+        {#if tile.xmatch.uncatalogued}
+          <p class="lead new"><b>Uncatalogued.</b> Nothing in {orList(xm.checked)} lies within {xm.radius_arcsec}&Prime; of the peak.</p>
+        {/if}
+        <ul class="matches">
+          {#each xm.checked as cat (cat)}
+            {@const m = tile.xmatch.nearest[cat]}
+            {@const href = m ? sourceLink(cat, m.name) : null}
+            <li class:hit={!!m && m.sep <= xm.radius_arcsec}>
+              <svg width="12" height="12" viewBox="-6 -6 12 12" aria-hidden="true"><path d={catShape(cat)} /></svg>
+              <span class="catname">{cat}</span>
+              {#if m}
+                <span class="who">
+                  {#if href}<a {href} target="_blank" rel="noopener noreferrer">{m.name}</a>{:else}{m.name}{/if}
+                  {#if m.type || m.note}<span class="dim">{[m.type, m.note].filter(Boolean).join(', ')}</span>{/if}
+                </span>
+                <span class="num sep">{fmtSep(m.sep)}</span>
+              {:else}
+                <span class="who dim">Nothing over this mosaic</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+        <p class="quiet">
+          The nearest source to the peak in each.
+          {#if sources.length}{sources.length} catalogued {sources.length === 1 ? 'source lies' : 'sources lie'} on this tile, marked on the plate.{/if}
+          {#if xm.failed.length}{orList(xm.failed)} couldn't be reached when this run was matched, so {xm.failed.length === 1 ? 'it was' : 'they were'} left out.{/if}
+        </p>
+      {:else}
+        <p class="quiet">This tile's mosaic has no WCS, so it wasn't matched.</p>
+      {/if}
+    </section>
+  {/if}
 
   <section class="block">
     {@render head('Verdict', record?.updated ? record.updated.replace('T', ' ').replace('Z', ' UTC') : undefined)}
@@ -344,6 +421,27 @@
       {#if importMsg}<p class="quiet">{importMsg}</p>{/if}
     {/if}
   </section>
+
+  {#if alike.length}
+    <section class="block">
+      {@render head('Similar Tiles', 'cosine')}
+      <div class="alike" class:neg={theme === 'plate'}>
+        {#each alike as a (a.index)}
+          {@const t = bundle.tiles[a.index]}
+          {@const v = verdicts.map.get(t.key)}
+          <button class="thumb" onclick={() => onselect(a.index)} title="Rank {t.rank}, cosine {a.cos.toFixed(3)}">
+            <img src="{base}tiles/{tileId(a.index)}.png" alt="Tile ranked {t.rank}" loading="lazy" decoding="async" />
+            <span class="cap">
+              <span class="num">{t.rank}</span>
+              <Glyph verdict={v?.verdict ?? null} size={9} />
+              <span class="num dim">{a.cos.toFixed(2)}</span>
+            </span>
+          </button>
+        {/each}
+      </div>
+      <p class="quiet">Closest by the descriptor of each tile's most anomalous patches. A verdict here moves every tile like it once the index is sorted by Learned.</p>
+    </section>
+  {/if}
 
   <section class="block">
     {@render head('Mosaic Locator')}
@@ -597,6 +695,10 @@
   .small {
     font-size: 11px;
   }
+  .under {
+    display: block;
+    margin-top: 2px;
+  }
   .field {
     display: grid;
     grid-template-columns: 62px 1fr;
@@ -765,6 +867,92 @@
   }
   .file:focus-within {
     outline: 1px solid var(--anno);
+  }
+  .catname {
+    color: var(--chalk-3);
+    font-size: 11px;
+  }
+  .lead {
+    margin: 0;
+    line-height: 1.45;
+  }
+  .lead.new b {
+    color: var(--cat);
+    font-weight: 500;
+  }
+  .matches {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 4px;
+  }
+  .matches li {
+    display: grid;
+    grid-template-columns: 12px 62px minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: baseline;
+  }
+  .matches svg {
+    align-self: center;
+    overflow: visible;
+  }
+  .matches path {
+    fill: none;
+    stroke: var(--cat);
+    stroke-width: 1.25;
+  }
+  .who {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .who .dim {
+    display: block;
+    font-size: 11px;
+  }
+  .sep {
+    color: var(--chalk-2);
+  }
+  .matches li.hit .sep {
+    color: var(--anno);
+  }
+  .alike {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+  }
+  .thumb {
+    display: grid;
+    gap: 3px;
+    padding: 0;
+    border: 1px solid var(--rule);
+    background: var(--ground-sunk);
+    cursor: pointer;
+    color: var(--chalk);
+  }
+  .thumb:hover,
+  .thumb:focus-visible {
+    border-color: var(--anno);
+    outline: none;
+  }
+  .thumb img {
+    width: 100%;
+    aspect-ratio: 1;
+    display: block;
+    object-fit: cover;
+  }
+  .neg img {
+    filter: grayscale(1) invert(1);
+  }
+  .cap {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 5px 3px;
+    font-size: 10.5px;
+  }
+  .cap .dim {
+    margin-left: auto;
   }
   .links {
     list-style: none;

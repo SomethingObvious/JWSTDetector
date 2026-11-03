@@ -1,27 +1,24 @@
-"""Checks for the tiling, the emptiness cut and the scoring rules, none of which need a GPU.
-
-Run it with `python test_helpers.py`, or with pytest. It needs numpy and astropy, and
-the few checks that import torch or pandas skip themselves when those aren't there.
-"""
+"""Checks for cutting mosaics into tiles, the stretches, the sensors and the photometry."""
 
 from __future__ import annotations
 
 import contextlib
 import io
+import json
 import re
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
 from PIL import Image
 
-import prep_data
-from jwstdetector.scoring import SCORE_MODES, aggregate_score
-from jwstdetector.seeding import set_seed
-from prep_data import (
+import jwstdetector.prep as prep
+from jwstdetector import photometry
+from jwstdetector.prep import (
     MiriSensor,
     MosaicStats,
     asinh_to_uint8,
@@ -33,6 +30,8 @@ from prep_data import (
     measure_mosaic,
     tile_starts,
 )
+from jwstdetector.scoring import SCORE_MODES, aggregate_score
+from jwstdetector.seeding import set_seed
 
 SKY, NOISE = 0.0, 1.0
 
@@ -258,7 +257,7 @@ def test_wht_gate() -> None:
 
     # On the SMACS 0723 MIRI mosaic a tile missing half a percent of its pixels still
     # ranked second, so by default a notch of 1% has to cost the tile.
-    args.min_wht_frac = prep_data.parse_args(["--indir", "x"]).min_wht_frac
+    args.min_wht_frac = prep.parse_args(["--indir", "x"]).min_wht_frac
     notched = np.ones((200, 200), np.float32)
     notched[:10, :10] = 0.0
     assert _cut(_sky_with_sources(200, 200), args, wht=notched)[1:] == (3, 0, 1)
@@ -324,9 +323,9 @@ def test_miri_i2d_end_to_end() -> None:
             ]
         ).writeto(tmp / "raw" / f"{stem}.fits")
 
-        prep_data.run(
+        prep.run(
             [
-                "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
+                "--sensor", "miri", "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
                 "--pattern", "*i2d.fits", "--tile_size", "100", "--upscale", "1",
                 "--stride", "100", "--min_wht_frac", "0.5", "--wcs_in_name",
             ]
@@ -358,7 +357,7 @@ def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
                 tmp / "raw" / name
             )
 
-        prep_data.run(
+        prep.run(
             [
                 "--sensor", "nircam", "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
                 "--tile_size", "100", "--upscale", "1", "--stride", "100", "--min_wht_frac", "0",
@@ -366,7 +365,7 @@ def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
         )  # fmt: skip
 
         levels = [measure_mosaic(p, 1.0, 99.8) for p in planes]
-        whole = prep_data.lupton(SimpleNamespace(stretch=0.05, Q=10.0), planes, levels)
+        whole = prep.lupton(SimpleNamespace(stretch=0.05, Q=10.0), planes, levels)
         pngs = sorted((tmp / "out/query").glob("A5_*.png"))
         assert len(pngs) == 6
         for png in pngs:
@@ -388,7 +387,7 @@ def test_cutout_pixels_and_wcs_match_the_mosaic() -> None:
     window = (slice(10, 30), slice(5, 25))
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "c.fits"
-        prep_data.write_cutout(path, [plane], window, w, "MJy/sr")
+        prep.write_cutout(path, [plane], window, w, "MJy/sr")
         with fits.open(path) as hdul:
             assert np.array_equal(hdul[0].data, plane[window])
             assert hdul[0].header["BUNIT"] == "MJy/sr"
@@ -399,7 +398,7 @@ def test_cutout_pixels_and_wcs_match_the_mosaic() -> None:
 def test_help_lists_the_sensor_flags() -> None:
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.suppress(SystemExit):
-        prep_data.parse_args(["--sensor", "nircam", "-h"])
+        prep.parse_args(["--sensor", "nircam", "-h"])
     assert "--rgb_filters" in out.getvalue()
 
 
@@ -413,150 +412,128 @@ def test_set_seed_reproducible() -> None:
     assert np.random.rand(5).tolist() != first
 
 
-class Skipped(Exception):
-    pass
-
-
-def test_subset_size() -> None:
-    try:
-        from run_query_bootstrap import subset_size
-    except ImportError as exc:
-        raise Skipped(f"{exc.name} isn't installed") from None
-
-    assert subset_size(1000, 0.1, 500, 5000) == 500
-    assert subset_size(100_000, 0.1, 500, 5000) == 5000
-    assert subset_size(10_000, 0.1, 500, 5000) == 1000
-    assert subset_size(3, 0.1, 500, 5000) == 1
-    assert subset_size(60, 0.1, 500, 5000) == 30
-
-
-def test_summarize_normalize() -> None:
-    try:
-        import pandas as pd
-
-        from summarize_results import normalize_measurements_df, parse_seed_from_anywhere
-    except ImportError as exc:
-        raise Skipped(f"{exc.name} isn't installed") from None
-
-    df = pd.DataFrame(
-        {
-            "Sample": ["a", "b"],
-            "AnomalyScore": [1.0, 2.0],
-            "MemoryBankTimeSec": [0.1, 0.1],
-            "InferenceTimeSec": [0.2, 0.3],
-        }
-    )
-    out = normalize_measurements_df(df, Path("x.csv"))
-    assert list(out.columns) == [
-        "Object",
-        "Sample",
-        "AnomalyScore",
-        "MemoryBankTime",
-        "InferenceTime",
-    ]
-    assert (out["Object"] == "query").all()
-    assert out["InferenceTime"].tolist() == [0.2, 0.3]
-    assert parse_seed_from_anywhere("measurements_seed=3.csv") == 3
-    assert parse_seed_from_anywhere("nofile.csv") is None
-
-
-def test_benchmark_sources_stay_in_the_tile() -> None:
-    try:
-        import benchmark
-    except ModuleNotFoundError as exc:
-        raise Skipped(f"{exc.name} isn't installed") from None
-    rng = np.random.default_rng(0)
-    for kind in benchmark.KINDS:
-        source = benchmark.profile(kind, 128, rng)
-        assert source.shape == (128, 128)
-        assert 0.9 < source.max() <= 1.0, (kind, source.max())
-        # Nothing bright at the border, so a source never runs off its tile.
-        if kind != "streak":
-            edge = np.concatenate([source[0], source[-1], source[:, 0], source[:, -1]])
-            assert edge.max() < 1e-3, (kind, edge.max())
-
-
-def test_bundle_ranks_exports_and_saves_verdicts() -> None:
-    try:
-        import yaml
-
-        from jwstdetector import bundle
-    except ModuleNotFoundError as exc:
-        raise Skipped(f"{exc.name} isn't installed") from None
+def test_cutouts_render_back_to_the_same_tiles() -> None:
+    # The benchmark adds sources to the cutouts and renders them again, so a cutout
+    # with nothing added has to come back as exactly the PNG prep saved.
+    rng = np.random.default_rng(5)
+    planes = [np.abs(_sky_with_sources(200, 300, seed=s)) * rng.uniform(0.5, 2) for s in (1, 2, 3)]
+    planes[2][40:45, 40:45] = np.nan
     with tempfile.TemporaryDirectory() as td:
-        data, run = Path(td) / "data", Path(td) / "run"
-        maps = run / "pass2" / "anomaly_maps" / "seed=0"
-        for d in (data / "query", data / "mosaics", data / "cutouts", maps):
-            d.mkdir(parents=True)
-        scores = {"a.png": 0.2, "b.png": float("nan"), "c.png": 0.9}
-        with (data / "manifest.csv").open("w", newline="") as f:
-            f.write("key,mosaic,x0,y0,size,ra,dec,cutout\n")
-            for i, key in enumerate(scores):
-                f.write(f"{key},m,{i * 8},0,8,10.0,-5.0,cutouts/{key}.fits\n")
-                Image.new("RGB", (8, 8)).save(data / "query" / key)
-                (data / "cutouts" / f"{key}.fits").write_bytes(b"fits")
-                grid = np.zeros((2, 2), np.float32)
-                grid[1, 0] = 1
-                np.save(maps / f"{Path(key).stem}.npy", grid)
-        (data / "mosaics" / "m.json").write_text('{"shape": [8, 24]}')
-        Image.new("RGB", (4, 4)).save(data / "mosaics" / "m.png")
-        (run / "args.yaml").write_text(yaml.safe_dump({"resolution": 32, "seed": 0}))
-        with (run / "measurements_final.csv").open("w", newline="") as f:
-            f.write("Sample,AnomalyScore\n")
-            f.writelines(f"{k},{v}\n" for k, v in scores.items())
+        tmp = Path(td)
+        (tmp / "raw").mkdir()
+        for filt, plane in zip(("f444w", "f277w", "f150w"), planes, strict=True):
+            name = f"mosaic_nircam_{filt}_COSMOS-Web_60mas_A5_v1.0_i2d.fits"
+            header = _wcs_header()
+            header["BUNIT"] = "MJy/sr"
+            header["TELESCOP"] = "JWST"
+            # One filter has a strip with a third of the exposure, which the PNG
+            # renders with its noise scaled down and the cutout has to say so.
+            wht = np.full(plane.shape, 3.0)
+            if filt == "f277w":
+                wht[:, 220:] = 1.0
+            fits.HDUList(
+                [
+                    fits.PrimaryHDU(),
+                    fits.ImageHDU(plane, header, name="SCI"),
+                    fits.ImageHDU(wht, name="WHT"),
+                ]
+            ).writeto(tmp / "raw" / name)
+        prep.run(
+            [
+                "--sensor", "nircam", "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
+                "--tile_size", "100", "--upscale", "1", "--stride", "100", "--save_cutouts",
+            ]
+        )  # fmt: skip
+        meta = json.loads((tmp / "out/mosaics/A5.json").read_text())
+        assert meta["render"]["kind"] == "lupton"
+        assert [b["filter"] for b in meta["planes"]] == ["F444W", "F277W", "F150W"]
+        assert [round(b["micron"], 2) for b in meta["planes"]] == [4.44, 2.77, 1.5]
+        pngs = sorted((tmp / "out/query").glob("*.png"))
+        assert pngs
+        shallow = 0
+        for png in pngs:
+            with fits.open(tmp / "out/cutouts" / f"{png.stem}.fits", memmap=False) as hdul:
+                cutout, noise = hdul[0].data, hdul["NOISEEQ"].data
+            shallow += int((noise[1] == round(255 / 3**0.5)).any())
+            with Image.open(png) as img:
+                rendered = prep.render_cutout(cutout, meta["render"], noise)
+                assert np.array_equal(rendered, np.asarray(img))
+        assert shallow == 2
 
-        b = bundle.RunBundle(run, data, writable=True)
-        tiles = b.index["tiles"]
-        assert [t["key"] for t in tiles] == ["c.png", "a.png", "b.png"]
-        assert tiles[2]["score"] is None
-        assert tiles[0]["peak"] == [1, 0]
-        assert "NaN" not in b.read("index.json")[0].decode()
-        assert len(b.read("maps/000000.f32")[0]) == 4 * 4
 
-        n = bundle.export(b, Path(td) / "site", cutouts=1)
-        assert sorted(p.name for p in (Path(td) / "site/run/cutouts").iterdir()) == ["000000.fits"]
-        assert n == 2 + 3 * 2 + 1 + 1
+def test_noise_factor_evens_out_the_sky() -> None:
+    rng = np.random.default_rng(0)
+    wht = np.full((200, 200), 4.0)
+    wht[:, 100:] = 1.0
+    sky = 10 + rng.normal(size=wht.shape) / np.sqrt(wht)
+    f = prep.noise_factor(wht, typical=4.0)
+    assert f[0, 0] == 255
+    assert f[0, 199] == 128
+    flat = prep.equalise(sky, 10.0, f)
+    assert abs(flat[:, :100].std() / flat[:, 100:].std() - 1) < 0.05
+    # A saturated core has no weight, so it keeps its flux.
+    assert prep.noise_factor(np.zeros((1, 1)), 4.0)[0, 0] == 255
 
-        site = Path(td) / "site"
-        (site / "index.html").write_text(
-            '<html><head><title>x</title>\n<meta name="description" content="old" />\n'
-            '<meta property="og:title" content="old" />\n  </head></html>',
-            encoding="utf-8",
+
+def test_fits_sensor_reads_any_single_image() -> None:
+    # An HST-style drizzled image: the image in the primary HDU, counts per second
+    # with PHOTFNU, and no weight map, which the generic sensor has to take as it is.
+    field = _sky_with_sources(200, 200)
+    header = _wcs_header()
+    header.update({"TELESCOP": "HST", "FILTER": "F814W", "BUNIT": "ELECTRONS/S"})
+    header.update({"PHOTFNU": 7.0e-8, "PHOTPLAM": 8045.0})
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = tmp / "hst_10092_acs_wfc_f814w_drz.fits"
+        fits.PrimaryHDU(field, header).writeto(path)
+        prep.run(
+            [
+                "--files", str(path), "--out", str(tmp / "out"), "--tile_size", "100",
+                "--upscale", "1", "--stride", "100", "--wcs_in_name", "--save_cutouts",
+            ]
+        )  # fmt: skip
+        assert len(list((tmp / "out/query").glob("*.png"))) == 4
+        meta = json.loads(next((tmp / "out/mosaics").glob("*.json")).read_text())
+        band = meta["planes"][0]
+        assert band["filter"] == "F814W"
+        assert band["telescope"] == "HST"
+        assert band["jy_per_unit"] == 7.0e-8
+        assert abs(band["micron"] - 0.8045) < 1e-9
+        # HST's 2.4 m mirror at 0.8 microns.
+        assert abs(band["psf_fwhm_arcsec"] - 1.03 * 0.8045e-6 / 2.4 * 206264.806) < 1e-9
+        assert meta["render"]["kind"] == "asinh"
+
+
+def test_fits_sensor_skips_weight_maps_and_clashing_names() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        for name in ("M51_F814W_drz.fits", "M51_F814W_drz_wht.fits", "M51_F555W_drz.fits"):
+            (tmp / name).touch()
+        args = prep.parse_args(
+            ["--indir", str(tmp), "--out", str(tmp / "out"), "--wht_pattern", "{stem}_wht.fits"]
         )
-        bundle.add_site_meta(b, site, "https://example.org/demo")
-        page = (site / "index.html").read_text(encoding="utf-8")
-        assert '<link rel="canonical" href="https://example.org/demo/" />' in page
-        assert 'content="old"' not in page and "application/ld+json" in page
-        with Image.open(site / "social.png") as card:
-            assert card.size == (1200, 630)
-        assert "<loc>https://example.org/demo/</loc>" in (site / "sitemap.xml").read_text()
+        specs = list(prep.SENSORS["fits"].iter_mosaic_specs(args))
+        assert [s.tile_id for s in specs] == ["M51_F555W_drz", "M51_F814W_drz"]
 
-        bundle.save_verdict(run, "a.png", "artifact", True, "A diffraction spike")
-        bundle.save_verdict(run, "c.png", "interesting", False, "")
-        bundle.save_verdict(run, "c.png", None, False, "")
-        assert bundle.read_verdicts(run) == {
-            "a.png": {
-                "verdict": "artifact",
-                "star": True,
-                "note": "A diffraction spike",
-                "updated": bundle.read_verdicts(run)["a.png"]["updated"],
-            }
-        }
+        args.tile_regex = r"^(M51)_"
+        with pytest.raises(SystemExit, match="would both be mosaic M51"):
+            list(prep.SENSORS["fits"].iter_mosaic_specs(args))
 
 
-def main() -> None:
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    skipped = 0
-    for t in tests:
-        try:
-            t()
-        except Skipped as exc:
-            skipped += 1
-            print(f"skip {t.__name__}, {exc}")
-            continue
-        print(f"ok  {t.__name__}")
-    print(f"\n{len(tests) - skipped} checks passed, {skipped} skipped")
-
-
-if __name__ == "__main__":
-    main()
+def test_photometry_units() -> None:
+    scale = 0.06
+    pixel_sr = (scale / photometry.ARCSEC_PER_RAD) ** 2
+    assert photometry.jy_per_unit([{"BUNIT": "MJy/sr"}], scale) == 1e6 * pixel_sr
+    assert photometry.jy_per_unit([{"BUNIT": "nanomaggy"}], scale) == 3.631e-6
+    assert photometry.jy_per_unit([{"BUNIT": "uJy"}], scale) == 1e-6
+    assert photometry.jy_per_unit([{"BUNIT": "mJy/sr"}], scale) == 1e-3 * pixel_sr
+    assert photometry.jy_per_unit([{"BUNIT": "mJy"}], scale) == 1e-3
+    assert photometry.jy_per_unit([{"BUNIT": "MJY/SR"}], scale) == 1e6 * pixel_sr
+    assert (
+        abs(photometry.jy_per_unit([{"BUNIT": "ADU", "MAGZERO": 30.0}], scale) - 3.631e-9) < 1e-20
+    )
+    assert photometry.jy_per_unit([{"BUNIT": "ADU"}], scale) is None
+    assert photometry.filter_name([{"FILTER1": "CLEAR1L", "FILTER2": "F606W"}]) == "F606W"
+    assert photometry.wavelength_um([{"TELESCOP": "JWST"}], "F1000W") == 10.0
+    assert photometry.wavelength_um([{"TELESCOP": "HST"}], "F814W") is None
+    assert photometry.diffraction_fwhm_arcsec(2.0, "SUBARU") is None

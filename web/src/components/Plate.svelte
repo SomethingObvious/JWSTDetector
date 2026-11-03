@@ -4,7 +4,8 @@
   import { equaliser, type Limits, type TileData } from '../lib/tiles';
   import { edgeTicks, scaleBar, type TileFrame } from '../lib/frame';
   import { CMAPS, cssGradient } from '../lib/colormaps';
-  import type { Display, Theme, TileInfo } from '../lib/types';
+  import { catShape } from '../lib/catalogues';
+  import type { Display, Theme, TileInfo, TileSource } from '../lib/types';
 
   let {
     tile,
@@ -19,6 +20,8 @@
     mapRange,
     theme,
     cursor,
+    sources,
+    hasCatalogues,
     onrenderer,
     oncursor,
   }: {
@@ -34,6 +37,8 @@
     mapRange: [number, number];
     theme: Theme;
     cursor: { ix: number; iy: number } | null;
+    sources: TileSource[];
+    hasCatalogues: boolean;
     onrenderer: (r: Renderer | null, err?: string) => void;
     oncursor: (c: { ix: number; iy: number } | null) => void;
   } = $props();
@@ -158,6 +163,25 @@
     return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
   });
 
+  // The part of the tile its score came from, as overlapping tiles score the rest.
+  const owned = $derived.by(() => {
+    if (!data || !tile.owned) return null;
+    const [rows, cols] = grid;
+    const [r0, r1, c0, c1] = tile.owned;
+    const [x0, y0] = toScreen((c0 * W) / cols, (r0 * H) / rows);
+    const [x1, y1] = toScreen(((c1 + 1) * W) / cols, ((r1 + 1) * H) / rows);
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  });
+
+  const markers = $derived(
+    data
+      ? sources.map(([cat, name, , , u, v]) => {
+          const [x, y] = toScreen(u * W, v * H);
+          return { cat, name, x, y };
+        })
+      : [],
+  );
+
   // Pointer: drag pans, the wheel zooms about the pointer.
   let drag: { x: number; y: number; cfx: number; cfy: number } | null = null;
 
@@ -215,6 +239,7 @@
       <button class="ctl" onclick={fit} title="Fit the tile to the view (f)">Fit</button>
       <button class="ctl" onclick={oneToOne} title="One image pixel per screen pixel (0)">1:1</button>
       <span class="zoom num" title="Screen pixels per image pixel">{zoom.toFixed(2)}<span class="u">&times;</span></span>
+      <button class="ctl" aria-pressed={display.catalogues && hasCatalogues} disabled={!hasCatalogues} onclick={() => (display.catalogues = !display.catalogues)} title={hasCatalogues ? 'Catalogued sources over the tile (c)' : 'Run jwstdetector match to mark catalogued sources'}>Catalogues</button>
     </div>
     <span class="sep"></span>
     <div class="group">
@@ -284,9 +309,18 @@
       {/if}
 
       <svg class="over" width={cw} height={ch} aria-hidden="true">
+        {#if owned}
+          <rect class="owned" x={owned.x} y={owned.y} width={owned.w} height={owned.h} />
+        {/if}
         {#if patchBox}
           <rect class="patch" x={patchBox.x} y={patchBox.y} width={patchBox.w} height={patchBox.h} />
         {/if}
+        {#each markers as m, i (i)}
+          <g class="src" transform="translate({m.x} {m.y})"><title>{m.cat} {m.name}</title>
+            <path class="halo" d={catShape(m.cat)} />
+            <path d={catShape(m.cat)} />
+          </g>
+        {/each}
         {#if ring}
           <g class="ring" transform="translate({ring.x} {ring.y})">
             <circle r={ring.r} />
@@ -488,11 +522,28 @@
     pointer-events: none;
     overflow: visible;
   }
+  .owned {
+    fill: none;
+    stroke: var(--chalk);
+    stroke-width: 1;
+    stroke-dasharray: 4 4;
+    opacity: 0.45;
+  }
   .patch {
     fill: none;
     stroke: var(--anno);
     stroke-width: 1;
     opacity: 0.85;
+  }
+  .src path {
+    fill: none;
+    stroke: var(--cat);
+    stroke-width: 1.25;
+  }
+  .src .halo {
+    stroke: var(--ground-sunk);
+    stroke-width: 3.5;
+    opacity: 0.7;
   }
   .ring circle,
   .ring path {

@@ -80,6 +80,7 @@ class Backbone:
     std: tuple[float, ...]
     device: torch.device
     autocast_dtype: torch.dtype | None
+    layers: str = "last"
 
     @property
     def grid_size(self) -> tuple[int, int]:
@@ -167,10 +168,33 @@ def get_backbone(
     autocast: bool = True,
     layers: str = "last",
 ) -> Backbone:
-    """Load a backbone by name, dinov3-*, dinov2_*, a Hub repo id or a local checkpoint folder."""
+    """Load a backbone by name, dinov3-*, dinov2_*, a Hub repo id or a local checkpoint folder.
+
+    "pixels" is no model at all, just each 16 px patch's raw RGB values, which runs the
+    same search on pixels so the benchmark can show what the features add.
+    """
+    device = torch.device(device)
+    if model_name == "pixels":
+        size = 16
+
+        def raw(x: torch.Tensor) -> torch.Tensor:
+            return tnf.unfold(x, size, stride=size).transpose(1, 2)
+
+        return Backbone(
+            name=model_name,
+            model=torch.nn.Identity(),
+            forward_patches=raw,
+            patch_size=size,
+            resolution=_snap_resolution(resolution, size),
+            mean=(0.0, 0.0, 0.0),
+            std=(1.0, 1.0, 1.0),
+            device=device,
+            autocast_dtype=None,
+            layers=layers,
+        )
+
     from transformers import AutoModel
 
-    device = torch.device(device)
     repo = hub_repo(model_name)
     try:
         model = AutoModel.from_pretrained(repo).eval().to(device)
@@ -210,6 +234,7 @@ def get_backbone(
         std=std,
         device=device,
         autocast_dtype=dtype,
+        layers=layers,
     )
     logger.info(
         "Loaded %s on %s, %d px patches at %d px, a %dx%d grid, autocast %s",

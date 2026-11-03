@@ -1,5 +1,8 @@
-#!/usr/bin/env python3
-"""Cuts JWST FITS mosaics into PNG tiles for the detector, one mosaic at a time.
+"""Cuts FITS mosaics into PNG tiles for the detector, one mosaic at a time.
+
+Any image with a celestial WCS works through --sensor fits, from any telescope, as one
+grey band per file or three files combined into colour with --rgb. The miri and
+nircam sensors are presets for JWST archive and COSMOS-Web file layouts.
 
 Each mosaic stays memmapped while it is cut, so memory stays flat however big the
 mosaic is. The sky level, its noise and the stretch limits are measured once per
@@ -21,6 +24,7 @@ import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from astropy.io import fits
@@ -30,7 +34,9 @@ from PIL import Image
 from scipy.ndimage import binary_fill_holes
 from tqdm import tqdm
 
-logger = logging.getLogger("prep_data")
+from jwstdetector.photometry import describe_plane
+
+logger = logging.getLogger(__name__)
 
 
 def find_image(
@@ -143,6 +149,48 @@ def covered_fraction(wht: np.ndarray) -> float:
     return float(binary_fill_holes(covered).mean())
 
 
+def noise_factor(wht: np.ndarray, typical: float) -> np.ndarray:
+    """sqrt(weight / typical) capped at 1, in 255ths, for every pixel of a window.
+
+    Multiplying the flux above the sky by it gives every part of a mosaic the noise of
+    its typical depth, which is how a detection image is weighted. Without it, sky
+    covered by one exposure in place of three renders 1.7 times noisier, and on SMACS
+    0723 tiles reaching into those strips took the top four places. Pixels with no
+    weight, like a saturated star's core, keep their flux.
+    """
+    w = np.asarray(wht, dtype=np.float32)
+    f = np.sqrt(np.clip(w / typical, 0.0, 1.0))
+    f = np.where(np.isfinite(w) & (w > 0), f, 1.0)
+    return np.round(f * 255).astype(np.uint8)
+
+
+def equalise(x: np.ndarray, sky: float, factor: np.ndarray | None) -> np.ndarray:
+    """Flux above `sky` scaled by a noise_factor, leaving NaN and zero fill as they are."""
+    x = np.asarray(x, dtype=np.float32)
+    if factor is None:
+        return x
+    f = factor.astype(np.float32) / 255
+    return np.where(np.isfinite(x) & (x != 0), (x - sky) * f + sky, x).astype(np.float32)
+
+
+def typical_weights(whts: Sequence[np.ndarray], starts_y, starts_x, crop: int) -> list[float]:
+    """The median weight of each map over up to 64 tile windows spread across the mosaic.
+
+    Windows, since a reprojected plane can only be read a window at a time."""
+    windows = [(y, x) for y in starts_y for x in starts_x]
+    windows = windows[:: max(1, len(windows) // 64)]
+    typical = []
+    for w in whts:
+        medians = []
+        for y, x in windows:
+            part = np.asarray(w[y : y + crop, x : x + crop])[::4, ::4]
+            part = part[np.isfinite(part) & (part > 0)]
+            if part.size:
+                medians.append(np.median(part))
+        typical.append(float(np.median(medians)) if medians else 1.0)
+    return typical
+
+
 def tile_starts(length: int, crop: int, stride: int) -> list[int]:
     """Where crops start along one axis.
 
@@ -246,6 +294,11 @@ def cut_tiles(
 
     saved = skipped_empty = skipped_wht = 0
     h, w = signal.shape
+    typical = None
+    if getattr(args, "noise_eq", False) and whts and len(whts) == len(planes or [signal]):
+        typical = typical_weights(
+            whts, tile_starts(h, crop, stride), tile_starts(w, crop, stride), crop
+        )
     for y in tile_starts(h, crop, stride):
         for x in tile_starts(w, crop, stride):
             window = np.s_[y : y + crop, x : x + crop]
@@ -263,13 +316,17 @@ def cut_tiles(
                 continue
 
             if not args.dry_run:
+                noise = None
+                if typical is not None:
+                    noise = [noise_factor(m[window], t) for m, t in zip(whts, typical, strict=True)]
                 if colour is not None:
-                    tile = colour(window)
+                    tile = colour(window, noise)
                 else:
                     s = stats
                     if args.stretch_scope == "tile":
                         s = measure_mosaic(raw, args.p_lo, args.p_hi)
-                    tile = asinh_to_uint8(raw, s.lo, s.hi, args.asinh_q, fill=s.sky)
+                    flux = equalise(raw, s.sky, noise[0] if noise else None)
+                    tile = asinh_to_uint8(flux, s.lo, s.hi, args.asinh_q, fill=s.sky)
                 cx, cy = x + (crop - 1) / 2, y + (crop - 1) / 2
                 radec = None
                 if wcs is not None:
@@ -287,7 +344,12 @@ def cut_tiles(
                 if getattr(args, "save_cutouts", False):
                     cutout = Path("cutouts") / f"{Path(name).stem}.fits"
                     write_cutout(
-                        query_dir.parent / cutout, planes or [signal], window, wcs, args.bunit
+                        query_dir.parent / cutout,
+                        planes or [signal],
+                        window,
+                        wcs,
+                        args.bunit,
+                        noise,
                     )
                 if records is not None:
                     records.append(
@@ -322,10 +384,13 @@ def write_cutout(
     window: tuple[slice, slice],
     wcs: WCS | None,
     bunit: str | None,
+    noise: Sequence[np.ndarray] | None = None,
 ) -> None:
     """The raw float pixels under one tile, as a FITS file with its own WCS.
 
-    Zero fill becomes NaN, which is what FITS readers take as no data.
+    Zero fill becomes NaN, which is what FITS readers take as no data. The noise
+    factors the PNG was rendered with go in a NOISEEQ extension, so render_cutout can
+    make the same PNG again.
     """
     data = np.stack([np.asarray(p[window], dtype=np.float32) for p in planes])
     data[data == 0] = np.nan
@@ -338,8 +403,12 @@ def write_cutout(
     if bunit:
         header["BUNIT"] = bunit
     path.parent.mkdir(parents=True, exist_ok=True)
-    hdu = fits.PrimaryHDU(data[0] if len(planes) == 1 else data, header=header)
-    hdu.writeto(path, overwrite=True)
+    hdus = [fits.PrimaryHDU(data[0] if len(planes) == 1 else data, header=header)]
+    if noise is not None:
+        factors = np.stack(noise)
+        hdus.append(fits.ImageHDU(factors[0] if len(noise) == 1 else factors, name="NOISEEQ"))
+        hdus[-1].header["COMMENT"] = "sqrt(weight / typical weight) capped at 1, times 255"
+    fits.HDUList(hdus).writeto(path, overwrite=True)
 
 
 def describe_mosaic(
@@ -350,8 +419,15 @@ def describe_mosaic(
     headers: Sequence[fits.Header],
     filters: Sequence[str],
     preview: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    render: dict | None = None,
+    bunit: str | None = None,
+    planes: Sequence[dict] | None = None,
 ) -> None:
-    """mosaics/<id>.json and a preview PNG, which the web viewer reads."""
+    """mosaics/<id>.json and a preview PNG, which the web viewer reads.
+
+    `render` records how the tiles were stretched, which is what lets render_cutout
+    turn a cutout back into the same PNG after the benchmark adds a source to it.
+    """
     h, w = signal.shape
     step = max(1, int(np.ceil(max(h, w) / 2048)))
     ys, xs = np.arange(0, h, step), np.arange(0, w, step)
@@ -385,7 +461,76 @@ def describe_mosaic(
             if card.keyword and card.keyword not in ("HISTORY", "COMMENT", "") and len(cards) < 400:
                 cards.setdefault(card.keyword, str(card.value))
     meta["header"] = cards
+    if bunit:
+        meta["bunit"] = bunit
+    if render is not None:
+        meta["render"] = render
+    if planes:
+        meta["planes"] = list(planes)
     (out / "mosaics" / f"{tile_id}.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+
+
+def pixel_scale(wcs: WCS | None) -> float | None:
+    """Arcseconds per pixel, from the area of one pixel."""
+    if wcs is None:
+        return None
+    cd = np.diag(wcs.wcs.cdelt) @ wcs.wcs.get_pc()
+    return float(np.sqrt(abs(np.linalg.det(cd))) * 3600)
+
+
+def plane_info(headers, path: str, own: WCS | None, target: WCS | None, filt: str = "") -> dict:
+    """describe_plane for a file that may have been reprojected onto `target`'s grid.
+
+    Interpolating keeps a pixel's value, so one unit of it now covers the target's
+    pixel area. The area ratio fixes surface brightness and per-pixel units alike.
+    """
+    own_scale, target_scale = pixel_scale(own), pixel_scale(target or own)
+    info = describe_plane(headers, path, own_scale, filt or None)
+    if info["jy_per_unit"] is not None and own_scale and target_scale:
+        info["jy_per_unit"] *= (target_scale / own_scale) ** 2
+    return info
+
+
+def asinh_render(stats: MosaicStats, args: argparse.Namespace) -> dict | None:
+    """The render record for a grey mosaic, or None when each tile has its own stretch."""
+    if args.stretch_scope != "mosaic":
+        return None
+    return {
+        "kind": "asinh",
+        "lo": stats.lo,
+        "hi": stats.hi,
+        "q": args.asinh_q,
+        "sky": stats.sky,
+        "tile_size": args.tile_size,
+    }
+
+
+def render_cutout(data: np.ndarray, render: dict, noise: np.ndarray | None = None) -> np.ndarray:
+    """The 8-bit tile `prep` saves for these float pixels, top row first, at its saved size.
+
+    `data` is a cutout as write_cutout leaves it, (H, W) or (3, H, W) with FITS row 1
+    first, and `render` is the record mosaics/<id>.json keeps of how its mosaic was
+    stretched. Both stretches send NaN and zero to the sky level, so the NaN that
+    write_cutout puts in holes renders exactly as the zero fill did.
+    """
+    if render["kind"] == "lupton":
+        levels = [
+            MosaicStats(sky=v["sky"], sigma=0.0, lo=0.0, hi=v["hi"]) for v in render["levels"]
+        ]
+        opts = SimpleNamespace(stretch=render["stretch"], Q=render["Q"])
+        noise = [None] * len(levels) if noise is None else list(noise)
+        planes = [equalise(d, v.sky, n) for d, v, n in zip(data, levels, noise, strict=True)]
+        tile = lupton(opts, planes, levels)
+    elif render["kind"] == "asinh":
+        flux = equalise(data, render["sky"], noise)
+        tile = asinh_to_uint8(flux, render["lo"], render["hi"], render["q"], fill=render["sky"])
+    else:
+        raise ValueError(f"Unknown render kind {render['kind']!r}")
+    img = Image.fromarray(np.ascontiguousarray(tile[::-1]))
+    size = int(render["tile_size"])
+    if img.size != (size, size):
+        img = img.resize((size, size), Image.Resampling.BICUBIC)
+    return np.asarray(img)
 
 
 class Reprojected:
@@ -537,6 +682,9 @@ class MiriSensor(Sensor):
                     lambda ys, xs: asinh_to_uint8(
                         sci[ys[:, None], xs[None, :]], stats.lo, stats.hi, args.asinh_q, stats.sky
                     ),
+                    render=asinh_render(stats, args),
+                    bunit=args.bunit,
+                    planes=[plane_info([sci_hdul[0].header, header], spec.sci_path, wcs, wcs)],
                 )
             return cut_tiles(
                 args, spec.tile_id, sci, wht, wcs, query_dir, global_idx, records=records
@@ -596,6 +744,19 @@ class NircamSensor(Sensor):
         for tile_id in args.tiles or self._infer_tiles_from_dir(args.indir):
             yield MosaicSpec(tile_id=tile_id, sci_path="")
 
+    def _inputs(self, args: argparse.Namespace, spec: MosaicSpec) -> list[tuple[str, str]]:
+        if len(args.rgb_filters) not in (1, 3):
+            raise ValueError(f"--rgb_filters takes 1 or 3 filters, not {len(args.rgb_filters)}")
+        out = []
+        for filt in args.rgb_filters:
+            path = self._build_path(args, spec.tile_id, filt)
+            if not Path(path).is_file():
+                raise FileNotFoundError(
+                    f"There is no {filt} mosaic for tile {spec.tile_id} at {path}"
+                )
+            out.append((filt, path))
+        return out
+
     def _weights(self, args, stack, hdul, path: str, filt: str) -> np.ndarray:
         try:
             return find_image(hdul, (args.wht_ext, "WHT"), fallback=False)[0]
@@ -620,34 +781,37 @@ class NircamSensor(Sensor):
         global_idx: int,
         records: list[dict],
     ) -> int:
-        if len(args.rgb_filters) not in (1, 3):
-            raise ValueError(f"--rgb_filters takes 1 or 3 filters, not {len(args.rgb_filters)}")
-
+        inputs = self._inputs(args, spec)
         with contextlib.ExitStack() as stack:
-            planes, whts, headers, target, levels = [], [], [], None, []
-            for filt in args.rgb_filters:
-                path = self._build_path(args, spec.tile_id, filt)
-                if not Path(path).is_file():
-                    raise FileNotFoundError(
-                        f"There is no {filt} mosaic for tile {spec.tile_id} at {path}"
-                    )
+            planes, whts, headers, target, levels, infos = [], [], [], None, [], []
+            for filt, path in inputs:
                 hdul = stack.enter_context(fits.open(path, memmap=True))
                 data, hdr = find_image(hdul, (args.sci_ext, "SCI"))
                 levels.append(measure_mosaic(data, args.p_lo, args.p_hi))
                 wht = (
                     self._weights(args, stack, hdul, path, filt) if args.min_wht_frac > 0 else None
                 )
-                if target is None:
+                if not infos:
                     # The first filter sets the pixel grid and is the detection plane.
                     target = celestial_wcs(hdr, path, required=args.wcs_in_name)
                     shape = data.shape
                     headers = [hdul[0].header, hdr]
                     args.bunit = hdr.get("BUNIT")
-                elif target is not None:
-                    wcs = celestial_wcs(hdr, path)
-                    data = on_grid(data, wcs, target, shape)
+                    own = target
+                elif target is None:
+                    # Without a WCS the files have to share a grid already.
+                    own = None
+                    if data.shape != shape:
+                        raise ValueError(
+                            f"{path} is {data.shape[1]}x{data.shape[0]} and the first file is "
+                            f"{shape[1]}x{shape[0]}, and without a WCS they can't be aligned"
+                        )
+                else:
+                    own = celestial_wcs(hdr, path)
+                    data = on_grid(data, own, target, shape)
                     if wht is not None:
-                        wht = on_grid(wht, wcs, target, shape)
+                        wht = on_grid(wht, own, target, shape)
+                infos.append(plane_info([hdul[0].header, hdr], path, own, target, filt))
                 planes.append(data)
                 if wht is not None:
                     whts.append(wht)
@@ -655,8 +819,13 @@ class NircamSensor(Sensor):
             colour = None
             if len(planes) == 3:
 
-                def colour(window: tuple[slice, slice]) -> np.ndarray:
-                    return lupton(args, [p[window] for p in planes], levels)
+                def colour(window: tuple[slice, slice], noise=None) -> np.ndarray:
+                    noise = noise or [None] * len(planes)
+                    flux = [
+                        equalise(p[window], v.sky, n)
+                        for p, v, n in zip(planes, levels, noise, strict=True)
+                    ]
+                    return lupton(args, flux, levels)
 
             signal = planes[0]
             if not args.dry_run:
@@ -666,8 +835,11 @@ class NircamSensor(Sensor):
                     signal,
                     target,
                     headers,
-                    args.rgb_filters,
+                    [i["filter"] for i in infos],
                     lambda ys, xs: self._preview(args, planes, levels, ys, xs),
+                    render=self._render(args, levels),
+                    bunit=args.bunit,
+                    planes=infos,
                 )
             return cut_tiles(
                 args,
@@ -681,6 +853,18 @@ class NircamSensor(Sensor):
                 planes=planes,
                 records=records,
             )[0]
+
+    @staticmethod
+    def _render(args, levels) -> dict | None:
+        if len(levels) == 1:
+            return asinh_render(levels[0], args)
+        return {
+            "kind": "lupton",
+            "stretch": args.stretch,
+            "Q": args.Q,
+            "levels": [{"sky": v.sky, "hi": v.hi} for v in levels],
+            "tile_size": args.tile_size,
+        }
 
     @staticmethod
     def _preview(args, planes, levels, ys, xs) -> np.ndarray:
@@ -714,7 +898,101 @@ def lupton(
         return make_lupton_rgb(*scaled, stretch=args.stretch, Q=args.Q)
 
 
-SENSORS: dict[str, Sensor] = {"miri": MiriSensor(), "nircam": NircamSensor()}
+def _weight_path(path: str, pattern: str) -> Path:
+    return Path(path).with_name(pattern.format(stem=Path(path).name.split(".")[0]))
+
+
+class FitsSensor(NircamSensor):
+    """Any FITS image with a celestial WCS, from any telescope.
+
+    Each file matching --pattern in --indir, or each of --files, is cut as its own grey
+    mosaic. --rgb takes three files of one field instead, red first, and cuts them as one
+    colour mosaic on the first file's grid. The image is the --sci_ext extension when
+    there is one and the first 2D image otherwise. A weight map is used when the file
+    has a --wht_ext extension or a sibling named by --wht_pattern, and the coverage
+    check is skipped with a warning when there's neither.
+    """
+
+    name = "fits"
+
+    def add_args(self, p: argparse.ArgumentParser) -> None:
+        p.add_argument("--pattern", default="*.fits", help="Glob for the mosaics in --indir.")
+        p.add_argument("--files", nargs="+", default=None, help="FITS files, one mosaic each.")
+        p.add_argument(
+            "--rgb",
+            nargs=3,
+            default=None,
+            metavar="FILE",
+            help="Red, green and blue files of one field.",
+        )
+        p.add_argument("--sci_ext", default="SCI")
+        p.add_argument("--wht_ext", default="WHT")
+        p.add_argument(
+            "--wht_pattern",
+            default=None,
+            help="The weight map's name from the image's, like {stem}_wht.fits. Weights in "
+            "a --wht_ext extension are found without it.",
+        )
+        p.add_argument("--stretch", type=float, default=0.05, help="Lupton stretch for --rgb.")
+        p.add_argument("--Q", type=float, default=10.0, help="Lupton softening for --rgb.")
+
+    def iter_mosaic_specs(self, args: argparse.Namespace) -> Iterator[MosaicSpec]:
+        if args.rgb:
+            yield MosaicSpec(
+                tile_id=args.tile_id or Path(args.rgb[0]).stem, sci_path="|".join(args.rgb)
+            )
+            return
+        if args.files:
+            paths = [str(p) for p in args.files]
+        elif args.indir:
+            paths = sorted(str(p) for p in Path(args.indir).glob(args.pattern) if p.is_file())
+        else:
+            raise SystemExit("--sensor fits needs --indir, --files or --rgb")
+        if args.wht_pattern:
+            weights = {str(_weight_path(p, args.wht_pattern)) for p in paths}
+            paths = [p for p in paths if p not in weights]
+        if not paths:
+            raise FileNotFoundError(f"Nothing in {args.indir} matches {args.pattern}")
+        seen: dict[str, str] = {}
+        for path in paths:
+            tile_id = args.tile_id if len(paths) == 1 and args.tile_id else None
+            if not tile_id and args.tile_regex:
+                tile_id = infer_tile_id_from_filename(path, args.tile_regex)
+            tile_id = tile_id or Path(path).stem
+            if tile_id in seen:
+                raise SystemExit(
+                    f"{seen[tile_id]} and {path} would both be mosaic {tile_id}. "
+                    "Give a --tile_regex that tells them apart."
+                )
+            seen[tile_id] = path
+            yield MosaicSpec(tile_id=tile_id, sci_path=path)
+
+    def _inputs(self, args: argparse.Namespace, spec: MosaicSpec) -> list[tuple[str, str]]:  # noqa: ARG002
+        paths = spec.sci_path.split("|")
+        for path in paths:
+            if not Path(path).is_file():
+                raise FileNotFoundError(f"There is no FITS file at {path}")
+        return [("", path) for path in paths]
+
+    def _weights(self, args, stack, hdul, path: str, filt: str) -> np.ndarray | None:  # noqa: ARG002
+        try:
+            return find_image(hdul, (args.wht_ext, "WHT"), fallback=False)[0]
+        except ValueError:
+            pass
+        if args.wht_pattern:
+            wht_path = _weight_path(path, args.wht_pattern)
+            if wht_path.is_file():
+                wht_hdul = stack.enter_context(fits.open(wht_path, memmap=True))
+                return find_image(wht_hdul, (args.wht_ext, "WHT", "SCI"))[0]
+        logger.warning(
+            "%s has no weight map, so tiles on the edge of its coverage aren't dropped. "
+            "Pass --wht_pattern if it has one beside it.",
+            Path(path).name,
+        )
+        return None
+
+
+SENSORS: dict[str, Sensor] = {"fits": FitsSensor(), "miri": MiriSensor(), "nircam": NircamSensor()}
 
 
 def clear_previous_output(out: Path, overwrite: bool) -> None:
@@ -742,12 +1020,15 @@ def clear_previous_output(out: Path, overwrite: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Cut JWST FITS mosaics into PNG tiles for anomaly detection."
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument(
-        "--sensor", choices=sorted(SENSORS), default="miri", help="Instrument layout to read."
+        "--sensor",
+        choices=sorted(SENSORS),
+        default="fits",
+        help="fits for any image with a WCS, or the miri and nircam presets for JWST layouts.",
     )
-    p.add_argument("--indir", required=True, help="Folder holding the FITS mosaics.")
+    p.add_argument("--indir", default=None, help="Folder holding the FITS mosaics.")
     p.add_argument(
         "--out", default="datasets/jwst/object1", help="Output root. Tiles go in out/query/."
     )
@@ -793,6 +1074,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mean_thresh", "--meanthresh", dest="mean_thresh", help=argparse.SUPPRESS)
     p.add_argument("--var_thresh", "--varthresh", dest="var_thresh", help=argparse.SUPPRESS)
 
+    p.add_argument(
+        "--noise_eq",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Scale the flux above the sky by sqrt(weight / typical weight), capped at 1, "
+        "so shallow parts of a mosaic aren't noisier than the rest. Needs weight maps.",
+    )
     p.add_argument(
         "--stretch_scope",
         choices=("mosaic", "tile"),
@@ -843,7 +1131,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Each sensor has its own flags, so find the sensor first. This parser has no
     # --help, which lets -h reach the full parser and list the sensor's flags too.
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--sensor", choices=sorted(SENSORS), default="miri")
+    pre.add_argument("--sensor", choices=sorted(SENSORS), default="fits")
     sensor = pre.parse_known_args(argv)[0].sensor
     p = build_parser()
     SENSORS[sensor].add_args(p)
@@ -867,6 +1155,8 @@ def run(argv: list[str] | None = None) -> None:
         raise SystemExit(f"--limit can't be negative, got {args.limit}")
     if args.asinh_q <= 0:
         raise SystemExit(f"--asinh_q has to be above 0, got {args.asinh_q}")
+    if args.sensor != "fits" and not args.indir:
+        raise SystemExit(f"--sensor {args.sensor} needs --indir")
 
     out = Path(args.out)
     query_dir = out / "query"
