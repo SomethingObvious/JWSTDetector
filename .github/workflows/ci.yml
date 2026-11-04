@@ -20,6 +20,8 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check jwstdetector tests
       - run: ruff format --check jwstdetector tests
+      - run: mypy jwstdetector tests
+      - run: basedpyright
       - run: pytest -q
 
   viewer:
@@ -36,4 +38,6 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run check
+      - run: npm run lint
+      - run: npm run format:check
       - run: npm test

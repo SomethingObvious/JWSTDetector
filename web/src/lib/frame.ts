@@ -7,26 +7,42 @@ import type { MosaicInfo, TileInfo } from './types';
  * row is the mosaic's highest row in the tile, as FITS counts rows from the bottom.
  */
 export class TileFrame {
+  readonly tile: TileInfo;
+  readonly mosaic: MosaicInfo;
+  readonly wcs: Tan;
+  readonly width: number;
+  readonly height: number;
   readonly scaleX: number;
   readonly scaleY: number;
   constructor(
-    readonly tile: TileInfo,
-    readonly mosaic: MosaicInfo,
-    readonly wcs: Tan,
-    readonly width: number,
-    readonly height: number,
+    tile: TileInfo,
+    mosaic: MosaicInfo,
+    wcs: Tan,
+    width: number,
+    height: number,
   ) {
+    this.tile = tile;
+    this.mosaic = mosaic;
+    this.wcs = wcs;
+    this.width = width;
+    this.height = height;
     this.scaleX = tile.size / width;
     this.scaleY = tile.size / height;
   }
 
   /** Image position (continuous, pixel centres at i + 0.5) to 0-based mosaic pixel. */
   toMosaic(ix: number, iy: number): [number, number] {
-    return [this.tile.x0 + ix * this.scaleX - 0.5, this.tile.y0 + (this.height - iy) * this.scaleY - 0.5];
+    return [
+      this.tile.x0 + ix * this.scaleX - 0.5,
+      this.tile.y0 + (this.height - iy) * this.scaleY - 0.5,
+    ];
   }
 
   fromMosaic(x: number, y: number): [number, number] {
-    return [(x + 0.5 - this.tile.x0) / this.scaleX, this.height - (y + 0.5 - this.tile.y0) / this.scaleY];
+    return [
+      (x + 0.5 - this.tile.x0) / this.scaleX,
+      this.height - (y + 0.5 - this.tile.y0) / this.scaleY,
+    ];
   }
 
   toSky(ix: number, iy: number): [number, number] {
@@ -74,7 +90,12 @@ const DEC_STEPS = [0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 300, 600, 900, 1800, 3
 const RA_STEPS = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 300, 600];
 
 function raParts(sec: number, step: number): Part[] {
-  const places = step < 0.1 ? 2 : step < 1 ? 1 : 0;
+  let places = 0;
+  if (step < 0.1) {
+    places = 2;
+  } else if (step < 1) {
+    places = 1;
+  }
   const scale = 10 ** places;
   let total = Math.round(sec * scale);
   const day = 86400 * scale;
@@ -86,7 +107,9 @@ function raParts(sec: number, step: number): Part[] {
     { v: String(h).padStart(2, '0'), u: 'h' },
     { v: String(m).padStart(2, '0'), u: 'm' },
   ];
-  if (step < 60) parts.push({ v: s.toFixed(places).padStart(places ? places + 3 : 2, '0'), u: 's' });
+  if (step < 60) {
+    parts.push({ v: s.toFixed(places).padStart(places ? places + 3 : 2, '0'), u: 's' });
+  }
   return parts;
 }
 
@@ -98,17 +121,40 @@ function decParts(arcsec: number, step: number): Part[] {
   const m = Math.floor((total % (3600 * scale)) / (60 * scale));
   const s = (total % (60 * scale)) / scale;
   const parts = [{ v: signOf(arcsec) + String(d).padStart(2, '0'), u: '°' }];
-  if (step < 3600) parts.push({ v: String(m).padStart(2, '0'), u: '′' });
-  if (step < 60) parts.push({ v: s.toFixed(places).padStart(places ? places + 3 : 2, '0'), u: '″' });
+  if (step < 3600) {
+    parts.push({ v: String(m).padStart(2, '0'), u: '′' });
+  }
+  if (step < 60) {
+    parts.push({ v: s.toFixed(places).padStart(places ? places + 3 : 2, '0'), u: '″' });
+  }
   return parts;
+}
+
+/** Like a printed atlas, repeat only the fields that changed since the last label. */
+function changedParts(full: Part[], prev: Part[] | null): Part[] {
+  if (!prev) {
+    return full;
+  }
+  let same = 0;
+  while (same < full.length - 1 && full[same]?.v === prev[same]?.v) {
+    same++;
+  }
+  return full.slice(same);
 }
 
 /**
  * Finds where lines of constant RA and Dec cross the edges of a w by h view and
  * labels each edge with whichever coordinate runs along it.
  */
-export function edgeTicks(w: number, h: number, sky: (x: number, y: number) => [number, number], target = 110): Tick[] {
-  if (w < 40 || h < 40) return [];
+export function edgeTicks(
+  w: number,
+  h: number,
+  sky: (x: number, y: number) => [number, number],
+  target = 110,
+): Tick[] {
+  if (w < 40 || h < 40) {
+    return [];
+  }
   const [raC, decC] = sky(w / 2, h / 2);
   const [ra1, dec1] = sky(w / 2 + 100, h / 2);
   const perPx = (separation(raC, decC, ra1, dec1) * 3600) / 100;
@@ -117,8 +163,12 @@ export function edgeTicks(w: number, h: number, sky: (x: number, y: number) => [
   const raStep = RA_STEPS.find((s) => s * 15 * cosd >= perPx * target) ?? 600;
   const unwrap = (ra: number) => {
     let d = ra - raC;
-    if (d > 180) d -= 360;
-    if (d < -180) d += 360;
+    if (d > 180) {
+      d -= 360;
+    }
+    if (d < -180) {
+      d += 360;
+    }
     return raC + d;
   };
 
@@ -130,6 +180,8 @@ export function edgeTicks(w: number, h: number, sky: (x: number, y: number) => [
   ];
   const out: Tick[] = [];
   const N = 160;
+  // Both arrays hold N + 1 samples.
+  const span = (v: number[]) => Math.abs((v[N] ?? NaN) - (v[0] ?? NaN));
   for (const [edge, at, len] of edges) {
     const ra: number[] = [];
     const dec: number[] = [];
@@ -139,42 +191,50 @@ export function edgeTicks(w: number, h: number, sky: (x: number, y: number) => [
       ra.push((unwrap(r) / 15) * 3600);
       dec.push(d * 3600);
     }
-    const raSpan = Math.abs(ra[N] - ra[0]) * 15 * cosd;
-    const decSpan = Math.abs(dec[N] - dec[0]);
-    const useRa = raSpan >= decSpan;
+    const useRa = span(ra) * 15 * cosd >= span(dec);
     const vals = useRa ? ra : dec;
     const step = useRa ? raStep : decStep;
     let prev: Part[] | null = null;
-    for (let k = 0; k < N; k++) {
-      const a = Math.floor(vals[k] / step);
-      const b = Math.floor(vals[k + 1] / step);
-      if (a === b) continue;
-      const v = Math.max(a, b) * step;
-      const f = (v - vals[k]) / (vals[k + 1] - vals[k]);
-      const pos = ((k + f) / N) * len;
-      if (pos < 18 || pos > len - 18) continue;
-      const full = useRa ? raParts(v, step) : decParts(v, step);
-      // Like a printed atlas, repeat only the fields that changed since the last label.
-      let parts = full;
-      if (prev) {
-        let same = 0;
-        while (same < full.length - 1 && full[same].v === prev[same]?.v) same++;
-        parts = full.slice(same);
+    for (const [k, v0] of vals.entries()) {
+      const v1 = vals[k + 1];
+      // The last sample has no segment after it.
+      if (v1 === undefined) {
+        continue;
       }
+      const a = Math.floor(v0 / step);
+      const b = Math.floor(v1 / step);
+      if (a === b) {
+        continue;
+      }
+      const v = Math.max(a, b) * step;
+      const f = (v - v0) / (v1 - v0);
+      const pos = ((k + f) / N) * len;
+      if (pos < 18 || pos > len - 18) {
+        continue;
+      }
+      const full = useRa ? raParts(v, step) : decParts(v, step);
+      out.push({ edge, at: pos, parts: changedParts(full, prev) });
       prev = full;
-      out.push({ edge, at: pos, parts });
     }
   }
   return out;
 }
 
-const SCALE_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 300];
+const SCALE_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 300] as const;
 
 /** A round scale bar length in arcsec that comes out between about 50 and 140 px. */
-export function scaleBar(arcsecPerCssPx: number): { arcsec: number; px: number; label: string } {
+export function scaleBar(arcsecPerCssPx: number): {
+  arcsec: number;
+  px: number;
+  label: string;
+} {
   const want = arcsecPerCssPx * 90;
-  let arcsec = SCALE_STEPS[0];
-  for (const s of SCALE_STEPS) if (s <= want * 1.4) arcsec = s;
-  const label = arcsec >= 60 ? `${arcsec / 60}′` : `${arcsec}″`;
+  let arcsec: number = SCALE_STEPS[0];
+  for (const s of SCALE_STEPS) {
+    if (s <= want * 1.4) {
+      arcsec = s;
+    }
+  }
+  const label = arcsec >= 60 ? `${String(arcsec / 60)}′` : `${String(arcsec)}″`;
   return { arcsec, px: arcsec / arcsecPerCssPx, label };
 }

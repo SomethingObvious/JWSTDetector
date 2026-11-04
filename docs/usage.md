@@ -9,6 +9,7 @@ jwstdetector match       cross-match each tile's peak with SIMBAD, NED and Gaia 
 jwstdetector candidates  write the ranking as a FITS or VOTable table and DS9 regions
 jwstdetector view        open the ranking in the web viewer, or export it as a site
 jwstdetector bench       plant sources of known magnitude and measure what is found
+jwstdetector recall      measure how a run ranks objects known to be in the field
 ```
 
 ## Cutting Tiles
@@ -81,9 +82,21 @@ A few options matter more than the rest.
 --k_neighbors 20                   smoother kNN scores
 --rotation                         every rotation and flip of the reference tiles, slow
 --score_mode peak_minus_median     one small oddity rather than a tile odd all over
+--places 3                         a patch needs close matches in 3 separate places
+--detector iforest                 the isolation forest baseline, no backbone
+--bank_precision fp32              an fp32 memory bank, slower with the same ranking
 ```
 
-`jwstdetector run --help` lists everything else, like the reference sizes for each pass.
+`jwstdetector run --help` lists everything else, like the reference sizes for each pass. A backbone too big for the GPU, like `dinov3-vit7b16-pretrain-sat493m` on 8 GB, is streamed from disk a layer at a time, and `args.yaml` records the precision and whether it was streamed.
+
+### Another Field as Reference
+
+```
+jwstdetector run --data_root datasets/smacs_nircam --out_dir results_cross \
+  --reference_roots datasets/abell370_nircam datasets/macs0416_nircam datasets/ceers1_nircam
+```
+
+This scores every tile against two or more other fields in place of the bootstrap, and each of those fields against the rest to calibrate a p-value and q-value per tile. They're in `significance.csv`, and the viewer shows them and filters by q. The fields need the same filters and stretch, and their mosaics different `--tiles` names. Anything that differs between the fields will rank first, which [the method](method.md#another-field-as-reference) shows on SMACS 0723.
 
 ## Catalogues
 
@@ -125,7 +138,16 @@ Sorting the index by Learned ranks tiles by their anomaly percentile times what 
 jwstdetector bench --data_root datasets/smacs_nircam --out_dir bench --mags 22 23 24 25 26 27 28 --seeds 5
 ```
 
-It needs a dataset cut with `--save_cutouts`. Arguments after `--` go to every `jwstdetector run`, and [the benchmark page](benchmark.md) has what it measures and the SMACS 0723 results.
+It needs a dataset cut with `--save_cutouts`. `--detectors` picks from knn, subspace, pixels and iforest, and `--psf` from webb, gaussian and auto, which takes STPSF's model for JWST when it's installed (`pip install -e .[webb]`). Arguments after `--` go to every `jwstdetector run`, and [the benchmark page](benchmark.md) has what it measures and the SMACS 0723 results.
+
+## Known Objects
+
+```
+jwstdetector recall results_smacs datasets/smacs_nircam --objects lensed.csv \
+  --centre 110.8270 -73.4541
+```
+
+The objects come from a CSV with `ra` and `dec` in degrees and an optional `id` like 1.2, where the part before the dot groups the images of one lensed galaxy. It reports where each object's patch ranks among every patch the run scored, and `--centre` also compares each one only with patches at the same distance from that point, which keeps a cluster core's general oddness from counting. `recall.csv` has every object and `recall.json` the summary.
 
 ## Without a Query Set
 

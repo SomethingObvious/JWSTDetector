@@ -12,9 +12,13 @@ function fitsBytes(cards: string[], data: number[]): ArrayBuffer {
   const buf = new ArrayBuffer(headLen + dataLen);
   const bytes = new Uint8Array(buf);
   bytes.fill(32, 0, headLen);
-  for (let i = 0; i < head.length; i++) bytes[i] = head.charCodeAt(i);
+  for (let i = 0; i < head.length; i++) {
+    bytes[i] = head.charCodeAt(i);
+  }
   const view = new DataView(buf, headLen);
-  data.forEach((v, i) => view.setFloat32(i * 4, v, false));
+  data.forEach((v, i) => {
+    view.setFloat32(i * 4, v, false);
+  });
   return buf;
 }
 
@@ -38,24 +42,40 @@ describe('readFits', () => {
     const f = readFits(buf);
     expect(f.width).toBe(3);
     expect(f.height).toBe(2);
-    expect(Array.from(f.planes[0].slice(0, 3))).toEqual([4, NaN, -6.5]);
-    expect(Array.from(f.planes[0].slice(3))).toEqual([1, 2, 3]);
-    expect(f.header.BUNIT).toBe('MJy/sr');
-    expect(f.header.OBJECT).toBe("it's / here");
-    expect(f.header.CRVAL1).toBe(150);
-    expect(f.header.SIMPLE).toBe(true);
+    expect(Array.from(f.planes[0]?.slice(0, 3) ?? [])).toEqual([4, NaN, -6.5]);
+    expect(Array.from(f.planes[0]?.slice(3) ?? [])).toEqual([1, 2, 3]);
+    expect(f.header['BUNIT']).toBe('MJy/sr');
+    expect(f.header['OBJECT']).toBe("it's / here");
+    expect(f.header['CRVAL1']).toBe(150);
+    expect(f.header['SIMPLE']).toBe(true);
   });
 
   it('reads three planes for colour', () => {
     const buf = fitsBytes(
-      [card('SIMPLE', 'T'), card('BITPIX', '-32'), card('NAXIS', '3'), card('NAXIS1', '1'), card('NAXIS2', '1'), card('NAXIS3', '3')],
+      [
+        card('SIMPLE', 'T'),
+        card('BITPIX', '-32'),
+        card('NAXIS', '3'),
+        card('NAXIS1', '1'),
+        card('NAXIS2', '1'),
+        card('NAXIS3', '3'),
+      ],
       [0.25, 0.5, 0.75],
     );
     expect(readFits(buf).planes.map((p) => p[0])).toEqual([0.25, 0.5, 0.75]);
   });
 
   it('refuses integer data', () => {
-    const buf = fitsBytes([card('SIMPLE', 'T'), card('BITPIX', '16'), card('NAXIS', '2'), card('NAXIS1', '1'), card('NAXIS2', '1')], [0]);
+    const buf = fitsBytes(
+      [
+        card('SIMPLE', 'T'),
+        card('BITPIX', '16'),
+        card('NAXIS', '2'),
+        card('NAXIS1', '1'),
+        card('NAXIS2', '1'),
+      ],
+      [0],
+    );
     expect(() => readFits(buf)).toThrow('BITPIX is 16');
   });
 });
@@ -113,13 +133,27 @@ describe('computeLimits', () => {
 
   it('gives float colour bands one span above their own sky', () => {
     const p = [new Float32Array(1), new Float32Array(1), new Float32Array(1)];
-    const l = computeLimits(tile(p, [[1, 3], [10, 11], [0, 4]]), 'minmax');
+    const l = computeLimits(
+      tile(p, [
+        [1, 3],
+        [10, 11],
+        [0, 4],
+      ]),
+      'minmax',
+    );
     expect(l.lo).toEqual([1, 10, 0]);
     expect(l.hi).toEqual([5, 14, 4]);
   });
 
   it('leaves PNG bands on their own limits', () => {
-    const l = computeLimits(tile(null, [[1, 3], [10, 11], [0, 4]]), 'minmax');
+    const l = computeLimits(
+      tile(null, [
+        [1, 3],
+        [10, 11],
+        [0, 4],
+      ]),
+      'minmax',
+    );
     expect(l.hi).toEqual([3, 11, 4]);
   });
 });

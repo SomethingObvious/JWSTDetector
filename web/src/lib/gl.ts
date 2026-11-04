@@ -1,5 +1,5 @@
 import { lutTexels, cmapRow } from './colormaps';
-import type { Display, MapSource } from './types';
+import type { Display } from './types';
 import type { Limits, TileData } from './tiles';
 
 const VERT = `#version 300 es
@@ -105,7 +105,7 @@ void main() {
 
 interface Uploaded {
   img: WebGLTexture;
-  maps: Record<MapSource, WebGLTexture | null>;
+  maps: { pass2: WebGLTexture; pass1: WebGLTexture | null; diff: WebGLTexture | null };
 }
 
 export interface DrawState {
@@ -126,45 +126,84 @@ export class Renderer {
   private lut: WebGLTexture;
   private eq: WebGLTexture;
   private textures = new Map<number, Uploaded>();
+  private canvas: HTMLCanvasElement;
 
-  constructor(private canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: true, alpha: true });
-    if (!gl) throw new Error('This browser has no WebGL2, which the plate needs to draw float pixels');
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
+    const gl = canvas.getContext('webgl2', {
+      antialias: false,
+      premultipliedAlpha: true,
+      alpha: true,
+    });
+    if (!gl) {
+      throw new Error(
+        'This browser has no WebGL2, which the plate needs to draw float pixels',
+      );
+    }
     this.gl = gl;
     this.prog = this.link();
     gl.useProgram(this.prog);
-    for (const name of FRAG.matchAll(/uniform \w+ \w+ (\w+);|uniform \w+ (\w+);/g)) {
-      const n = name[1] ?? name[2];
-      this.loc[n] = gl.getUniformLocation(this.prog, n);
+    for (const m of FRAG.matchAll(/uniform \w+ (?:\w+ )?(?<name>\w+);/gu)) {
+      const n = m.groups?.['name'];
+      if (n) {
+        this.loc[n] = gl.getUniformLocation(this.prog, n);
+      }
     }
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     this.lut = this.texture();
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 6, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutTexels());
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA8,
+      256,
+      6,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      lutTexels(),
+    );
     this.eq = this.texture();
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 256, 3, 0, gl.RED, gl.FLOAT, new Float32Array(256 * 3));
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.R32F,
+      256,
+      3,
+      0,
+      gl.RED,
+      gl.FLOAT,
+      new Float32Array(256 * 3),
+    );
     gl.bindVertexArray(gl.createVertexArray());
   }
 
   private link(): WebGLProgram {
     const gl = this.gl;
     const shader = (type: number, src: string) => {
-      const s = gl.createShader(type)!;
+      const s = gl.createShader(type);
+      if (!s) {
+        throw new Error('Shader could not be created');
+      }
       gl.shaderSource(s, src);
       gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`Shader did not compile: ${gl.getShaderInfoLog(s)}`);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        throw new Error(`Shader did not compile: ${String(gl.getShaderInfoLog(s))}`);
+      }
       return s;
     };
-    const p = gl.createProgram()!;
+    const p = gl.createProgram();
     gl.attachShader(p, shader(gl.VERTEX_SHADER, VERT));
     gl.attachShader(p, shader(gl.FRAGMENT_SHADER, FRAG));
     gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`Shader did not link: ${gl.getProgramInfoLog(p)}`);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error(`Shader did not link: ${String(gl.getProgramInfoLog(p))}`);
+    }
     return p;
   }
 
   private texture(): WebGLTexture {
     const gl = this.gl;
-    const t = gl.createTexture()!;
+    const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -175,7 +214,17 @@ export class Renderer {
 
   private mapTexture(values: Float32Array, cols: number, rows: number): WebGLTexture {
     const t = this.texture();
-    this.gl.texImage2D(this.gl.TEXTURE_2D, 0, this.gl.R32F, cols, rows, 0, this.gl.RED, this.gl.FLOAT, values);
+    this.gl.texImage2D(
+      this.gl.TEXTURE_2D,
+      0,
+      this.gl.R32F,
+      cols,
+      rows,
+      0,
+      this.gl.RED,
+      this.gl.FLOAT,
+      values,
+    );
     return t;
   }
 
@@ -185,30 +234,61 @@ export class Renderer {
 
   /** Sends a tile's pixels and maps to the GPU once, so drawing it later costs nothing. */
   upload(d: TileData, grid: [number, number]) {
-    if (this.textures.has(d.index)) return;
+    if (this.textures.has(d.index)) {
+      return;
+    }
     const gl = this.gl;
     const img = this.texture();
     if (d.planes && d.channels === 3) {
       const n = d.width * d.height;
       const rgb = new Float32Array(n * 3);
-      const [r, g, b] = d.planes;
-      for (let i = 0; i < n; i++) {
-        rgb[i * 3] = r[i];
-        rgb[i * 3 + 1] = g[i];
-        rgb[i * 3 + 2] = b[i];
-      }
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB32F, d.width, d.height, 0, gl.RGB, gl.FLOAT, rgb);
+      // Interleaves the bands one plane at a time.
+      d.planes.forEach((plane, c) => {
+        let o = c;
+        for (const v of plane) {
+          rgb[o] = v;
+          o += 3;
+        }
+      });
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGB32F,
+        d.width,
+        d.height,
+        0,
+        gl.RGB,
+        gl.FLOAT,
+        rgb,
+      );
     } else if (d.planes) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, d.width, d.height, 0, gl.RED, gl.FLOAT, d.planes[0]);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.R32F,
+        d.width,
+        d.height,
+        0,
+        gl.RED,
+        gl.FLOAT,
+        d.planes[0] ?? null,
+      );
     } else {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, d.width, d.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, d.rgba);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA8,
+        d.width,
+        d.height,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        d.rgba,
+      );
     }
     const [rows, cols] = grid;
-    let diff: Float32Array | null = null;
-    if (d.map1) {
-      diff = new Float32Array(d.map2.length);
-      for (let i = 0; i < diff.length; i++) diff[i] = d.map2[i] - d.map1[i];
-    }
+    const map1 = d.map1;
+    const diff = map1 ? d.map2.map((v, i) => v - (map1[i] ?? NaN)) : null;
     this.textures.set(d.index, {
       img,
       maps: {
@@ -221,9 +301,15 @@ export class Renderer {
 
   evict(index: number) {
     const u = this.textures.get(index);
-    if (!u) return;
+    if (!u) {
+      return;
+    }
     this.gl.deleteTexture(u.img);
-    for (const t of Object.values(u.maps)) if (t) this.gl.deleteTexture(t);
+    for (const t of Object.values(u.maps)) {
+      if (t) {
+        this.gl.deleteTexture(t);
+      }
+    }
     this.textures.delete(index);
   }
 
@@ -246,42 +332,55 @@ export class Renderer {
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     const u = this.textures.get(s.tile.index);
-    if (!u) return;
+    if (!u) {
+      return;
+    }
     const d = s.display;
     const mapTex = u.maps[d.source] ?? u.maps.pass2;
+    // WebGL treats a missing location as null and skips the call.
+    const loc = (name: string) => this.loc[name] ?? null;
 
     const bind = (unit: number, tex: WebGLTexture, name: string) => {
       gl.activeTexture(gl.TEXTURE0 + unit);
       gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.uniform1i(this.loc[name], unit);
+      gl.uniform1i(loc(name), unit);
     };
     bind(0, u.img, 'u_img');
     bind(1, this.lut, 'u_lut');
     bind(2, this.eq, 'u_eq');
-    bind(3, mapTex!, 'u_map');
+    bind(3, mapTex, 'u_map');
 
-    const L = this.loc;
-    gl.uniform2f(L.u_size, s.tile.width, s.tile.height);
-    gl.uniform2f(L.u_canvas, w, h);
-    gl.uniform2f(L.u_center, s.centre[0], s.centre[1]);
-    gl.uniform1f(L.u_zoom, s.zoom * dpr);
-    gl.uniform1f(L.u_dpr, dpr);
-    gl.uniform1f(L.u_scale, s.tile.planes ? 1 : 255);
-    gl.uniform1i(L.u_channels, s.tile.channels);
-    const lim = (a: number[]) => [a[0], a[1] ?? a[0], a[2] ?? a[0]] as const;
-    gl.uniform3f(L.u_lo, ...lim(s.limits.lo));
-    gl.uniform3f(L.u_hi, ...lim(s.limits.hi));
-    gl.uniform1i(L.u_mono, d.mono ? 1 : 0);
-    gl.uniform1i(L.u_stretch, ['linear', 'sqrt', 'log', 'asinh', 'histeq'].indexOf(d.stretch));
-    gl.uniform1i(L.u_cmap, cmapRow(d.cmap));
-    gl.uniform1i(L.u_invert, d.invert ? 1 : 0);
-    gl.uniform3f(L.u_nan, ...s.nan);
-    gl.uniform1i(L.u_overlay, d.overlay ? (d.contours ? 2 : 1) : 0);
-    gl.uniform1f(L.u_opacity, d.overlayOpacity);
-    gl.uniform1i(L.u_ocmap, cmapRow(d.overlayCmap));
-    gl.uniform2f(L.u_orange, s.mapRange[0], s.mapRange[1]);
-    gl.uniform1f(L.u_thresh, d.threshold);
-    gl.uniform2i(L.u_grid, grid[1], grid[0]);
+    gl.uniform2f(loc('u_size'), s.tile.width, s.tile.height);
+    gl.uniform2f(loc('u_canvas'), w, h);
+    gl.uniform2f(loc('u_center'), s.centre[0], s.centre[1]);
+    gl.uniform1f(loc('u_zoom'), s.zoom * dpr);
+    gl.uniform1f(loc('u_dpr'), dpr);
+    gl.uniform1f(loc('u_scale'), s.tile.planes ? 1 : 255);
+    gl.uniform1i(loc('u_channels'), s.tile.channels);
+    const lim = (a: number[]) => {
+      const x = a[0] ?? NaN;
+      return [x, a[1] ?? x, a[2] ?? x] as const;
+    };
+    gl.uniform3f(loc('u_lo'), ...lim(s.limits.lo));
+    gl.uniform3f(loc('u_hi'), ...lim(s.limits.hi));
+    gl.uniform1i(loc('u_mono'), d.mono ? 1 : 0);
+    gl.uniform1i(
+      loc('u_stretch'),
+      ['linear', 'sqrt', 'log', 'asinh', 'histeq'].indexOf(d.stretch),
+    );
+    gl.uniform1i(loc('u_cmap'), cmapRow(d.cmap));
+    gl.uniform1i(loc('u_invert'), d.invert ? 1 : 0);
+    gl.uniform3f(loc('u_nan'), ...s.nan);
+    let overlay = 0;
+    if (d.overlay) {
+      overlay = d.contours ? 2 : 1;
+    }
+    gl.uniform1i(loc('u_overlay'), overlay);
+    gl.uniform1f(loc('u_opacity'), d.overlayOpacity);
+    gl.uniform1i(loc('u_ocmap'), cmapRow(d.overlayCmap));
+    gl.uniform2f(loc('u_orange'), s.mapRange[0], s.mapRange[1]);
+    gl.uniform1f(loc('u_thresh'), d.threshold);
+    gl.uniform2i(loc('u_grid'), grid[1], grid[0]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 }

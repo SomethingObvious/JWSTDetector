@@ -21,18 +21,28 @@ function devVerdicts(): Plugin {
         }
         let body = '';
         req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')));
-        req.on('end', async () => {
+        const save = async () => {
           try {
-            const v = JSON.parse(body) as { key: string; verdict: string | null; star: boolean; note: string };
-            const file = runDir + 'verdicts.json';
+            const v = JSON.parse(body) as {
+              key: string;
+              verdict: string | null;
+              star: boolean;
+              note: string;
+            };
+            const file = `${runDir}verdicts.json`;
             let all: Record<string, unknown> = {};
             try {
-              all = JSON.parse(await readFile(file, 'utf8'));
+              all = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
             } catch {
               all = {};
             }
-            const saved = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
-            all[v.key] = { verdict: v.verdict, star: v.star, note: v.note, updated: saved };
+            const saved = new Date().toISOString().replace(/\.\d+Z$/u, 'Z');
+            all[v.key] = {
+              verdict: v.verdict,
+              star: v.star,
+              note: v.note,
+              updated: saved,
+            };
             await writeFile(file, JSON.stringify(all, null, 1));
             res.setHeader('content-type', 'application/json');
             res.end(JSON.stringify({ saved }));
@@ -40,6 +50,9 @@ function devVerdicts(): Plugin {
             res.statusCode = 400;
             res.end(String(err));
           }
+        };
+        req.on('end', () => {
+          void save();
         });
       });
     },

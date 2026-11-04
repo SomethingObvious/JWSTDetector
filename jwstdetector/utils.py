@@ -1,14 +1,42 @@
-"""Turning patch distances into something you can look at."""
+"""Turning patch distances into something you can look at, and the astropy aliases.
+
+Import the aliases under `if TYPE_CHECKING:`, since this module loads torch and
+matplotlib.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 from scipy.ndimage import gaussian_filter, zoom
 
+from jwstdetector.backbones import background_mask, embedding_rgb
+from jwstdetector.data import TileDataset, relative_key
 
-def _to_pixels(grid: np.ndarray, shape: tuple[int, int], order: int) -> np.ndarray:
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import numpy.typing as npt
+
+    from jwstdetector.backbones import Backbone
+
+# astropy ships no type information, so its objects are Any to the type checkers.
+# Naming them still says what each value is.
+FitsHeader: TypeAlias = Any
+FitsHDUList: TypeAlias = Any
+SkyWcs: TypeAlias = Any
+SkyCoords: TypeAlias = Any
+AstropyTable: TypeAlias = Any
+TableCell: TypeAlias = Any
+
+
+def _to_pixels(
+    grid: npt.NDArray[np.float32], shape: tuple[int, int], order: Literal[0, 1]
+) -> npt.NDArray[np.float32]:
     # grid_mode lines each patch up with the pixels it covers. Without it scipy pins
     # the first and last patch centres to the image corners, which is up to half a
     # patch off at the edges.
@@ -16,26 +44,27 @@ def _to_pixels(grid: np.ndarray, shape: tuple[int, int], order: int) -> np.ndarr
     return zoom(grid, factors, order=order, grid_mode=True, mode="nearest")
 
 
-def dists2map(dists: np.ndarray, img_shape: tuple[int, int], sigma: float = 4.0) -> np.ndarray:
-    """The patch-distance grid scaled up to pixels and smoothed."""
+def dists2map(
+    dists: npt.NDArray[Any], img_shape: tuple[int, int], sigma: float = 4.0
+) -> npt.NDArray[np.float32]:
+    """Scale the patch-distance grid up to pixels and smooth it.
+
+    Returns:
+        The smoothed map, `img_shape` pixels in size.
+    """
     grid = np.asarray(dists, dtype=np.float32)
     return gaussian_filter(_to_pixels(grid, img_shape[:2], order=1), sigma=sigma)
 
 
-def plot_reference_masks(backbone, paths: list[Path], root: Path, out_path: Path, limit: int = 8):
+def plot_reference_masks(  # noqa: PLR0917 bootstrap and reference pass all four positionally
+    backbone: Backbone, paths: list[Path], root: Path, out_path: Path, limit: int = 8
+) -> None:
     """Draw a few reference tiles beside their embedding PCA and background mask.
 
     It's only worth it while tuning --masking, which otherwise stays invisible until
     the scores start looking wrong.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from PIL import Image
-
-    from jwstdetector.backbones import background_mask, embedding_rgb
-    from jwstdetector.data import TileDataset, relative_key
+    mpl.use("Agg")
 
     paths = paths[:limit]
     dataset = TileDataset(paths, root, backbone.transform())
@@ -56,7 +85,9 @@ def plot_reference_masks(backbone, paths: list[Path], root: Path, out_path: Path
         axs[row][1].imshow(rgb)
         axs[row][1].set_title("PCA of Patch Embeddings", fontsize=8)
         axs[row][2].imshow(tile)
-        axs[row][2].imshow(_to_pixels(mask.astype(np.float32), tile.shape[:2], order=0), alpha=0.5)
+        axs[row][2].imshow(
+            _to_pixels(mask.astype(np.float32), tile.shape[:2], order=0), alpha=0.5
+        )
         axs[row][2].set_title("Background Mask", fontsize=8)
         for ax in axs[row]:
             ax.axis("off")

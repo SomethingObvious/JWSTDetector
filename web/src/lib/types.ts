@@ -12,6 +12,10 @@ export interface RunInfo {
   score_mode: string;
   passes: number;
   n_reference: number;
+  /** Prep folders the tiles were scored against, when the reference was other fields. */
+  reference_fields?: string[];
+  /** Tiles from those fields that calibrate the p-values, or 0 without them. */
+  n_calibration?: number;
   created: string;
   args: Record<string, unknown>;
   /** Width of each row of embedding.f32, or 0 when the run saved no descriptors. */
@@ -35,6 +39,9 @@ export interface TileInfo {
   /** Null when the tile had nothing left to compare against. */
   score: number | null;
   score_pass1?: number;
+  /** Conformal p-value and Benjamini-Hochberg q-value against the reference fields. */
+  p?: number;
+  q?: number;
   in_reference: boolean;
   mosaic: string;
   x0: number;
@@ -118,13 +125,36 @@ export interface Display {
 
 export type Theme = 'atlas' | 'plate' | 'classic';
 
+export type SortKey = 'rank' | 'priority' | 'score' | 'delta' | 'ra' | 'dec';
+export type MatchFilter = 'all' | 'uncatalogued' | 'catalogued';
+export type VerdictFilter =
+  | 'all'
+  | 'unreviewed'
+  | 'interesting'
+  | 'artifact'
+  | 'known'
+  | 'not_anomalous'
+  | 'starred';
+export interface Filters {
+  text: string;
+  verdict: VerdictFilter;
+  match: MatchFilter;
+  mosaic: string;
+  scoreMin: number | null;
+  scoreMax: number | null;
+  /** Highest q-value shown, or null for every tile. */
+  qMax: number | null;
+  sort: SortKey;
+  desc: boolean;
+}
+
 export function tileId(index: number): string {
   return String(index).padStart(6, '0');
 }
 
 /** Drops the program and visit tokens and puts the observation last, so the instrument and filter read first. */
 export function shortMosaic(name: string): string {
-  const parts = name.split(/[-_]/).filter((t) => !/^(jw\d+|t\d+|clear)$/i.test(t));
-  const obs = parts.filter((t) => /^o\d+$/i.test(t));
+  const parts = name.split(/[-_]/u).filter((t) => !/^(?:jw\d+|t\d+|clear)$/iu.test(t));
+  const obs = parts.filter((t) => /^o\d+$/iu.test(t));
   return [...parts.filter((t) => !obs.includes(t)), ...obs].join(' ');
 }

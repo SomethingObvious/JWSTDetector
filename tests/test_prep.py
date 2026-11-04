@@ -1,25 +1,26 @@
-"""Checks for cutting mosaics into tiles, the stretches, the sensors and the photometry."""
+"""Checks for tiling mosaics, the stretches, the sensors and the photometry."""
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
+from pathlib import Path
 import re
 import tempfile
-from pathlib import Path
-from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
-import numpy as np
-import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
+import numpy as np
 from PIL import Image
+import pytest
 
-import jwstdetector.prep as prep
-from jwstdetector import photometry
+from jwstdetector import photometry, prep
 from jwstdetector.prep import (
     MiriSensor,
+    Mosaic,
     MosaicStats,
     asinh_to_uint8,
     cut_tiles,
@@ -33,11 +34,18 @@ from jwstdetector.prep import (
 from jwstdetector.scoring import SCORE_MODES, aggregate_score
 from jwstdetector.seeding import set_seed
 
+if TYPE_CHECKING:
+    import numpy.typing as npt
+
+    from jwstdetector.utils import FitsHDUList, FitsHeader
+
 SKY, NOISE = 0.0, 1.0
 
 
-def _tile_args(tile_size=100, stride=100, dry_run=True):
-    return SimpleNamespace(
+def _tile_args(
+    tile_size: int = 100, stride: int = 100, *, dry_run: bool = True
+) -> argparse.Namespace:
+    return argparse.Namespace(
         tile_size=tile_size,
         upscale=1,
         stride=stride,
@@ -55,25 +63,45 @@ def _tile_args(tile_size=100, stride=100, dry_run=True):
     )
 
 
-def _cut(field, args=None, wht=None, query_dir=Path("unused")):
-    """(next index, saved, skipped as empty, skipped for low WHT) for one field."""
-    return cut_tiles(args or _tile_args(), "A5", field, wht, None, query_dir, 0)
+def _cut(
+    field: npt.NDArray[np.float32],
+    args: argparse.Namespace | None = None,
+    *,
+    wht: npt.NDArray[np.float32] | None = None,
+    query_dir: Path = Path("unused"),
+) -> tuple[int, int, int, int]:
+    """Cut one field as mosaic A5, with no WCS.
+
+    Returns:
+        The next index and the saved, empty and low-WHT counts.
+    """
+    return cut_tiles(
+        args or _tile_args(), Mosaic("A5", field, wht=wht), query_dir, global_idx=0
+    )
 
 
-def _blank_sky(h, w, seed=0):
+def _blank_sky(h: int, w: int, seed: int = 0) -> npt.NDArray[np.float32]:
     return np.random.default_rng(seed).normal(SKY, NOISE, (h, w)).astype(np.float32)
 
 
-def _sky_with_sources(h, w, tile=100, peak=500.0, seed=0):
-    """Blank sky with a compact bright source in the middle of every tile."""
+def _sky_with_sources(
+    h: int, w: int, *, tile: int = 100, peak: float = 500.0, seed: int = 0
+) -> npt.NDArray[np.float32]:
+    """Make blank sky with a compact bright source in the middle of every tile.
+
+    Returns:
+        The field as float32.
+    """
     field = _blank_sky(h, w, seed)
     for y in range(0, h - tile + 1, tile):
         for x in range(0, w - tile + 1, tile):
-            field[y + tile // 2 : y + tile // 2 + 5, x + tile // 2 : x + tile // 2 + 5] = peak
+            field[
+                y + tile // 2 : y + tile // 2 + 5, x + tile // 2 : x + tile // 2 + 5
+            ] = peak
     return field
 
 
-def _wcs_header(ra=150.0, dec=-2.0):
+def _wcs_header(ra: float = 150.0, dec: float = -2.0) -> FitsHeader:
     w = WCS(naxis=2)
     w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     w.wcs.crpix = [100.0, 100.0]
@@ -187,7 +215,8 @@ def test_aggregate_score_modes() -> None:
 
     assert aggregate_score(needle, "max") == 5.0
     assert aggregate_score(needle, "peak_minus_median") == 4.5
-    # A tile that is odd all over must not outrank a normal tile holding one strange thing.
+    # A tile that is odd all over must not outrank a normal tile holding one
+    # strange thing.
     assert aggregate_score(np.full(1000, 2.0, np.float32), "peak_minus_median") == 0.0
 
 
@@ -195,12 +224,8 @@ def test_aggregate_score_edge_cases() -> None:
     assert np.isnan(aggregate_score(np.array([]), "top1p"))
     assert aggregate_score(np.array([np.nan, np.inf, 2.0]), "max") == 2.0
     assert aggregate_score(np.array([1.0]), "top1p") == 1.0
-    try:
+    with pytest.raises(ValueError, match="Unknown score_mode"):
         aggregate_score(np.ones(4), "nonsense")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("an unknown score_mode should raise")
 
 
 # --- tiling ------------------------------------------------------------------
@@ -266,31 +291,29 @@ def test_wht_gate() -> None:
 # --- FITS handling -----------------------------------------------------------
 def test_find_image() -> None:
     sci = np.ones((8, 8), np.float32)
-    hdul = fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(sci, name="SCI")])
+    hdul: FitsHDUList = fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(sci, name="SCI"),
+    ])
     assert find_image(hdul, ("SCI",))[0].shape == (8, 8)
     # SCI must not come back as the weight map just because there is no WHT.
-    try:
+    with pytest.raises(ValueError, match="no 2D image called WHT"):
         find_image(hdul, ("WHT",), fallback=False)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a missing WHT should raise")
     assert find_image(hdul, ("WHT",))[0] is hdul["SCI"].data
 
     stacked = fits.HDUList([fits.PrimaryHDU(sci[None])])
     assert find_image(stacked, ("SCI",))[0].shape == (8, 8)
     cube = fits.HDUList([fits.PrimaryHDU(np.ones((3, 8, 8), np.float32))])
-    try:
+    with pytest.raises(ValueError, match="no 2D image called SCI"):
         find_image(cube, ("SCI",))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a real cube should raise")
 
 
 def test_make_output_name() -> None:
-    assert make_output_name("A5", 100.4, 200.6, 7) == "A5_cx000100_cy000201_i00000007.png"
-    with_wcs = make_output_name("A5", 10, 20, 1, wcs_ra_dec=(150.1, -2.3))
+    assert (
+        make_output_name("A5", 100.4, 200.6, global_idx=7)
+        == "A5_cx000100_cy000201_i00000007.png"
+    )
+    with_wcs = make_output_name("A5", 10, 20, global_idx=1, wcs_ra_dec=(150.1, -2.3))
     assert with_wcs == "A5_cx000010_cy000020_ra150.100000_decm2.300000_i00000001.png"
 
 
@@ -315,19 +338,18 @@ def test_miri_i2d_end_to_end() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         (tmp / "raw").mkdir()
-        fits.HDUList(
-            [
-                fits.PrimaryHDU(),
-                fits.ImageHDU(field, header=_wcs_header(), name="SCI"),
-                fits.ImageHDU(wht, name="WHT"),
-            ]
-        ).writeto(tmp / "raw" / f"{stem}.fits")
+        fits.HDUList([
+            fits.PrimaryHDU(),
+            fits.ImageHDU(field, header=_wcs_header(), name="SCI"),
+            fits.ImageHDU(wht, name="WHT"),
+        ]).writeto(tmp / "raw" / f"{stem}.fits")
 
         prep.run(
             [
-                "--sensor", "miri", "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
-                "--pattern", "*i2d.fits", "--tile_size", "100", "--upscale", "1",
-                "--stride", "100", "--min_wht_frac", "0.5", "--wcs_in_name",
+                "--sensor", "miri", "--indir", str(tmp / "raw"),
+                "--out", str(tmp / "out"), "--pattern", "*i2d.fits",
+                "--tile_size", "100", "--upscale", "1", "--stride", "100",
+                "--min_wht_frac", "0.5", "--wcs_in_name",
             ]
         )  # fmt: skip
 
@@ -335,17 +357,29 @@ def test_miri_i2d_end_to_end() -> None:
         assert len(names) == 2, names
         assert all(n.startswith(f"{stem}_cx000050_") for n in names), names
         m = re.search(r"cy(\d+)_ra([\d.]+)_dec(m?[\d.]+)_", names[1])
+        assert m is not None, names[1]
         ra, dec = WCS(_wcs_header()).all_pix2world(49.5, 149.5, 0)
         assert m.group(1) == "000150"
         assert m.group(2) == f"{float(ra):.6f}"
         assert m.group(3) == f"m{-float(dec):.6f}"
 
 
+def _tile_origin(name: str) -> tuple[int, int]:
+    # The corner of a 100 px tile, from the centre pixel in its name.
+    m = re.search(r"cx(\d+)_cy(\d+)", name)
+    assert m is not None, name
+    cx, cy = (int(v) for v in m.groups())
+    return cx - 50, cy - 50
+
+
 def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
     # Lupton's mapping works pixel by pixel, so a colour tile made on its own has to
     # match the same crop of a colour image made from the whole mosaic, top row first.
     rng = np.random.default_rng(3)
-    planes = [np.abs(_sky_with_sources(200, 300, seed=s)) * rng.uniform(0.5, 2) for s in (1, 2, 3)]
+    planes = [
+        np.abs(_sky_with_sources(200, 300, seed=s)) * rng.uniform(0.5, 2)
+        for s in (1, 2, 3)
+    ]
     planes[1][10, 10] = np.nan
     filters = ["f444w", "f277w", "f150w"]
     with tempfile.TemporaryDirectory() as td:
@@ -359,21 +393,23 @@ def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
 
         prep.run(
             [
-                "--sensor", "nircam", "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
-                "--tile_size", "100", "--upscale", "1", "--stride", "100", "--min_wht_frac", "0",
+                "--sensor", "nircam", "--indir", str(tmp / "raw"),
+                "--out", str(tmp / "out"), "--tile_size", "100", "--upscale", "1",
+                "--stride", "100", "--min_wht_frac", "0",
             ]
         )  # fmt: skip
 
         levels = [measure_mosaic(p, 1.0, 99.8) for p in planes]
-        whole = prep.lupton(SimpleNamespace(stretch=0.05, Q=10.0), planes, levels)
+        whole = prep.lupton(argparse.Namespace(stretch=0.05, Q=10.0), planes, levels)
         pngs = sorted((tmp / "out/query").glob("A5_*.png"))
         assert len(pngs) == 6
         for png in pngs:
-            cx, cy = (int(v) for v in re.search(r"cx(\d+)_cy(\d+)", png.name).groups())
-            x, y = cx - 50, cy - 50
+            x, y = _tile_origin(png.name)
             with Image.open(png) as img:
                 assert img.mode == "RGB"
-                assert np.array_equal(np.asarray(img), whole[y : y + 100, x : x + 100][::-1])
+                assert np.array_equal(
+                    np.asarray(img), whole[y : y + 100, x : x + 100][::-1]
+                )
 
 
 def test_cutout_pixels_and_wcs_match_the_mosaic() -> None:
@@ -387,7 +423,8 @@ def test_cutout_pixels_and_wcs_match_the_mosaic() -> None:
     window = (slice(10, 30), slice(5, 25))
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "c.fits"
-        prep.write_cutout(path, [plane], window, w, "MJy/sr")
+        prep.write_cutout(path, Mosaic("c", plane, wcs=w, bunit="MJy/sr"), window)
+        hdul: FitsHDUList
         with fits.open(path) as hdul:
             assert np.array_equal(hdul[0].data, plane[window])
             assert hdul[0].header["BUNIT"] == "MJy/sr"
@@ -403,20 +440,28 @@ def test_help_lists_the_sensor_flags() -> None:
 
 
 # --- reproducibility and the runners ------------------------------------------
+def _global_draw() -> list[float]:
+    draws: list[float] = np.random.rand(5).tolist()  # noqa: NPY002 set_seed pins this global stream
+    return draws
+
+
 def test_set_seed_reproducible() -> None:
     set_seed(7)
-    first = np.random.rand(5).tolist()
+    first = _global_draw()
     set_seed(7)
-    assert np.random.rand(5).tolist() == first
+    assert _global_draw() == first
     set_seed(8)
-    assert np.random.rand(5).tolist() != first
+    assert _global_draw() != first
 
 
 def test_cutouts_render_back_to_the_same_tiles() -> None:
     # The benchmark adds sources to the cutouts and renders them again, so a cutout
     # with nothing added has to come back as exactly the PNG prep saved.
     rng = np.random.default_rng(5)
-    planes = [np.abs(_sky_with_sources(200, 300, seed=s)) * rng.uniform(0.5, 2) for s in (1, 2, 3)]
+    planes = [
+        np.abs(_sky_with_sources(200, 300, seed=s)) * rng.uniform(0.5, 2)
+        for s in (1, 2, 3)
+    ]
     planes[2][40:45, 40:45] = np.nan
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -431,17 +476,16 @@ def test_cutouts_render_back_to_the_same_tiles() -> None:
             wht = np.full(plane.shape, 3.0)
             if filt == "f277w":
                 wht[:, 220:] = 1.0
-            fits.HDUList(
-                [
-                    fits.PrimaryHDU(),
-                    fits.ImageHDU(plane, header, name="SCI"),
-                    fits.ImageHDU(wht, name="WHT"),
-                ]
-            ).writeto(tmp / "raw" / name)
+            fits.HDUList([
+                fits.PrimaryHDU(),
+                fits.ImageHDU(plane, header, name="SCI"),
+                fits.ImageHDU(wht, name="WHT"),
+            ]).writeto(tmp / "raw" / name)
         prep.run(
             [
-                "--sensor", "nircam", "--indir", str(tmp / "raw"), "--out", str(tmp / "out"),
-                "--tile_size", "100", "--upscale", "1", "--stride", "100", "--save_cutouts",
+                "--sensor", "nircam", "--indir", str(tmp / "raw"),
+                "--out", str(tmp / "out"), "--tile_size", "100", "--upscale", "1",
+                "--stride", "100", "--save_cutouts",
             ]
         )  # fmt: skip
         meta = json.loads((tmp / "out/mosaics/A5.json").read_text())
@@ -451,8 +495,11 @@ def test_cutouts_render_back_to_the_same_tiles() -> None:
         pngs = sorted((tmp / "out/query").glob("*.png"))
         assert pngs
         shallow = 0
+        hdul: FitsHDUList
         for png in pngs:
-            with fits.open(tmp / "out/cutouts" / f"{png.stem}.fits", memmap=False) as hdul:
+            with fits.open(
+                tmp / "out/cutouts" / f"{png.stem}.fits", memmap=False
+            ) as hdul:
                 cutout, noise = hdul[0].data, hdul["NOISEEQ"].data
             shallow += int((noise[1] == round(255 / 3**0.5)).any())
             with Image.open(png) as img:
@@ -507,11 +554,20 @@ def test_fits_sensor_reads_any_single_image() -> None:
 def test_fits_sensor_skips_weight_maps_and_clashing_names() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        for name in ("M51_F814W_drz.fits", "M51_F814W_drz_wht.fits", "M51_F555W_drz.fits"):
+        for name in (
+            "M51_F814W_drz.fits",
+            "M51_F814W_drz_wht.fits",
+            "M51_F555W_drz.fits",
+        ):
             (tmp / name).touch()
-        args = prep.parse_args(
-            ["--indir", str(tmp), "--out", str(tmp / "out"), "--wht_pattern", "{stem}_wht.fits"]
-        )
+        args = prep.parse_args([
+            "--indir",
+            str(tmp),
+            "--out",
+            str(tmp / "out"),
+            "--wht_pattern",
+            "{stem}_wht.fits",
+        ])
         specs = list(prep.SENSORS["fits"].iter_mosaic_specs(args))
         assert [s.tile_id for s in specs] == ["M51_F555W_drz", "M51_F814W_drz"]
 
@@ -529,11 +585,13 @@ def test_photometry_units() -> None:
     assert photometry.jy_per_unit([{"BUNIT": "mJy/sr"}], scale) == 1e-3 * pixel_sr
     assert photometry.jy_per_unit([{"BUNIT": "mJy"}], scale) == 1e-3
     assert photometry.jy_per_unit([{"BUNIT": "MJY/SR"}], scale) == 1e6 * pixel_sr
-    assert (
-        abs(photometry.jy_per_unit([{"BUNIT": "ADU", "MAGZERO": 30.0}], scale) - 3.631e-9) < 1e-20
-    )
+    from_zero_point = photometry.jy_per_unit([{"BUNIT": "ADU", "MAGZERO": 30.0}], scale)
+    assert from_zero_point is not None
+    assert abs(from_zero_point - 3.631e-9) < 1e-20
     assert photometry.jy_per_unit([{"BUNIT": "ADU"}], scale) is None
-    assert photometry.filter_name([{"FILTER1": "CLEAR1L", "FILTER2": "F606W"}]) == "F606W"
+    assert (
+        photometry.filter_name([{"FILTER1": "CLEAR1L", "FILTER2": "F606W"}]) == "F606W"
+    )
     assert photometry.wavelength_um([{"TELESCOP": "JWST"}], "F1000W") == 10.0
     assert photometry.wavelength_um([{"TELESCOP": "HST"}], "F814W") is None
     assert photometry.diffraction_fwhm_arcsec(2.0, "SUBARU") is None

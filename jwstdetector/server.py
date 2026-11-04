@@ -11,15 +11,18 @@ host can serve, GitHub Pages included, where verdicts stay in each visitor's bro
 from __future__ import annotations
 
 import argparse
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import mimetypes
-import threading
-import webbrowser
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import threading
+from typing import Any, ClassVar
 from urllib.parse import unquote, urlsplit
+import webbrowser
+
+from typing_extensions import override
 
 from jwstdetector.bundle import RunBundle, add_site_meta, export, save_verdict
 
@@ -28,107 +31,154 @@ logger = logging.getLogger(__name__)
 APP_DIR = Path(__file__).resolve().parent / "viewer_static"
 
 
-def make_handler(bundle: RunBundle):
-    lock = threading.Lock()
+class _ViewerHandler(BaseHTTPRequestHandler):
+    bundle: ClassVar[RunBundle]
+    lock: ClassVar[threading.Lock]
 
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):
-            logger.debug(fmt, *args)
+    @override
+    def log_message(self, format: str, *args: Any) -> None:
+        logger.debug(format, *args)
 
-        def _send(self, status: int, body: bytes, ctype: str, cache: bool = False) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+    def _send(
+        self, status: int, body: bytes, ctype: str, *, cache: bool = False
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
-        def _error(self, status: int, message: str) -> None:
-            self._send(status, json.dumps({"error": message}).encode(), "application/json")
+    def _error(self, status: int, message: str) -> None:
+        self._send(status, json.dumps({"error": message}).encode(), "application/json")
 
-        def do_GET(self) -> None:
-            path = unquote(urlsplit(self.path).path).lstrip("/") or "index.html"
-            if path.startswith("run/"):
-                try:
-                    body, ctype = bundle.read(path[4:])
-                except (FileNotFoundError, OSError):
-                    self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
-                    return
-                static = not path.endswith(("index.json", "verdicts.json"))
-                self._send(HTTPStatus.OK, body, ctype, cache=static)
-                return
-
-            target = (APP_DIR / path).resolve()
-            if not target.is_relative_to(APP_DIR) or not target.is_file():
+    def do_GET(self) -> None:
+        """Serve a run file under run/, or a file of the built viewer otherwise."""
+        path = unquote(urlsplit(self.path).path).lstrip("/") or "index.html"
+        if path.startswith("run/"):
+            try:
+                body, ctype = self.bundle.read(path[4:])
+            except (FileNotFoundError, OSError):
                 self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
                 return
-            ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-            self._send(HTTPStatus.OK, target.read_bytes(), ctype, cache=path != "index.html")
+            static = not path.endswith(("index.json", "verdicts.json"))
+            self._send(HTTPStatus.OK, body, ctype, cache=static)
+            return
 
-        def do_POST(self) -> None:
-            if urlsplit(self.path).path != "/run/api/verdict":
-                self._error(HTTPStatus.NOT_FOUND, "Only run/api/verdict takes writes")
-                return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(min(length, 1 << 20)))
-                key = str(body["key"])
-                if key not in {t.key for t in bundle.tiles}:
-                    raise KeyError(f"{key} isn't a tile in this run")
-                with lock:
-                    saved = save_verdict(
-                        bundle.run_dir,
-                        key,
-                        body.get("verdict"),
-                        bool(body.get("star")),
-                        str(body.get("note") or ""),
-                    )
-            except (ValueError, KeyError, TypeError) as exc:
-                self._error(HTTPStatus.BAD_REQUEST, str(exc))
-                return
-            self._send(HTTPStatus.OK, json.dumps({"saved": saved}).encode(), "application/json")
+        target = (APP_DIR / path).resolve()
+        if not target.is_relative_to(APP_DIR) or not target.is_file():
+            self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
+            return
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self._send(
+            HTTPStatus.OK, target.read_bytes(), ctype, cache=path != "index.html"
+        )
 
+    def do_POST(self) -> None:
+        """Save the verdict posted to run/api/verdict."""
+        if urlsplit(self.path).path != "/run/api/verdict":
+            self._error(HTTPStatus.NOT_FOUND, "Only run/api/verdict takes writes")
+            return
+        try:
+            saved = self._save_posted_verdict()
+        except (ValueError, KeyError, TypeError) as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._send(
+            HTTPStatus.OK, json.dumps({"saved": saved}).encode(), "application/json"
+        )
+
+    def _save_posted_verdict(self) -> str:
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(min(length, 1 << 20)))
+        key = str(body["key"])
+        if key not in {t.key for t in self.bundle.tiles}:
+            msg = f"{key} isn't a tile in this run"
+            raise KeyError(msg)
+        with self.lock:
+            return save_verdict(
+                self.bundle.run_dir,
+                key,
+                body.get("verdict"),
+                bool(body.get("star")),
+                str(body.get("note") or ""),
+            )
+
+
+def make_handler(bundle: RunBundle) -> type[BaseHTTPRequestHandler]:
+    """Return a request handler class that serves `bundle` and the viewer."""
+
+    class Handler(_ViewerHandler):
+        pass
+
+    Handler.bundle = bundle
+    Handler.lock = threading.Lock()
     return Handler
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("run_dir", type=Path, help="A `jwstdetector run` output folder.")
-    ap.add_argument("data_root", type=Path, help="The `jwstdetector prep` --out folder it scored.")
+    ap.add_argument(
+        "data_root", type=Path, help="The `jwstdetector prep` --out folder it scored."
+    )
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument(
-        "--no-browser", dest="browser", action="store_false", help="Don't open a browser tab."
+        "--no-browser",
+        dest="browser",
+        action="store_false",
+        help="Don't open a browser tab.",
     )
-    ap.add_argument("--export", type=Path, default=None, help="Write a static site here instead.")
+    ap.add_argument(
+        "--export", type=Path, default=None, help="Write a static site here instead."
+    )
     ap.add_argument(
         "--cutouts",
         type=int,
         default=None,
-        help="With --export, keep the FITS cutouts of only the top N tiles, as they're big.",
+        help="With --export, keep the FITS cutouts of only the top N tiles, "
+        "as they're big.",
     )
-    ap.add_argument("--name", default=None, help="The run's name in the viewer, its tag otherwise.")
+    ap.add_argument(
+        "--name", default=None, help="The run's name in the viewer, its tag otherwise."
+    )
     ap.add_argument(
         "--site_url",
         default=None,
-        help="With --export, where the site will be hosted, for its social card and sitemap.",
+        help="With --export, where the site will be hosted, "
+        "for its social card and sitemap.",
     )
     ap.add_argument("--verbose", action="store_true", help="Log every request.")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Serve the run in a browser, or export it as a static site with --export.
+
+    Returns:
+        The exit code, which is always 0.
+
+    Raises:
+        SystemExit: If the viewer hasn't been built.
+    """
+    args = _parser().parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
     if not (APP_DIR / "index.html").is_file():
-        raise SystemExit(
+        msg = (
             f"The viewer isn't built, as {APP_DIR / 'index.html'} is missing. "
             "Run `npm ci && npm run build` in web/."
         )
+        raise SystemExit(msg)
     bundle = RunBundle(args.run_dir, args.data_root, writable=args.export is None)
     if args.name:
-        bundle.index["run"]["name"] = args.name
+        index: dict[str, Any] = bundle.index
+        index["run"]["name"] = args.name
 
     if args.export is not None:
         n = export(bundle, args.export, APP_DIR, cutouts=args.cutouts)

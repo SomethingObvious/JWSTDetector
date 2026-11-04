@@ -1,22 +1,6 @@
-<script lang="ts" module>
-  export type SortKey = 'rank' | 'priority' | 'score' | 'delta' | 'ra' | 'dec';
-  export type MatchFilter = 'all' | 'uncatalogued' | 'catalogued';
-  export type VerdictFilter = 'all' | 'unreviewed' | 'interesting' | 'artifact' | 'known' | 'not_anomalous' | 'starred';
-  export interface Filters {
-    text: string;
-    verdict: VerdictFilter;
-    match: MatchFilter;
-    mosaic: string;
-    scoreMin: number | null;
-    scoreMax: number | null;
-    sort: SortKey;
-    desc: boolean;
-  }
-</script>
-
 <script lang="ts">
   import Glyph from './Glyph.svelte';
-  import { shortMosaic, type Bundle } from '../lib/types';
+  import { shortMosaic, type Bundle, type Filters } from '../lib/types';
   import { raHms, decDms } from '../lib/wcs';
   import { orList } from '../lib/catalogues';
   import type { Verdicts } from '../lib/verdicts.svelte';
@@ -39,7 +23,7 @@
     verdicts: Verdicts;
     reviewed: number;
     filters: Filters;
-    filterInput?: HTMLInputElement;
+    filterInput?: HTMLInputElement | undefined;
     onselect: (index: number) => void;
   } = $props();
 
@@ -52,29 +36,64 @@
     let lo = Infinity;
     let hi = -Infinity;
     for (const t of bundle.tiles) {
-      if (t.score === null) continue;
-      if (t.score < lo) lo = t.score;
-      if (t.score > hi) hi = t.score;
+      if (t.score === null) {
+        continue;
+      }
+      if (t.score < lo) {
+        lo = t.score;
+      }
+      if (t.score > hi) {
+        hi = t.score;
+      }
     }
-    if (lo > hi) return [0, 1] as const;
+    if (lo > hi) {
+      return [0, 1] as const;
+    }
     return [lo, hi === lo ? lo + 1 : hi] as const;
   });
 
   const first = $derived(Math.max(0, Math.floor(scrollTop / ROW) - 4));
-  const last = $derived(Math.min(order.length, Math.ceil((scrollTop + height) / ROW) + 4));
-  const visible = $derived(Array.from({ length: Math.max(0, last - first) }, (_, k) => first + k));
+  const last = $derived(
+    Math.min(order.length, Math.ceil((scrollTop + height) / ROW) + 4),
+  );
+  const visible = $derived(
+    Array.from({ length: Math.max(0, last - first) }, (_, k) => first + k),
+  );
+  const rows = $derived(
+    visible.flatMap((k) => {
+      const i = order[k];
+      const t = i === undefined ? undefined : bundle.tiles[i];
+      return i === undefined || !t ? [] : [{ k, i, t }];
+    }),
+  );
   const mosaicNames = $derived(Object.keys(bundle.mosaics));
   const xmatch = $derived(bundle.run.xmatch);
-  const unmatched = $derived(bundle.tiles.reduce((n, t) => n + (t.xmatch?.uncatalogued ? 1 : 0), 0));
-  const matched = $derived(bundle.tiles.reduce((n, t) => n + (t.xmatch && !t.xmatch.uncatalogued ? 1 : 0), 0));
+  const Q_LEVELS = [0.01, 0.05, 0.1, 0.2];
+  const calibrated = $derived((bundle.run.n_calibration ?? 0) > 0);
+  const underQ = $derived(
+    Q_LEVELS.map((level) =>
+      bundle.tiles.reduce((n, t) => n + (t.q !== undefined && t.q <= level ? 1 : 0), 0),
+    ),
+  );
+  const unmatched = $derived(
+    bundle.tiles.reduce((n, t) => n + (t.xmatch?.uncatalogued ? 1 : 0), 0),
+  );
+  const matched = $derived(
+    bundle.tiles.reduce((n, t) => n + (t.xmatch && !t.xmatch.uncatalogued ? 1 : 0), 0),
+  );
 
   // Keeps the current row in view without animating, so stepping never waits on a scroll.
   $effect(() => {
-    if (!scroller || pos < 0) return;
+    if (!scroller || pos < 0) {
+      return;
+    }
     const top = pos * ROW;
     const st = scroller.scrollTop;
-    if (top < st + ROW) scroller.scrollTop = Math.max(0, top - ROW);
-    else if (top + ROW > st + height - ROW) scroller.scrollTop = top + 2 * ROW - height;
+    if (top < st + ROW) {
+      scroller.scrollTop = Math.max(0, top - ROW);
+    } else if (top + ROW > st + height - ROW) {
+      scroller.scrollTop = top + 2 * ROW - height;
+    }
   });
 
   function num(v: string): number | null {
@@ -116,10 +135,39 @@
     </div>
     {#if xmatch}
       <div class="row2">
-        <select class="ctl" bind:value={filters.match} aria-label="Catalogue filter" title="Uncatalogued means nothing in {orList(xmatch.checked)} within {xmatch.radius_arcsec}&Prime; of the peak">
+        <select
+          class="ctl"
+          bind:value={filters.match}
+          aria-label="Catalogue filter"
+          title="Uncatalogued means nothing in {orList(
+            xmatch.checked,
+          )} within {xmatch.radius_arcsec}&Prime; of the peak"
+        >
           <option value="all">Catalogued or Not</option>
-          <option value="uncatalogued">Uncatalogued ({unmatched.toLocaleString('en-CA')})</option>
-          <option value="catalogued">Catalogued ({matched.toLocaleString('en-CA')})</option>
+          <option value="uncatalogued"
+            >Uncatalogued ({unmatched.toLocaleString('en-CA')})</option
+          >
+          <option value="catalogued"
+            >Catalogued ({matched.toLocaleString('en-CA')})</option
+          >
+        </select>
+      </div>
+    {/if}
+    {#if calibrated}
+      <div class="row2">
+        <select
+          class="ctl"
+          aria-label="False discovery rate"
+          title="Tiles whose q-value is at or under the level, so about that share of them are expected to be ordinary for the reference fields"
+          value={filters.qMax === null ? '' : String(filters.qMax)}
+          onchange={(e) => (filters.qMax = num(e.currentTarget.value))}
+        >
+          <option value="">Any q-value</option>
+          {#each Q_LEVELS as level, j (level)}
+            <option value={String(level)}
+              >q &le; {level} ({(underQ[j] ?? 0).toLocaleString('en-CA')})</option
+            >
+          {/each}
         </select>
       </div>
     {/if}
@@ -154,9 +202,26 @@
           <option value="ra">RA</option>
           <option value="dec">Dec</option>
         </select>
-        <button class="ctl dir" onclick={() => (filters.desc = !filters.desc)} aria-label={filters.desc ? 'Descending, switch to ascending' : 'Ascending, switch to descending'}>
-          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true" class:flip={filters.desc}>
-            <path d="M2 6.5 L5 3.5 L8 6.5" fill="none" stroke="currentColor" stroke-width="1.3" />
+        <button
+          class="ctl dir"
+          onclick={() => (filters.desc = !filters.desc)}
+          aria-label={filters.desc
+            ? 'Descending, switch to ascending'
+            : 'Ascending, switch to descending'}
+        >
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 10 10"
+            aria-hidden="true"
+            class:flip={filters.desc}
+          >
+            <path
+              d="M2 6.5 L5 3.5 L8 6.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+            />
           </svg>
         </button>
       </span>
@@ -164,18 +229,40 @@
     <div class="counts">
       <span><b class="num">{order.length.toLocaleString('en-CA')}</b> shown</span>
       <span><b class="num">{reviewed.toLocaleString('en-CA')}</b> reviewed</span>
-      <span><b class="num">{bundle.tiles.length.toLocaleString('en-CA')}</b> total</span>
+      <span><b class="num">{bundle.tiles.length.toLocaleString('en-CA')}</b> total</span
+      >
     </div>
   </div>
 
-  <div class="list" bind:this={scroller} bind:clientHeight={height} onscroll={(e) => (scrollTop = e.currentTarget.scrollTop)} role="listbox" aria-label="Candidates" tabindex="-1">
+  <div
+    class="list"
+    bind:this={scroller}
+    bind:clientHeight={height}
+    onscroll={(e) => (scrollTop = e.currentTarget.scrollTop)}
+    role="listbox"
+    aria-label="Candidates"
+    tabindex="-1"
+  >
     {#if order.length === 0}
-      <p class="empty">Nothing matches these filters. Clear the text or set the verdict filter back to All Verdicts to see every tile.</p>
+      <div class="empty">
+        <p>Nothing matches these filters.</p>
+        <button
+          class="ctl"
+          onclick={() =>
+            Object.assign(filters, {
+              text: '',
+              verdict: 'all',
+              match: 'all',
+              mosaic: '',
+              scoreMin: null,
+              scoreMax: null,
+              qMax: null,
+            })}>Show Every Tile</button
+        >
+      </div>
     {/if}
     <div class="spacer" style:height="{order.length * ROW}px">
-      {#each visible as k (order[k])}
-        {@const i = order[k]}
-        {@const t = bundle.tiles[i]}
+      {#each rows as { k, i, t } (i)}
         {@const v = verdicts.map.get(t.key)}
         <button
           class="item"
@@ -184,17 +271,48 @@
           role="option"
           aria-selected={i === current}
           tabindex="-1"
-          onclick={() => onselect(i)}
+          onclick={() => {
+            onselect(i);
+          }}
         >
           <span class="rank num">{t.rank}</span>
           <span class="mark"><Glyph verdict={v?.verdict ?? null} /></span>
-          <span class="mark">{#if v?.star}<Glyph verdict="star" size={11} />{/if}</span>
-          <span class="bar" aria-hidden="true"><i style:width="{t.score === null ? 0 : Math.max(2, ((t.score - scoreRange[0]) / (scoreRange[1] - scoreRange[0])) * 100)}%"></i></span>
-          <span class="score num">{t.score === null ? 'unscored' : t.score.toFixed(4)}</span>
+          <span class="mark"
+            >{#if v?.star}<Glyph verdict="star" size={11} />{/if}</span
+          >
+          <span class="bar" aria-hidden="true"
+            ><i
+              style:width="{t.score === null
+                ? 0
+                : Math.max(
+                    2,
+                    ((t.score - scoreRange[0]) / (scoreRange[1] - scoreRange[0])) * 100,
+                  )}%"
+            ></i></span
+          >
+          <span class="score num"
+            >{t.score === null ? 'unscored' : t.score.toFixed(4)}</span
+          >
           <span class="line2">
             <span class="mname name">{shortMosaic(t.mosaic)}</span>
-            {#if t.xmatch?.uncatalogued}<svg class="new" width="9" height="9" viewBox="-4.5 -4.5 9 9" role="img" aria-label="Uncatalogued"><title>Uncatalogued, nothing within {xmatch?.radius_arcsec}&Prime; of the peak</title><circle r="3.4" /></svg>{/if}
+            {#if t.xmatch?.uncatalogued}<svg
+                class="new"
+                width="9"
+                height="9"
+                viewBox="-4.5 -4.5 9 9"
+                role="img"
+                aria-label="Uncatalogued"
+                ><title
+                  >Uncatalogued, nothing within {xmatch?.radius_arcsec}&Prime; of the
+                  peak</title
+                ><circle r="3.4" /></svg
+              >{/if}
             <span class="coord num">{raHms(t.ra, 1)} {decDms(t.dec, 0)}</span>
+            {#if t.q !== undefined}<span
+                class="qv num"
+                title="q-value, the false discovery rate at this tile"
+                >q {t.q < 0.001 ? '<0.001' : t.q.toFixed(3)}</span
+              >{/if}
           </span>
         </button>
       {/each}
@@ -306,6 +424,9 @@
     margin: 16px 12px;
     color: var(--chalk-2);
   }
+  .empty p {
+    margin: 0 0 10px;
+  }
   .item {
     position: absolute;
     left: 0;
@@ -383,6 +504,13 @@
   }
   .coord {
     flex: none;
+    font-size: 10px;
+    color: var(--chalk-2);
+    white-space: nowrap;
+  }
+  .qv {
+    flex: none;
+    margin-left: auto;
     font-size: 10px;
     color: var(--chalk-2);
     white-space: nowrap;

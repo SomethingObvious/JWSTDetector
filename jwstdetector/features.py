@@ -9,25 +9,35 @@ reuses every tile it didn't plant a source in.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
-from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from jwstdetector.backbones import Backbone
 from jwstdetector.data import relative_key, tile_loader
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    import numpy.typing as npt
+
+    from jwstdetector.backbones import Backbone
 
 # float16 tops out at 65504, and a feature past that is stored as float32 instead.
 _HALF_MAX = 6e4
 
 
 class FeatureCache:
-    """One .npy of (n_patches, dims) per tile under `root`, about 1.6 MB for ViT-L at 448 px."""
+    """One .npy of (n_patches, dims) per tile under `root`.
 
-    def __init__(self, root: Path, backbone: Backbone):
+    That's about 1.6 MB a tile for ViT-L at 448 px.
+    """
+
+    def __init__(self, root: Path, backbone: Backbone) -> None:
         self.root = Path(root)
         self._salt = "|".join(
             str(v)
@@ -35,20 +45,24 @@ class FeatureCache:
                 backbone.name,
                 backbone.resolution,
                 backbone.layers,
-                backbone.autocast_dtype,
+                backbone.dtype,
+                backbone.compiled,
+                backbone.fast_accumulate,
                 tuple(backbone.mean),
                 tuple(backbone.std),
             )
         ).encode()
 
     def path(self, tile: Path) -> Path:
+        """Return where a tile's features go, named for its bytes and the model."""
         digest = hashlib.sha1(self._salt, usedforsecurity=False)
         digest.update(Path(tile).read_bytes())
         name = digest.hexdigest()
         return self.root / name[:2] / f"{name}.npy"
 
     @staticmethod
-    def save(path: Path, feats: np.ndarray) -> None:
+    def save(path: Path, feats: npt.NDArray[Any]) -> None:
+        """Save one tile's features, as float16 when they fit."""
         if np.abs(feats).max() < _HALF_MAX:
             feats = feats.astype(np.float16)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,26 +73,37 @@ class FeatureCache:
         tmp.replace(path)
 
 
+@dataclass(frozen=True)
+class EmbedOptions:
+    """How tiles are read and embedded."""
+
+    batch_size: int = 8
+    num_workers: int = 4
+    cache: FeatureCache | None = None
+
+
 def embedded(
     backbone: Backbone,
     paths: list[Path],
     root: Path,
     *,
-    cache: FeatureCache | None = None,
-    batch_size: int = 8,
-    num_workers: int = 4,
+    options: EmbedOptions,
     desc: str = "Embedding tiles",
 ) -> Iterator[tuple[list[str], torch.Tensor]]:
-    """Yields each batch's tile keys and (B, n_patches, D) float32 features, in `paths` order."""
-    pin = backbone.device.type == "cuda"
+    """Embed the tiles a batch at a time, in `paths` order.
+
+    Yields:
+        Each batch's tile keys and (B, n_patches, D) float32 features.
+    """
+    batch_size = max(options.batch_size, backbone.min_batch)
+    cache = options.cache
     if cache is None:
         loader = tile_loader(
             paths,
             root,
-            backbone.transform(),
+            backbone,
             batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=pin,
+            num_workers=options.num_workers,
         )
         for keys, images in tqdm(loader, desc=desc, leave=False):
             yield list(keys), backbone.embed(images)
@@ -90,13 +115,14 @@ def embedded(
         loader = tile_loader(
             [paths[i] for i in missing],
             root,
-            backbone.transform(),
+            backbone,
             batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=pin,
+            num_workers=options.num_workers,
         )
         slots = iter(missing)
-        for _, images in tqdm(loader, desc=f"{desc} ({len(missing)} not cached)", leave=False):
+        for _, images in tqdm(
+            loader, desc=f"{desc} ({len(missing)} not cached)", leave=False
+        ):
             for feats in backbone.embed(images).cpu().numpy():
                 cache.save(files[next(slots)], feats)
 

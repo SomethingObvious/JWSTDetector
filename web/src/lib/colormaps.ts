@@ -52,7 +52,7 @@ const CIVIDIS: Vec3[] = [
   [0.5953, 0.5733, 0.4696],
   [0.7224, 0.6704, 0.4385],
   [0.8571, 0.7728, 0.3816],
-  [0.9952, 0.9049, 0.2310],
+  [0.9952, 0.9049, 0.231],
 ];
 
 function evaluate(id: Cmap, t: number): Vec3 {
@@ -61,24 +61,38 @@ function evaluate(id: Cmap, t: number): Vec3 {
       return [t, t, t];
     case 'heat':
       // DS9's heat: red rises first, then green, then blue.
-      return [Math.min(1, t * 3), Math.min(1, Math.max(0, t * 3 - 1)), Math.min(1, Math.max(0, t * 3 - 2))];
+      return [
+        Math.min(1, t * 3),
+        Math.min(1, Math.max(0, t * 3 - 1)),
+        Math.min(1, Math.max(0, t * 3 - 2)),
+      ];
     case 'cividis': {
       const x = t * (CIVIDIS.length - 1);
       const i = Math.min(CIVIDIS.length - 2, Math.floor(x));
       const f = x - i;
       const a = CIVIDIS[i];
       const b = CIVIDIS[i + 1];
-      return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+      if (!a || !b) {
+        throw new RangeError(`Colour map position ${String(t)} is outside 0 to 1`);
+      }
+      return [
+        a[0] + (b[0] - a[0]) * f,
+        a[1] + (b[1] - a[1]) * f,
+        a[2] + (b[2] - a[2]) * f,
+      ];
     }
     default: {
       const c = POLY[id];
-      const out: Vec3 = [0, 0, 0];
-      for (let k = 0; k < 3; k++) {
-        let v = 0;
-        for (let p = c.length - 1; p >= 0; p--) v = v * t + c[p][k];
-        out[k] = Math.min(1, Math.max(0, v));
-      }
-      return out;
+      // Horner's rule from the highest power down.
+      const channel = (k: 0 | 1 | 2) =>
+        Math.min(
+          1,
+          Math.max(
+            0,
+            c.reduceRight((v, row) => v * t + row[k], 0),
+          ),
+        );
+      return [channel(0), channel(1), channel(2)];
     }
   }
 }
@@ -105,7 +119,9 @@ export function cssGradient(id: Cmap, reverse = false): string {
   for (let i = 0; i <= 8; i++) {
     const t = i / 8;
     const [r, g, b] = evaluate(id, reverse ? 1 - t : t);
-    stops.push(`rgb(${Math.round(r * 255)} ${Math.round(g * 255)} ${Math.round(b * 255)}) ${t * 100}%`);
+    stops.push(
+      `rgb(${String(Math.round(r * 255))} ${String(Math.round(g * 255))} ${String(Math.round(b * 255))}) ${String(t * 100)}%`,
+    );
   }
   return `linear-gradient(90deg, ${stops.join(', ')})`;
 }
