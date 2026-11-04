@@ -4,15 +4,15 @@
 
 JWSTDetector looks for strange things in James Webb Space Telescope (JWST) images without any labels. It cuts FITS mosaics into tiles, embeds them with a DINOv3 backbone, ranks every tile by how far its patches sit from ordinary sky, cross-matches the most anomalous spot in each with SIMBAD, NED and Gaia DR3, and opens the ranking in a web viewer that learns from your verdicts. It reads any FITS image with a WCS, from JWST, HST, Euclid or anything else.
 
-The [demo](https://somethingobvious.github.io/JWSTDetector/) is a real run on Webb's First Deep Field, the SMACS 0723 cluster in NIRCam F444W, F356W and F277W (program 2736 on [MAST](https://mast.stsci.edu/)), cut into 288 tiles. The screenshot is its 11th tile, where NED lists the lensed galaxy beside the peak at a redshift of 6.27.
+The [demo](https://somethingobvious.github.io/JWSTDetector/) is a real run on Webb's First Deep Field, the SMACS 0723 cluster in NIRCam F444W, F356W and F277W (program 2736 on [MAST](https://mast.stsci.edu/)), cut into 288 tiles. The screenshot is its 11th tile, where a lensed galaxy NED puts at a redshift of 6.27 is the third strongest of the 196 patches the tile scores.
 
 ## What It Finds
 
-![Four tiles kNN ranks highly on SMACS 0723, with the most anomalous patch of each boxed: lensed arcs, the cluster core, a lensed galaxy at redshift 6.27 and the rainbow of a diffraction spike](.github/readme/kinds.jpg)
+![Four tiles kNN ranks highly on SMACS 0723, with an anomalous patch of each boxed: lensed arcs, the cluster core, a lensed galaxy at redshift 6.27 and the rainbow of a diffraction spike](.github/readme/kinds.jpg)
 
-These are ranks 2, 3, 11 and 12, as prep cut them. The top of kNN's ranking is lensed arcs, the intracluster light of the core and the diffraction spikes of bright stars, which come out as rainbows because the three filters' PSFs differ in width. The subspace detector finds different things, and the two rankings barely agree (Spearman 0.20, with 3 tiles in both top 20s).
+These are ranks 2, 3, 11 and 12, as prep cut them. The top of kNN's ranking is lensed arcs, the intracluster light of the core and the diffraction spikes of bright stars, which come out as rainbows because the three filters' PSFs differ in width. The subspace detector finds different things, and the two rankings barely agree (Spearman 0.19, with 3 tiles in both top 20s).
 
-230 of the 288 tiles have nothing in any of the three catalogues within 1.5 arcseconds of their most anomalous patch. On a field this deep that mostly means galaxies too faint for them, so it's a filter to combine with verdicts rather than a list of discoveries.
+234 of the 288 tiles have nothing in any of the three catalogues within 1.5 arcseconds of their most anomalous patch. On a field this deep that mostly means galaxies too faint for them, so it's a filter to combine with verdicts rather than a list of discoveries.
 
 ## Benchmark
 
@@ -28,7 +28,7 @@ The default detector scores each patch by its cosine distance to the nearest pat
 
 Two systematics took over the top of the SMACS ranking before they were fixed at the source. Objects cut off by a tile's edge put 45% of the top 20 peaks on the outermost ring of patches, so each patch now counts only for the tile whose centre it is nearest. Sky covered by one exposure in place of three took the top four places, so prep now weights the flux by depth before rendering, as for a detection image. [The method](docs/method.md) has the equations, the measurements behind both fixes and what each part assumes.
 
-`--reference_roots` scores against other fields instead and gives each tile a calibrated p-value and false discovery rate, though anything that differs between the fields ranks first, so they have to match closely.
+`--reference_roots` scores against other fields instead and gives each tile a calibrated p-value and false discovery rate, which needs fields with the same filters and a similar depth.
 
 Each tile also gets a descriptor built from its anomalous patches only. Sorting by Learned in the viewer spreads your verdicts over those descriptors, so marking one diffraction spike as an artifact sinks the tiles that look like it.
 

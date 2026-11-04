@@ -252,12 +252,17 @@ class MemoryBank:
 
 @dataclass(frozen=True)
 class Footprint:
-    """Where a tile was cut from, in mosaic pixels."""
+    """Where a tile was cut from, in mosaic pixels, and its centre on the sky."""
 
     mosaic: str
     x0: int
     y0: int
     size: int
+    ra: float = float("nan")
+    dec: float = float("nan")
+    # Half the tile's diagonal, so two tiles can only overlap when their centres
+    # are closer than the sum of theirs.
+    radius_deg: float = float("nan")
 
 
 def excluded_refs(
@@ -310,7 +315,50 @@ def excluded_refs(
             & (f.y0 < b[:, 1] + b[:, 2])
         )
         out[q] = sorted(set(out[q]) | set(idx[hit].tolist()))
+    _exclude_on_sky(out, query_paths, ref_paths, footprints=footprints)
     return out
+
+
+def _unit(
+    ra: npt.NDArray[np.float64], dec: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    r, d = np.radians(ra), np.radians(dec)
+    return np.stack([np.cos(d) * np.cos(r), np.cos(d) * np.sin(r), np.sin(d)], axis=-1)
+
+
+def _exclude_on_sky(
+    out: list[list[int]],
+    query_paths: list[Path],
+    ref_paths: list[Path],
+    *,
+    footprints: dict[Path, Footprint],
+) -> None:
+    """Add reference tiles from other mosaics that may share sky with each query.
+
+    Separate visits or fields can overlap on the sky, as neighbouring survey
+    pointings do, and pixel boxes only compare tiles of one mosaic.
+    """
+    refs = [
+        (i, footprints[p])
+        for i, p in enumerate(ref_paths)
+        if p in footprints and np.isfinite(footprints[p].radius_deg)
+    ]
+    if not refs:
+        return
+    idx = np.array([i for i, _ in refs])
+    mosaic = np.array([f.mosaic for _, f in refs])
+    vec = _unit(np.array([f.ra for _, f in refs]), np.array([f.dec for _, f in refs]))
+    radius = np.array([f.radius_deg for _, f in refs])
+    for q, p in enumerate(query_paths):
+        f = footprints.get(p)
+        if f is None or not np.isfinite(f.radius_deg):
+            continue
+        sep = np.degrees(
+            np.arccos(np.clip(vec @ _unit(np.array(f.ra), np.array(f.dec)), -1, 1))
+        )
+        hit = (mosaic != f.mosaic) & (sep < radius + f.radius_deg)
+        if hit.any():
+            out[q] = sorted(set(out[q]) | set(idx[hit].tolist()))
 
 
 class SubspaceModel:
@@ -410,7 +458,9 @@ class _Reservoir:
         self.filled += take
         if take < n:
             slots, src = self._draw(n, take, feats.device)
-            self.features[slots] = feats[src]
+            # Indexed assignment won't cast the way slicing does, so an fp16 bank
+            # needs the fp32 features cast first.
+            self.features[slots] = feats[src].to(self.dtype)
             self.owners[slots] = ids[src]
         self.seen += n
 

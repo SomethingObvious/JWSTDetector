@@ -92,6 +92,13 @@ def _add_input_args(p: argparse.ArgumentParser) -> None:
         "tile then also gets a calibrated p-value and q-value.",
     )
     p.add_argument(
+        "--calibrate",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="With --reference_roots, score each field against the others for the "
+        "p-values. The benchmark turns it off, as it only needs the ranking.",
+    )
+    p.add_argument(
         "--recursive_query", default=True, action=argparse.BooleanOptionalAction
     )
 
@@ -517,12 +524,13 @@ def _reference_fields(args: argparse.Namespace) -> list[_Field]:
         The fields, in the order given.
 
     Raises:
-        SystemExit: If there are fewer than two, or one has no query folder.
+        SystemExit: If there are fewer than two to calibrate, or one has no query
+            folder.
     """
-    if len(args.reference_roots) < _MIN_REFERENCE_FIELDS:
+    if args.calibrate and len(args.reference_roots) < _MIN_REFERENCE_FIELDS:
         msg = (
             "--reference_roots needs two or more fields, as each one is calibrated "
-            "against the others."
+            "against the others. --no-calibrate takes one."
         )
         raise SystemExit(msg)
     fields: list[_Field] = []
@@ -580,13 +588,15 @@ def _cross_field(scorer: _Scorer, out_dir: Path) -> int:
         "Scoring against %d tiles from %d other fields", len(everything), len(fields)
     )
     scores = scorer.score(_Tiles(everything, ref_root), out_dir / "cross")
+    shutil.copyfile(
+        out_dir / "cross/measurements.csv", out_dir / "measurements_final.csv"
+    )
+    if not scorer.args.calibrate:
+        return 0
     calibration = _calibrate(scorer, fields, ref_root=ref_root, out_dir=out_dir)
 
     found = write_significance(
         out_dir / "significance.csv", scores, np.array([v for *_, v in calibration])
-    )
-    shutil.copyfile(
-        out_dir / "cross/measurements.csv", out_dir / "measurements_final.csv"
     )
     # With few calibration tiles even the strangest tile can't reach a small q, and
     # saying how small p can go keeps a null result from reading as a clean field.

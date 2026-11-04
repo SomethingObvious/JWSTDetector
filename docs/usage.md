@@ -96,7 +96,7 @@ jwstdetector run --data_root datasets/smacs_nircam --out_dir results_cross \
   --reference_roots datasets/abell370_nircam datasets/macs0416_nircam datasets/ceers1_nircam
 ```
 
-This scores every tile against two or more other fields in place of the bootstrap, and each of those fields against the rest to calibrate a p-value and q-value per tile. They're in `significance.csv`, and the viewer shows them and filters by q. The fields need the same filters and stretch, and their mosaics different `--tiles` names. Anything that differs between the fields will rank first, which [the method](method.md#another-field-as-reference) shows on SMACS 0723.
+This scores every tile against two or more other fields in place of the bootstrap, and each of those fields against the rest to calibrate a p-value and q-value per tile. They're in `significance.csv`, and the viewer shows them and filters by q. The fields need the same filters, stretch and a similar depth, and their mosaics different `--tiles` names. [The method](method.md#another-field-as-reference) has what the p-values assume.
 
 ## Catalogues
 

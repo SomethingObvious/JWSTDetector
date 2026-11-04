@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 from pathlib import Path
 import shutil
@@ -217,12 +218,45 @@ def load_footprints(
             data_root,
         )
         return {}
+    scales: dict[str, float] = {}
     out: dict[Path, Footprint] = {}
     for p in paths:
         meta = manifest.get(relative_key(p, query_dir))
-        if meta is not None:
-            out[p] = Footprint(meta["mosaic"], meta["x0"], meta["y0"], meta["size"])
+        if meta is None:
+            continue
+        mosaic = meta["mosaic"]
+        if mosaic not in scales:
+            scales[mosaic] = _pixel_scale_arcsec(data_root, mosaic)
+        ra: float | None = meta["ra"]
+        dec: float | None = meta["dec"]
+        nan = float("nan")
+        if ra is None or dec is None or not np.isfinite(scales[mosaic]):
+            ra, dec, radius = nan, nan, nan
+        else:
+            radius = meta["size"] * scales[mosaic] / 3600 / np.sqrt(2)
+        out[p] = Footprint(
+            mosaic,
+            meta["x0"],
+            meta["y0"],
+            meta["size"],
+            ra=ra,
+            dec=dec,
+            radius_deg=radius,
+        )
     return out
+
+
+def _pixel_scale_arcsec(data_root: Path, mosaic: str) -> float:
+    """Read the mosaic's pixel scale from prep's mosaics/<id>.json.
+
+    Returns:
+        Arcseconds per pixel, or NaN when the file or the value isn't there.
+    """
+    path = Path(data_root) / "mosaics" / f"{mosaic}.json"
+    if not path.is_file():
+        return float("nan")
+    scale = json.loads(path.read_text(encoding="utf-8")).get("pixel_scale_arcsec")
+    return float(scale) if scale else float("nan")
 
 
 class _MosaicTiles:
