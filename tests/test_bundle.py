@@ -1,17 +1,21 @@
-"""Checks for what the viewer reads: the run bundle, cross-matching and candidate tables."""
+"""Checks for what the viewer reads: the run bundle, cross-matching and candidates."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+from astropy.table import Table
 import numpy as np
+from PIL import Image
 import pytest
 import yaml
-from astropy.table import Table
-from PIL import Image
 
 from jwstdetector import bundle, candidates, catalogues
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 SCORES = {"a.png": 0.2, "b.png": float("nan"), "c.png": 0.9}
 WCS_META = {
@@ -29,8 +33,12 @@ WCS_META = {
 
 
 @pytest.fixture
-def run(tmp_path: Path):
-    """Three 8 px tiles side by side on one mosaic, each with its peak patch bottom left."""
+def run(tmp_path: Path) -> tuple[Path, Path]:
+    """Three 8 px tiles side by side on one mosaic, each peak patch bottom left.
+
+    Returns:
+        The run folder and the dataset folder.
+    """
     data, run = tmp_path / "data", tmp_path / "run"
     maps = run / "pass2" / "anomaly_maps" / "seed=0"
     for d in (data / "query", data / "mosaics", data / "cutouts", maps):
@@ -54,7 +62,9 @@ def run(tmp_path: Path):
     return run, data
 
 
-def test_bundle_ranks_exports_and_saves_verdicts(run, tmp_path: Path) -> None:
+def test_bundle_ranks_exports_and_saves_verdicts(
+    run: tuple[Path, Path], tmp_path: Path
+) -> None:
     run_dir, data = run
     b = bundle.RunBundle(run_dir, data, writable=True)
     tiles = b.index["tiles"]
@@ -65,7 +75,9 @@ def test_bundle_ranks_exports_and_saves_verdicts(run, tmp_path: Path) -> None:
     assert len(b.read("maps/000000.f32")[0]) == 4 * 4
 
     n = bundle.export(b, tmp_path / "site", cutouts=1)
-    assert sorted(p.name for p in (tmp_path / "site/run/cutouts").iterdir()) == ["000000.fits"]
+    assert sorted(p.name for p in (tmp_path / "site/run/cutouts").iterdir()) == [
+        "000000.fits"
+    ]
     assert n == 2 + 3 * 2 + 1 + 1
 
     site = tmp_path / "site"
@@ -97,7 +109,7 @@ def test_bundle_ranks_exports_and_saves_verdicts(run, tmp_path: Path) -> None:
     }
 
 
-def test_peak_sky_position_follows_the_png_orientation(run) -> None:
+def test_peak_sky_position_follows_the_png_orientation(run: tuple[Path, Path]) -> None:
     # The peak patch is bottom left in the PNG, which is FITS row y0 + 1.5 for a 2x2
     # grid of 4 px patches, not y0 + 5.5.
     b = bundle.RunBundle(*run, writable=False)
@@ -107,11 +119,15 @@ def test_peak_sky_position_follows_the_png_orientation(run) -> None:
     assert c["peak_sky"] == [round(float(ra[0]), 7), round(float(dec[0]), 7)]
 
 
-def test_crossmatch_with_a_local_catalogue(run, tmp_path: Path) -> None:
+def test_crossmatch_with_a_local_catalogue(
+    run: tuple[Path, Path], tmp_path: Path
+) -> None:
     run_dir, data = run
     peak = bundle.RunBundle(run_dir, data, writable=False).index["tiles"][0]["peak_sky"]
     cat = tmp_path / "mine.csv"
-    Table({"ID": ["near", "far"], "RA": [peak[0], 30.0], "DEC": [peak[1], 20.0]}).write(cat)
+    Table({"ID": ["near", "far"], "RA": [peak[0], 30.0], "DEC": [peak[1], 20.0]}).write(
+        cat
+    )
 
     result = catalogues.crossmatch(run_dir, data, radius=1.0, services=[], local=[cat])
     assert result["checked"] == ["mine"]
@@ -129,11 +145,15 @@ def test_crossmatch_with_a_local_catalogue(run, tmp_path: Path) -> None:
     assert len(over_c) == 1
     name, u, v = over_c[0][1], over_c[0][4], over_c[0][5]
     assert name == "mine near"
-    # The peak patch's centre, a quarter of the way in from the left and from the bottom.
+    # The peak patch's centre, a quarter of the way in from the left and from the
+    # bottom.
     assert abs(u - 0.25) < 1e-4
     assert abs(v - 0.75) < 1e-4
     assert json.loads(b.read("cats/000001.json")[0]) == []
+    _check_candidates(b, tmp_path)
 
+
+def _check_candidates(b: bundle.RunBundle, tmp_path: Path) -> None:
     table = candidates.candidate_table(b)
     assert list(table["rank"]) == [1, 2, 3]
     assert list(table["mine_name"][:2]) == ["mine near", "mine near"]
@@ -145,7 +165,7 @@ def test_crossmatch_with_a_local_catalogue(run, tmp_path: Path) -> None:
     assert reg.read_text().count("circle(") == 3
 
 
-def test_descriptor_embedding_is_unit_length_and_padded(run) -> None:
+def test_descriptor_embedding_is_unit_length_and_padded(run: tuple[Path, Path]) -> None:
     run_dir, data = run
     rng = np.random.default_rng(0)
     np.savez(
@@ -155,18 +175,36 @@ def test_descriptor_embedding_is_unit_length_and_padded(run) -> None:
     )
     b = bundle.RunBundle(run_dir, data, writable=False)
     assert b.index["run"]["embedding_dims"] == bundle.EMBED_DIMS
-    raw = np.frombuffer(b.read("embedding.f32")[0], dtype="<f4").reshape(3, bundle.EMBED_DIMS)
+    raw = np.frombuffer(b.read("embedding.f32")[0], dtype="<f4").reshape(
+        3, bundle.EMBED_DIMS
+    )
     assert np.allclose(np.linalg.norm(raw, axis=1), 1, atol=1e-5)
     assert "embedding.f32" in list(b.paths())
 
 
-def test_a_failed_refresh_keeps_the_last_good_copy(run, monkeypatch) -> None:
+def _answer(
+    reply: dict[str, Any], *, copy: bool = False
+) -> Callable[..., dict[str, Any]]:
+    def fetch(*_: object) -> dict[str, Any]:
+        return dict(reply) if copy else reply
+
+    return fetch
+
+
+def test_a_failed_refresh_keeps_the_last_good_copy(
+    run: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
     run_dir, data = run
-    good = {"ok": True, "server": "a", "rows": [["NED x", 10.0, -5.0, "G", ""]], "error": ""}
-    monkeypatch.setattr(catalogues, "fetch", lambda *a: good)
+    good = {
+        "ok": True,
+        "server": "a",
+        "rows": [["NED x", 10.0, -5.0, "G", ""]],
+        "error": "",
+    }
+    monkeypatch.setattr(catalogues, "fetch", _answer(good))
     catalogues.crossmatch(run_dir, data, services=["NED"])
     down = {"ok": False, "server": "", "rows": [], "error": "reset"}
-    monkeypatch.setattr(catalogues, "fetch", lambda *a: down)
+    monkeypatch.setattr(catalogues, "fetch", _answer(down))
     result = catalogues.crossmatch(run_dir, data, services=["NED"], refresh=True)
     assert result["checked"] == ["NED"]
     assert result["failed"] == {}
@@ -174,10 +212,17 @@ def test_a_failed_refresh_keeps_the_last_good_copy(run, monkeypatch) -> None:
     assert cached["catalogues"]["NED"]["rows"] == good["rows"]
 
 
-def test_only_the_catalogues_asked_for_are_used(run, monkeypatch) -> None:
+def test_only_the_catalogues_asked_for_are_used(
+    run: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
     run_dir, data = run
-    good = {"ok": True, "server": "a", "rows": [["NED x", 10.0, -5.0, "G", ""]], "error": ""}
-    monkeypatch.setattr(catalogues, "fetch", lambda *a: dict(good))
+    good = {
+        "ok": True,
+        "server": "a",
+        "rows": [["NED x", 10.0, -5.0, "G", ""]],
+        "error": "",
+    }
+    monkeypatch.setattr(catalogues, "fetch", _answer(good, copy=True))
     catalogues.crossmatch(run_dir, data, services=["NED"])
 
     # NED stays in the cache but isn't asked this time, so nothing is checked and no
@@ -191,8 +236,8 @@ def test_only_the_catalogues_asked_for_are_used(run, monkeypatch) -> None:
 
 def test_social_card_keeps_off_a_blank_gap() -> None:
     lit = np.r_[np.full(10, 0.4), np.zeros(5), np.full(30, 0.4)]
-    lo, hi = bundle._lit_span(lit, 20, 20)
+    lo, hi = bundle.lit_span(lit, 20, 20)
     assert 12 < lo <= 15
     assert hi == 45
     # Too short a run to fit the card falls back to the whole axis.
-    assert bundle._lit_span(lit, 20, 40) == (0, 45)
+    assert bundle.lit_span(lit, 20, 40) == (0, 45)

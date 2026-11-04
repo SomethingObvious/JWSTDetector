@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 
 from jwstdetector import benchmark
-from jwstdetector.benchmark import Source
+from jwstdetector.benchmark import Optics, Source
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 SIZE = 64
 
@@ -19,16 +22,21 @@ def _source(kind: str, sed: str = "flat") -> Source:
     return Source("t.png", kind, sed, cx=30.0, cy=34.0, radius=9.0, theta=0.4, span=2.0)
 
 
-def _band(micron: float | None = 2.0) -> dict:
-    return {"filter": "F", "micron": micron, "jy_per_unit": 1e-6, "psf_fwhm_arcsec": 0.18}
+def _band(micron: float | None = 2.0) -> dict[str, Any]:
+    return {
+        "filter": "F",
+        "micron": micron,
+        "jy_per_unit": 1e-6,
+        "psf_fwhm_arcsec": 0.18,
+    }
 
 
 def test_shapes_stay_inside_the_tile() -> None:
     for kind in benchmark.KINDS:
         img = benchmark.intrinsic(_source(kind), SIZE)
         assert img.shape == (SIZE, SIZE)
-        assert img.max() > 0.5
-        assert img[0].max() < 1e-3 or kind == "streak"
+        assert np.max(img) > 0.5
+        assert np.max(img[0]) < 1e-3 or kind == "streak"
     ring = benchmark.intrinsic(_source("ring"), SIZE).sum()
     arc = benchmark.intrinsic(_source("arc"), SIZE).sum()
     # A 2 radian arc is about a third of the ring.
@@ -37,18 +45,22 @@ def test_shapes_stay_inside_the_tile() -> None:
 
 def test_planted_flux_matches_the_magnitude() -> None:
     planes = np.ones((1, SIZE, SIZE), np.float32)
-    out = benchmark.add_source(planes, _source("point"), 25.0, [_band()], pixel_scale=0.06)
+    out = benchmark.add_source(
+        planes, _source("point"), 25.0, optics=Optics([_band()], pixel_scale=0.06)
+    )
     added = out.astype(np.float64).sum() - planes.sum()
     # AB 25 is 0.3631 microjanskys, which is 0.3631 units at 1e-6 Jy per unit.
     assert abs(added - 0.3631) < 1e-4
-    peak = np.unravel_index(np.argmax(out[0]), out[0].shape)
-    assert peak == (34, 30)
+    row, col = np.unravel_index(np.argmax(out[0]), out[0].shape)
+    assert (int(row), int(col)) == (34, 30)
 
 
 def test_a_red_source_is_brighter_at_long_wavelengths() -> None:
     planes = np.ones((2, SIZE, SIZE), np.float32)
     bands = [_band(2.0), _band(4.44)]
-    out = benchmark.add_source(planes, _source("point", "red"), 25.0, bands, pixel_scale=0.06)
+    out = benchmark.add_source(
+        planes, _source("point", "red"), 25.0, optics=Optics(bands, pixel_scale=0.06)
+    )
     short, long = (out[i].astype(np.float64).sum() - SIZE * SIZE for i in range(2))
     assert abs(long / short - (4.44 / 2.0) ** 2) < 1e-3
     # The magnitude is set at the geometric mean wavelength.
@@ -59,18 +71,28 @@ def test_holes_stay_holes() -> None:
     planes = np.ones((1, SIZE, SIZE), np.float32)
     planes[0, 30:40, 25:35] = np.nan
     planes[0, 0:5] = 0
-    out = benchmark.add_source(planes, _source("ring"), 20.0, [_band()], pixel_scale=0.06)
+    out = benchmark.add_source(
+        planes, _source("ring"), 20.0, optics=Optics([_band()], pixel_scale=0.06)
+    )
     assert np.isnan(out[0, 30:40, 25:35]).all()
     assert (out[0, 0:5] == 0).all()
 
 
 def test_ranks_put_nan_last() -> None:
-    assert benchmark.ranks_of({"a": 1.0, "b": float("nan"), "c": 3.0}) == {"c": 1, "a": 2, "b": 3}
+    assert benchmark.ranks_of({"a": 1.0, "b": float("nan"), "c": 3.0}) == {
+        "c": 1,
+        "a": 2,
+        "b": 3,
+    }
 
 
 def test_wilson_interval() -> None:
-    assert benchmark.wilson(0, 10) == (0.0, pytest.approx(0.2775, abs=1e-4))
-    assert benchmark.wilson(10, 10) == (pytest.approx(0.7225, abs=1e-4), 1.0)
+    lo, hi = benchmark.wilson(0, 10)
+    assert lo == 0.0
+    assert hi == pytest.approx(0.2775, abs=1e-4)
+    lo, hi = benchmark.wilson(10, 10)
+    assert lo == pytest.approx(0.7225, abs=1e-4)
+    assert hi == 1.0
     lo, hi = benchmark.wilson(5, 10)
     assert (round(lo, 4), round(hi, 4)) == (0.2366, 0.7634)
     assert benchmark.wilson(0, 0) == (0.0, 1.0)
@@ -96,7 +118,7 @@ def test_summary_and_m50() -> None:
 
 def test_check_dataset_refuses_what_it_cannot_plant(tmp_path: Path) -> None:
     (tmp_path / "mosaics").mkdir()
-    info = {
+    info: dict[str, Any] = {
         "render": {"kind": "asinh"},
         "pixel_scale_arcsec": 0.06,
         "planes": [_band(), _band(4.0)],
@@ -104,7 +126,9 @@ def test_check_dataset_refuses_what_it_cannot_plant(tmp_path: Path) -> None:
     (tmp_path / "mosaics" / "m.json").write_text(json.dumps(info))
     manifest = {"t.png": {"mosaic": "m", "cutout": "cutouts/t.fits"}}
 
-    assert benchmark.check_dataset(tmp_path, manifest)["m"]["planes"][1]["micron"] == 4.0
+    assert (
+        benchmark.check_dataset(tmp_path, manifest)["m"]["planes"][1]["micron"] == 4.0
+    )
     with pytest.raises(SystemExit, match="--save_cutouts"):
         benchmark.check_dataset(tmp_path, {"t.png": {"mosaic": "m", "cutout": ""}})
     with pytest.raises(SystemExit, match="1 or 2 values"):

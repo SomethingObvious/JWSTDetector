@@ -6,16 +6,19 @@ takes DINO's place.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
+import tempfile
+from typing import TYPE_CHECKING, TypedDict
 
 import numpy as np
-import torch
 from PIL import Image
+import torch
+from typing_extensions import Unpack
 
-import jwstdetector.detection as detection
+from jwstdetector import detection
 from jwstdetector.backbones import Backbone, background_mask, hub_repo, parse_layers
 from jwstdetector.detection import (
+    BankSettings,
     Footprint,
     MemoryBank,
     SubspaceModel,
@@ -24,6 +27,12 @@ from jwstdetector.detection import (
     excluded_refs,
     run_anomaly_detection,
 )
+from jwstdetector.features import EmbedOptions, FeatureCache
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import pytest
 
 PATCH, RESOLUTION, DIM = 16, 128, 32
 GRID = RESOLUTION // PATCH
@@ -31,8 +40,9 @@ ANOMALOUS = "A5_cx000264_cy000264_ra150.999999_decm2.197645_i00000099.png"
 
 
 def _stub_backbone(seed: int = 0) -> Backbone:
-    """Each patch averaged down to its mean colour and projected, which is content-sensitive
-    and deterministic, and that's all the detector needs from a backbone."""
+    # Each patch averaged down to its mean colour and projected, which is
+    # content-sensitive and deterministic, and that's all the detector needs from a
+    # backbone.
     projection = torch.randn(3, DIM, generator=torch.Generator().manual_seed(seed))
 
     def forward_patches(x: torch.Tensor) -> torch.Tensor:
@@ -48,19 +58,16 @@ def _stub_backbone(seed: int = 0) -> Backbone:
         mean=(0.5, 0.5, 0.5),
         std=(0.5, 0.5, 0.5),
         device=torch.device("cpu"),
-        autocast_dtype=None,
     )
 
 
 def _write_tiles(root: Path, n_normal: int = 12) -> list[str]:
-    """A field of ordinary tiles plus one with a bright bar across it.
-
-    The names carry an RA and Dec the way prep_data --wcs_in_name writes them, so the
-    map file names have to survive the dots in the stem.
-    """
+    # A field of ordinary tiles plus one with a bright bar across it. The names carry
+    # an RA and Dec the way prep_data --wcs_in_name writes them, so the map file names
+    # have to survive the dots in the stem.
     root.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
-    names = []
+    names: list[str] = []
     for i in range(n_normal):
         tile = rng.integers(40, 70, (RESOLUTION, RESOLUTION, 3), dtype=np.uint8)
         name = f"A5_cx000064_cy000064_ra150.10{i:04d}_decm2.197645_i{i:08d}.png"
@@ -74,19 +81,39 @@ def _write_tiles(root: Path, n_normal: int = 12) -> list[str]:
     return names
 
 
-def _run(tmp: Path, include_odd_in_reference: bool = False, **kwargs):
+class _RunOptions(TypedDict, total=False):
+    places: int
+    drop_directions: int
+    rotation: bool
+    masking: bool
+    mask_ref_images: bool
+    knn_metric: str
+    k_neighbors: int
+    score_mode: str
+    save_tiffs: bool
+    detector: str
+
+
+def _run(
+    tmp: Path,
+    *,
+    include_odd_in_reference: bool = False,
+    **kwargs: Unpack[_RunOptions],
+) -> dict[str, float]:
     query_dir = tmp / "query"
     names = _write_tiles(query_dir)
-    ref_paths = [query_dir / n for n in names if include_odd_in_reference or n != ANOMALOUS]
+    ref_paths = [
+        query_dir / n for n in names if include_odd_in_reference or n != ANOMALOUS
+    ]
     query_paths = sorted(query_dir.glob("*.png"))
 
     scores, memorybank_sec, seconds = run_anomaly_detection(
         _stub_backbone(),
         ref_paths,
         query_dir,
-        query_paths,
-        query_dir,
-        tmp / "out",
+        query_paths=query_paths,
+        query_root=query_dir,
+        out_dir=tmp / "out",
         num_workers=0,
         batch_size=4,
         **kwargs,
@@ -100,7 +127,10 @@ def _run(tmp: Path, include_odd_in_reference: bool = False, **kwargs):
 def test_hub_names() -> None:
     assert hub_repo("dinov2_vitl14") == "facebook/dinov2-large"
     assert hub_repo("dinov2_vits14_reg") == "facebook/dinov2-with-registers-small"
-    assert hub_repo("dinov3-vitl16-pretrain-sat493m") == "facebook/dinov3-vitl16-pretrain-sat493m"
+    assert (
+        hub_repo("dinov3-vitl16-pretrain-sat493m")
+        == "facebook/dinov3-vitl16-pretrain-sat493m"
+    )
     assert hub_repo("someone/else") == "someone/else"
 
 
@@ -119,54 +149,108 @@ def test_memory_bank_metrics() -> None:
 
 def test_distances_skip_excluded_tiles() -> None:
     features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]])
-    bank = MemoryBank(features.clone(), "L2_normalized", torch.tensor([0, 1, 2], dtype=torch.int32))
+    bank = MemoryBank(
+        features.clone(), "L2_normalized", torch.tensor([0, 1, 2], dtype=torch.int32)
+    )
     query = features[:1].clone()
     rows = torch.zeros(1, dtype=torch.long)
     # Its own patch is an exact match. Skipped, the nearest is [0.6, 0.8] at 1 - 0.6.
     assert torch.allclose(bank.distances(query, 1), torch.zeros(1))
-    own = bank.distances(query, 1, rows, torch.tensor([[True, False, False]]))
+    own = bank.distances(
+        query, 1, rows=rows, excluded=torch.tensor([[True, False, False]])
+    )
     assert torch.allclose(own, torch.tensor([0.4])), own
     # Tile 2 overlaps it as well, which leaves only [0, 1] at 1 - 0.
-    both = bank.distances(query, 1, rows, torch.tensor([[True, False, True]]))
+    both = bank.distances(
+        query, 1, rows=rows, excluded=torch.tensor([[True, False, True]])
+    )
     assert torch.allclose(both, torch.tensor([1.0])), both
-    none = bank.distances(query, 1, rows, torch.tensor([[False, False, False]]))
+    none = bank.distances(
+        query, 1, rows=rows, excluded=torch.tensor([[False, False, False]])
+    )
     assert torch.allclose(none, torch.zeros(1))
 
 
 def test_too_few_candidates_average_what_is_left() -> None:
-    bank = MemoryBank(torch.eye(3), "L2_normalized", torch.tensor([0, 0, 1], dtype=torch.int32))
+    bank = MemoryBank(
+        torch.eye(3), "L2_normalized", torch.tensor([0, 0, 1], dtype=torch.int32)
+    )
     query = torch.tensor([[1.0, 0.0, 0.0]])
     rows = torch.zeros(1, dtype=torch.long)
     # k=3 with tile 0 excluded leaves one patch, at 1 - 0. It used to be inf, then 0.
-    one_left = bank.distances(query, 3, rows, torch.tensor([[True, False]]))
+    one_left = bank.distances(
+        query, 3, rows=rows, excluded=torch.tensor([[True, False]])
+    )
     assert torch.allclose(one_left, torch.ones(1)), one_left
-    nothing = bank.distances(query, 3, rows, torch.tensor([[True, True]]))
+    nothing = bank.distances(query, 3, rows=rows, excluded=torch.tensor([[True, True]]))
     assert torch.isnan(nothing).all(), nothing
+
+
+def test_twins_only_fill_their_own_places() -> None:
+    # Five tiles of plain sky, and the rare patch in tiles 0 and 1 alone.
+    sky, rare = [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]
+    features = torch.tensor([
+        sky,
+        rare,
+        sky,
+        rare,
+        sky,
+        sky,
+        sky,
+        sky,
+        sky,
+        [0.0, 0.0, 1.0],
+    ])
+    owners = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 4, 4], dtype=torch.int32)
+    bank = MemoryBank(features, "L2_normalized", owners)
+    bank.near = torch.eye(5, dtype=torch.bool)
+    query = torch.tensor([rare])
+    for places, expected in ((1, 0.0), (2, 0.0), (3, 1.0)):
+        got = bank.distances(query, 1, places=places)
+        assert torch.allclose(got, torch.tensor([expected])), (places, got)
+    # Plain sky has a match in all five places, so it stays ordinary.
+    assert torch.allclose(
+        bank.distances(torch.tensor([sky]), 1, places=5), torch.zeros(1)
+    )
+    # Tiles 0 and 1 overlap, so their copies of the rare patch are one place.
+    bank.near[0, 1] = bank.near[1, 0] = True
+    got = bank.distances(query, 1, places=2)
+    assert torch.allclose(got, torch.ones(1)), got
+
+
+def test_places_beyond_the_candidates_give_the_farthest_seen() -> None:
+    bank = MemoryBank(
+        torch.eye(3), "L2_normalized", torch.tensor([0, 1, 2], dtype=torch.int32)
+    )
+    bank.near = torch.eye(3, dtype=torch.bool)
+    got = bank.distances(torch.tensor([[1.0, 0.0, 0.0]]), 1, places=4)
+    assert torch.allclose(got, torch.ones(1)), got
 
 
 def test_l2_matches_cdist() -> None:
     torch.manual_seed(0)
     bank_features = torch.randn(50, 8)
     queries = torch.randn(30, 8)
-    expected = torch.cdist(queries, bank_features).topk(4, dim=1, largest=False).values.mean(1)
+    expected = (
+        torch.cdist(queries, bank_features).topk(4, dim=1, largest=False).values.mean(1)
+    )
     got = MemoryBank(bank_features.clone(), "L2").distances(queries, 4)
     assert torch.allclose(got, expected, atol=1e-4), (got - expected).abs().max()
 
 
-def test_chunking_matches_a_single_pass() -> None:
+def test_chunking_matches_a_single_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(0)
-    bank = MemoryBank(torch.randn(64, 16), "L2", torch.arange(64, dtype=torch.int32) % 5)
+    bank = MemoryBank(
+        torch.randn(64, 16), "L2", torch.arange(64, dtype=torch.int32) % 5
+    )
     queries = torch.randn(200, 16)
     rows = torch.arange(200) % 7
     excluded = torch.rand(7, 5, generator=torch.Generator().manual_seed(1)) < 0.4
-    full = bank.distances(queries, 3, rows, excluded)
+    full = bank.distances(queries, 3, rows=rows, excluded=excluded)
 
-    original = detection._MAX_DISTANCE_ELEMENTS
-    try:
-        detection._MAX_DISTANCE_ELEMENTS = 64 * 7  # several ragged chunks
-        chunked = bank.distances(queries, 3, rows, excluded)
-    finally:
-        detection._MAX_DISTANCE_ELEMENTS = original
+    # Several ragged chunks.
+    monkeypatch.setattr(detection, "_MAX_DISTANCE_ELEMENTS", 64 * 7)
+    chunked = bank.distances(queries, 3, rows=rows, excluded=excluded)
     assert torch.allclose(full, chunked, atol=1e-6, equal_nan=True)
 
 
@@ -211,6 +295,20 @@ def test_end_to_end_ranks_the_odd_tile_first() -> None:
         assert np.load(maps[0]).shape == (GRID, GRID)
 
 
+def test_end_to_end_places_still_ranks_the_odd_tile_first() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        scores = _run(Path(td), include_odd_in_reference=True, places=3)
+        ranked = sorted(scores, key=scores.__getitem__, reverse=True)
+        assert ranked[0] == ANOMALOUS, ranked[:3]
+
+
+def test_end_to_end_with_directions_dropped_still_ranks_the_odd_tile_first() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        scores = _run(Path(td), drop_directions=2)
+        ranked = sorted(scores, key=scores.__getitem__, reverse=True)
+        assert ranked[0] == ANOMALOUS, ranked[:3]
+
+
 def test_reference_tile_is_scored_against_the_others() -> None:
     # The label-free runner scores tiles that are also in its reference. Matched
     # against its own patches, the odd tile would score 0 and sink to the bottom.
@@ -245,35 +343,45 @@ def test_end_to_end_options() -> None:
         assert tiff.exists()
 
 
-def _bank(max_patches: int, seed: int = 0, **kwargs) -> MemoryBank:
+def _bank(max_patches: int, seed: int = 0, *, masking: bool = False) -> MemoryBank:
     with tempfile.TemporaryDirectory() as td:
         query_dir = Path(td) / "query"
         _write_tiles(query_dir)
         paths = sorted(query_dir.glob("*.png"))
         return build_memory_bank(
-            _stub_backbone(), paths, query_dir, num_workers=0, max_patches=max_patches,
-            seed=seed, **kwargs,
-        )  # fmt: skip
+            _stub_backbone(),
+            paths,
+            query_dir,
+            settings=BankSettings(max_patches=max_patches, seed=seed, masking=masking),
+            options=EmbedOptions(num_workers=0),
+        )
+
+
+def _owners(bank: MemoryBank) -> torch.Tensor:
+    assert bank.owners is not None
+    return bank.owners
 
 
 def test_bank_holds_every_patch_under_the_cap() -> None:
     bank = _bank(10**9)
     assert len(bank) == 13 * GRID * GRID
-    assert bank.owners.tolist() == [i for i in range(13) for _ in range(GRID * GRID)]
+    assert _owners(bank).tolist() == [i for i in range(13) for _ in range(GRID * GRID)]
 
 
 def test_bank_sample_fills_the_cap_evenly_and_repeats() -> None:
     cap = 13 * GRID * GRID // 2
     bank = _bank(cap)
     assert len(bank) == cap
-    per_tile = np.bincount(bank.owners.numpy(), minlength=13)
-    # Each tile should give about 32 of its 64 patches, the last tile as much as the first.
-    assert per_tile.min() >= 20 and per_tile.max() <= 44, per_tile
+    per_tile = np.bincount(_owners(bank).numpy(), minlength=13)
+    # Each tile should give about 32 of its 64 patches, the last tile as much as the
+    # first.
+    assert np.min(per_tile) >= 20, per_tile
+    assert np.max(per_tile) <= 44, per_tile
 
     again = _bank(cap)
     assert torch.equal(bank.features, again.features)
-    assert torch.equal(bank.owners, again.owners)
-    assert not torch.equal(bank.owners, _bank(cap, seed=1).owners)
+    assert torch.equal(_owners(bank), _owners(again))
+    assert not torch.equal(_owners(bank), _owners(_bank(cap, seed=1)))
 
 
 def test_masked_bank_still_fills_the_cap() -> None:
@@ -310,7 +418,7 @@ def test_subspace_scores_the_off_plane_patch() -> None:
     assert model.rank == 3
     on = torch.tensor([[4.0, -2.0, 1.0] + [0.0] * 7])
     off = torch.tensor([[0.0] * 9 + [2.0]])
-    d = model.distances(torch.cat([on, off]), 5, None, None)
+    d = model.distances(torch.cat([on, off]))
     assert d[0] < 1e-2, d
     assert abs(d[1].item() - 4.0) < 0.05, d
 
@@ -339,36 +447,70 @@ def test_parse_layers() -> None:
 def test_subset_size() -> None:
     from jwstdetector.bootstrap import subset_size
 
-    assert subset_size(1000, 0.1, 500, 5000) == 500
-    assert subset_size(100_000, 0.1, 500, 5000) == 5000
-    assert subset_size(10_000, 0.1, 500, 5000) == 1000
-    assert subset_size(3, 0.1, 500, 5000) == 1
-    assert subset_size(60, 0.1, 500, 5000) == 30
+    assert subset_size(1000, 0.1, minimum=500, maximum=5000) == 500
+    assert subset_size(100_000, 0.1, minimum=500, maximum=5000) == 5000
+    assert subset_size(10_000, 0.1, minimum=500, maximum=5000) == 1000
+    assert subset_size(3, 0.1, minimum=500, maximum=5000) == 1
+    assert subset_size(60, 0.1, minimum=500, maximum=5000) == 30
+
+
+def _cached_detector(
+    tmp: Path,
+) -> tuple[Callable[[Path], dict[str, float]], list[int], list[Path]]:
+    # A run on a feature cache, the batch sizes the backbone saw and the query tiles.
+    backbone = _stub_backbone()
+    calls: list[int] = []
+    forward = backbone.forward_patches
+
+    def counted(x: torch.Tensor) -> torch.Tensor:
+        calls.append(len(x))
+        return forward(x)
+
+    backbone.forward_patches = counted
+    cache = FeatureCache(tmp / "cache", backbone)
+    query_dir = tmp / "query"
+    names = _write_tiles(query_dir)
+    paths = sorted(query_dir.glob("*.png"))
+    refs = [query_dir / n for n in names if n != ANOMALOUS]
+
+    def run(out_dir: Path) -> dict[str, float]:
+        scores, *_ = run_anomaly_detection(
+            backbone,
+            refs,
+            query_dir,
+            query_paths=paths,
+            query_root=query_dir,
+            out_dir=out_dir,
+            num_workers=0,
+            batch_size=4,
+            cache=cache,
+        )
+        return scores
+
+    return run, calls, paths
+
+
+def _check_descriptors(path: Path, paths: list[Path]) -> None:
+    with np.load(path) as f:
+        keys, vectors = f["keys"].tolist(), f["vectors"].astype(np.float32)
+    assert sorted(keys) == sorted(p.name for p in paths)
+    assert vectors.shape == (len(paths), DIM)
+    # The odd tile's descriptor describes its bright bar, so it sits apart from the
+    # rest.
+    odd = vectors[keys.index(ANOMALOUS)]
+    others = np.delete(vectors, keys.index(ANOMALOUS), 0)
+    spread = np.linalg.norm(others - others.mean(0), axis=1).max()
+    assert np.linalg.norm(others - odd, axis=1).min() > 2 * spread
 
 
 def test_cached_features_give_the_same_scores_and_embed_once() -> None:
-    from jwstdetector.features import FeatureCache
-
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         plain = _run(tmp / "plain")
-        backbone = _stub_backbone()
-        calls = []
-        forward = backbone.forward_patches
-        backbone.forward_patches = lambda x: calls.append(len(x)) or forward(x)
-        cache = FeatureCache(tmp / "cache", backbone)
-        query_dir = tmp / "query"
-        names = _write_tiles(query_dir)
-        paths = sorted(query_dir.glob("*.png"))
-        refs = [query_dir / n for n in names if n != ANOMALOUS]
-        opts = {"num_workers": 0, "batch_size": 4, "cache": cache}
-        first, *_ = run_anomaly_detection(
-            backbone, refs, query_dir, paths, query_dir, tmp / "a", **opts
-        )
+        run, calls, paths = _cached_detector(tmp)
+        first = run(tmp / "a")
         embedded_once = sum(calls)
-        second, *_ = run_anomaly_detection(
-            backbone, refs, query_dir, paths, query_dir, tmp / "b", **opts
-        )
+        second = run(tmp / "b")
 
         # The bank and the scoring both read the cache, so each tile went through once.
         assert embedded_once == len(paths)
@@ -378,44 +520,32 @@ def test_cached_features_give_the_same_scores_and_embed_once() -> None:
             assert abs(first[key] - value) < 1e-3 * max(1.0, abs(value))
             assert first[key] == second[key]
 
-        with np.load(tmp / "a" / "descriptors.npz") as f:
-            keys, vectors = f["keys"].tolist(), f["vectors"].astype(np.float32)
-        assert sorted(keys) == sorted(p.name for p in paths)
-        assert vectors.shape == (len(paths), DIM)
-        # The odd tile's descriptor describes its bright bar, so it sits apart from the rest.
-        odd = vectors[keys.index(ANOMALOUS)]
-        others = np.delete(vectors, keys.index(ANOMALOUS), 0)
-        spread = np.linalg.norm(others - others.mean(0), axis=1).max()
-        assert np.linalg.norm(others - odd, axis=1).min() > 2 * spread
+        _check_descriptors(tmp / "a" / "descriptors.npz", paths)
 
 
 def test_overlapping_tiles_share_out_their_patches() -> None:
-    from types import SimpleNamespace
-
     from jwstdetector.data import owned_patches
 
     # 320 px tiles at a 160 px stride, and one more flush against the far edge.
-    fp = {
-        (x, y): SimpleNamespace(mosaic="m", x0=x, y0=y, size=320)
+    fp: dict[tuple[int, int] | str, Footprint] = {
+        (x, y): Footprint("m", x, y, 320)
         for x in range(0, 641, 160)
         for y in (0, 160, 320)
     }
-    fp["flush"] = SimpleNamespace(mosaic="m", x0=630, y0=320, size=320)
+    fp["flush"] = Footprint("m", 630, 320, 320)
     owned = owned_patches(fp, (28, 28))
     rows, cols = np.nonzero(owned[(320, 160)])
-    assert (rows.min(), rows.max(), cols.min(), cols.max()) == (7, 20, 7, 20)
+    assert [int(f(v)) for v in (rows, cols) for f in (np.min, np.max)] == [7, 20, 7, 20]
     # PNG rows run down and FITS rows up, so the bottom tile keeps its bottom rows.
     rows, _ = np.nonzero(owned[(320, 0)])
-    assert (rows.min(), rows.max()) == (7, 27)
+    assert [int(np.min(rows)), int(np.max(rows))] == [7, 27]
     # Every bit of covered sky is within one patch of a patch some tile scores.
     patch = 320 / 28
-    centres = np.array(
-        [
-            (f.x0 + (c + 0.5) * patch, f.y0 + 320 - (r + 0.5) * patch)
-            for k, f in fp.items()
-            for r, c in zip(*np.nonzero(owned[k]), strict=True)
-        ]
-    )
+    centres = np.array([
+        (f.x0 + (c + 0.5) * patch, f.y0 + 320 - (r + 0.5) * patch)
+        for k, f in fp.items()
+        for r, c in zip(*np.nonzero(owned[k]), strict=True)
+    ])
     xs, ys = np.meshgrid(np.arange(0.5, 950, 7.0), np.arange(0.5, 640, 7.0))
     points = np.stack([xs.ravel(), ys.ravel()], axis=1)
     gap = np.abs(points[:, None, :] - centres[None, :, :]).max(axis=2).min(axis=1)
@@ -430,3 +560,18 @@ def test_pixel_backbone_returns_raw_patches() -> None:
     out = b.embed(x)
     assert out.shape == (1, 4, 3 * 16 * 16)
     assert torch.equal(out[0, 1].reshape(3, 16, 16), x[0, :, :16, 16:])
+
+
+def test_dropping_directions_lets_a_small_difference_count() -> None:
+    # Every patch points mostly along axis 0, so under cosine distance a patch that
+    # differs on axis 1 instead of axis 2 looks the same as the rest.
+    rng = np.random.default_rng(0)
+    bank = np.zeros((400, 8), dtype=np.float32)
+    bank[:, 0] = 50 + rng.normal(0, 5, 400)
+    bank[:, 2] = 1.0 + rng.normal(0, 0.01, 400)
+    odd = torch.tensor([[50.0, 1.0, 0.0, 0, 0, 0, 0, 0]])
+    plain = detection.MemoryBank(torch.from_numpy(bank.copy()), "L2_normalized")
+    dropped = detection.MemoryBank(torch.from_numpy(bank.copy()), "L2_normalized")
+    dropped.drop_directions(1)
+    assert plain.distances(odd, 1).item() < 1e-3
+    assert dropped.distances(odd, 1).item() > 0.5

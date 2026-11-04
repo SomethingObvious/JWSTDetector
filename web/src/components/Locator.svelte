@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { track } from '../lib/track';
   import type { Bundle, Theme, TileInfo } from '../lib/types';
 
   let {
@@ -17,6 +18,7 @@
     onselect: (index: number) => void;
   } = $props();
 
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- a cache, the loaded counter drives redraws
   const images = new Map<string, HTMLImageElement>();
   let loaded = $state(0);
   let failed = $state<string | null>(null);
@@ -24,8 +26,8 @@
   let width = $state(316);
 
   const tile = $derived(bundle.tiles[current]);
-  const mosaic = $derived(bundle.mosaics[tile.mosaic]);
-  const shape = $derived(mosaic?.shape ?? [1, 1]);
+  const mosaic = $derived(tile && bundle.mosaics[tile.mosaic]);
+  const shape = $derived<[number, number]>(mosaic?.shape ?? [1, 1]);
   const height = $derived(Math.round((width * shape[0]) / shape[1]));
   const scale = $derived(width / shape[1]);
   // The preview is the right way up, so mosaic row 0 is its bottom edge.
@@ -35,7 +37,14 @@
   // Dots for the other candidates in the current list that sit on this mosaic.
   const dots = $derived.by(() => {
     const out: number[] = [];
-    for (const i of order) if (bundle.tiles[i].mosaic === tile.mosaic && i !== current) out.push(i);
+    if (!tile) {
+      return out;
+    }
+    for (const i of order) {
+      if (bundle.tiles[i]?.mosaic === tile.mosaic && i !== current) {
+        out.push(i);
+      }
+    }
     return out;
   });
 
@@ -43,7 +52,9 @@
     let img = images.get(name);
     if (!img) {
       const m = bundle.mosaics[name];
-      if (!m) return null;
+      if (!m) {
+        return null;
+      }
       img = new Image();
       img.decoding = 'async';
       img.onload = () => loaded++;
@@ -55,13 +66,17 @@
   }
 
   $effect(() => {
-    void loaded;
-    void theme;
-    if (!canvas || !mosaic) return;
+    track(loaded, theme);
+    if (!canvas || !mosaic || !tile) {
+      return;
+    }
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return;
+    }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const css = getComputedStyle(document.documentElement);
     const v = (k: string) => css.getPropertyValue(k).trim();
@@ -70,7 +85,9 @@
     const img = image(tile.mosaic);
     if (img) {
       ctx.globalAlpha = theme === 'plate' ? 0.55 : 0.8;
-      if (theme === 'plate') ctx.filter = 'invert(1) grayscale(1)';
+      if (theme === 'plate') {
+        ctx.filter = 'invert(1) grayscale(1)';
+      }
       ctx.drawImage(img, 0, 0, width, height);
       ctx.filter = 'none';
       ctx.globalAlpha = 1;
@@ -79,7 +96,9 @@
     ctx.globalAlpha = 0.85;
     for (const i of dots) {
       const t = bundle.tiles[i];
-      ctx.fillRect(px(t) - 1.5, py(t) - 1.5, 3, 3);
+      if (t) {
+        ctx.fillRect(px(t) - 1.5, py(t) - 1.5, 3, 3);
+      }
     }
     ctx.globalAlpha = 1;
     const s = tile.size * scale;
@@ -90,20 +109,28 @@
   });
 
   function click(e: MouseEvent) {
-    const r = canvas!.getBoundingClientRect();
+    if (!canvas) {
+      return;
+    }
+    const r = canvas.getBoundingClientRect();
     const mx = e.clientX - r.left;
     const my = e.clientY - r.top;
     let best = -1;
     let bestD = 9 * 9;
     for (const i of dots) {
       const t = bundle.tiles[i];
+      if (!t) {
+        continue;
+      }
       const d = (px(t) - mx) ** 2 + (py(t) - my) ** 2;
       if (d < bestD) {
         bestD = d;
         best = i;
       }
     }
-    if (best >= 0) onselect(best);
+    if (best >= 0) {
+      onselect(best);
+    }
   }
 </script>
 

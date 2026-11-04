@@ -1,11 +1,20 @@
 <script lang="ts">
   import type { Verdict } from '../lib/types';
 
-  let { verdict, size = 12 }: { verdict: Verdict | null | 'star' | 'star-off'; size?: number } = $props();
+  let {
+    verdict,
+    size = 12,
+  }: { verdict: Verdict | null | 'star' | 'star-off'; size?: number } = $props();
 </script>
 
 <!-- Shape carries the verdict, colour only repeats it. -->
-<svg class="glyph {verdict ?? 'none'}" width={size} height={size} viewBox="-6 -6 12 12" aria-hidden="true">
+<svg
+  class="glyph {verdict ?? 'none'}"
+  width={size}
+  height={size}
+  viewBox="-6 -6 12 12"
+  aria-hidden="true"
+>
   {#if verdict !== 'star' && verdict !== 'star-off' && verdict !== null}
     <circle class="ink" r="5.4" />
   {/if}
@@ -18,7 +27,10 @@
   {:else if verdict === 'not_anomalous'}
     <path d="M-3.4 0 L3.4 0" class="stroke" />
   {:else if verdict === 'star' || verdict === 'star-off'}
-    <path d="M0 -5.2 L1.2 -1.2 L5.2 0 L1.2 1.2 L0 5.2 L-1.2 1.2 L-5.2 0 L-1.2 -1.2 Z" class="fill" />
+    <path
+      d="M0 -5.2 L1.2 -1.2 L5.2 0 L1.2 1.2 L0 5.2 L-1.2 1.2 L-5.2 0 L-1.2 -1.2 Z"
+      class="fill"
+    />
   {:else}
     <circle r="1.6" class="dot" />
   {/if}

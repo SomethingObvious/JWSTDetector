@@ -5,6 +5,7 @@
   import { edgeTicks, scaleBar, type TileFrame } from '../lib/frame';
   import { CMAPS, cssGradient } from '../lib/colormaps';
   import { catShape } from '../lib/catalogues';
+  import { track } from '../lib/track';
   import type { Display, Theme, TileInfo, TileSource } from '../lib/types';
 
   let {
@@ -62,8 +63,14 @@
   const cx = $derived(cfx * W);
   const cy = $derived(cfy * H);
 
-  const toScreen = (ix: number, iy: number): [number, number] => [(ix - cx) * zoom + cw / 2, (iy - cy) * zoom + ch / 2];
-  const toImage = (sx: number, sy: number): [number, number] => [(sx - cw / 2) / zoom + cx, (sy - ch / 2) / zoom + cy];
+  const toScreen = (ix: number, iy: number): [number, number] => [
+    (ix - cx) * zoom + cw / 2,
+    (iy - cy) * zoom + ch / 2,
+  ];
+  const toImage = (sx: number, sy: number): [number, number] => [
+    (sx - cw / 2) / zoom + cx,
+    (sy - ch / 2) / zoom + cy,
+  ];
 
   export function fit() {
     rel = 1;
@@ -77,37 +84,53 @@
 
   onMount(() => {
     try {
-      renderer = new Renderer(canvas!);
+      if (!canvas) {
+        throw new Error('The plate has no canvas to draw on');
+      }
+      renderer = new Renderer(canvas);
       onrenderer(renderer);
     } catch (err) {
       glError = err instanceof Error ? err.message : String(err);
       onrenderer(null, glError);
     }
-    return () => onrenderer(null);
+    return () => {
+      onrenderer(null);
+    };
   });
 
   $effect(() => {
-    void theme;
-    const v = getComputedStyle(document.documentElement).getPropertyValue('--nan').trim();
-    const m = v.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
-    if (m) nan = [parseInt(m[1], 16) / 255, parseInt(m[2], 16) / 255, parseInt(m[3], 16) / 255];
+    // The colour comes from the theme's CSS, so a theme change has to rerun this.
+    track(theme);
+    const v = getComputedStyle(document.documentElement)
+      .getPropertyValue('--nan')
+      .trim();
+    if (/^#[0-9a-f]{6}$/iu.test(v)) {
+      const byte = (i: number) => parseInt(v.slice(i, i + 2), 16) / 255;
+      nan = [byte(1), byte(3), byte(5)];
+    }
   });
 
   $effect(() => {
-    if (!renderer || !data?.planes || display.stretch !== 'histeq') return;
+    if (!renderer || !data?.planes || display.stretch !== 'histeq') {
+      return;
+    }
     renderer.setEqualiser(equaliser(data, limits));
   });
 
   $effect(() => {
-    if (!renderer || !canvas) return;
+    if (!renderer || !canvas) {
+      return;
+    }
     if (!data) {
       renderer.gl.clearColor(0, 0, 0, 0);
       renderer.gl.clear(renderer.gl.COLOR_BUFFER_BIT);
       return;
     }
-    if (!renderer.has(data.index)) renderer.upload(data, grid);
-    void cw;
-    void ch;
+    if (!renderer.has(data.index)) {
+      renderer.upload(data, grid);
+    }
+    // A resize clears the canvas, so it has to redraw.
+    track(cw, ch);
     renderer.draw(
       {
         tile: data,
@@ -130,19 +153,25 @@
     const t = Math.max(0, Math.round(y0));
     const r = Math.min(cw, Math.round(x1));
     const b = Math.min(ch, Math.round(y1));
-    return data && r - l > 40 && b - t > 40 ? { l, t, w: r - l, h: b - t } : { l: 0, t: 0, w: cw, h: ch };
+    return data && r - l > 40 && b - t > 40
+      ? { l, t, w: r - l, h: b - t }
+      : { l: 0, t: 0, w: cw, h: ch };
   });
   const ticks = $derived(
-    frame && data && cw > 0 ? edgeTicks(vis.w, vis.h, (x, y) => frame.toSky(...toImage(vis.l + x, vis.t + y))) : [],
+    frame && data && cw > 0
+      ? edgeTicks(vis.w, vis.h, (x, y) => frame.toSky(...toImage(vis.l + x, vis.t + y)))
+      : [],
   );
   const compass = $derived(frame?.compass() ?? null);
   const bar = $derived(frame ? scaleBar(frame.arcsecPerPx / zoom) : null);
   const ring = $derived.by(() => {
-    if (!data) return null;
+    if (!data) {
+      return null;
+    }
     const [rows, cols] = grid;
     const [pr, pc] = tile.peak;
     const [x, y] = toScreen(((pc + 0.5) * W) / cols, ((pr + 0.5) * H) / rows);
-    const r = Math.max(11, (0.85 * Math.max(W / cols, H / rows) * zoom));
+    const r = Math.max(11, 0.85 * Math.max(W / cols, H / rows) * zoom);
     return { x, y, r };
   });
   // The same edges in the frame's coordinates, which sit M outside the viewport.
@@ -151,13 +180,25 @@
   const R = $derived(M + vis.l + vis.w);
   const B = $derived(M + vis.t + vis.h);
   // The scale bar takes the bottom corner the ring isn't near.
-  const barRight = $derived(!!ring && ring.x < vis.l + vis.w / 2 && ring.y > vis.t + vis.h / 2);
+  const barRight = $derived(
+    ring !== null && ring.x < vis.l + vis.w / 2 && ring.y > vis.t + vis.h / 2,
+  );
+  const corners = $derived<[number, number, number, number][]>([
+    [L - 0.5, T - 0.5, -1, -1],
+    [R + 0.5, T - 0.5, 1, -1],
+    [L - 0.5, B + 0.5, -1, 1],
+    [R + 0.5, B + 0.5, 1, 1],
+  ]);
   const patchBox = $derived.by(() => {
-    if (!cursor || !data) return null;
+    if (!cursor || !data) {
+      return null;
+    }
     const [rows, cols] = grid;
     const c = Math.floor((cursor.ix / W) * cols);
     const r = Math.floor((cursor.iy / H) * rows);
-    if (c < 0 || r < 0 || c >= cols || r >= rows) return null;
+    if (c < 0 || r < 0 || c >= cols || r >= rows) {
+      return null;
+    }
     const [x0, y0] = toScreen((c * W) / cols, (r * H) / rows);
     const [x1, y1] = toScreen(((c + 1) * W) / cols, ((r + 1) * H) / rows);
     return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
@@ -165,7 +206,9 @@
 
   // The part of the tile its score came from, as overlapping tiles score the rest.
   const owned = $derived.by(() => {
-    if (!data || !tile.owned) return null;
+    if (!data || !tile.owned) {
+      return null;
+    }
     const [rows, cols] = grid;
     const [r0, r1, c0, c1] = tile.owned;
     const [x0, y0] = toScreen((c0 * W) / cols, (r0 * H) / rows);
@@ -186,13 +229,16 @@
   let drag: { x: number; y: number; cfx: number; cfy: number } | null = null;
 
   function local(e: PointerEvent | WheelEvent): [number, number] {
-    const r = canvas!.getBoundingClientRect();
+    // Only the canvas sends these events, so it is bound by then.
+    const r = canvas?.getBoundingClientRect() ?? new DOMRect();
     return [e.clientX - r.left, e.clientY - r.top];
   }
 
   function onpointerdown(e: PointerEvent) {
-    if (e.button !== 0) return;
-    canvas!.setPointerCapture(e.pointerId);
+    if (e.button !== 0) {
+      return;
+    }
+    canvas?.setPointerCapture(e.pointerId);
     drag = { x: e.clientX, y: e.clientY, cfx, cfy };
   }
 
@@ -201,14 +247,18 @@
       cfx = drag.cfx - (e.clientX - drag.x) / zoom / W;
       cfy = drag.cfy - (e.clientY - drag.y) / zoom / H;
     }
-    if (!data) return;
+    if (!data) {
+      return;
+    }
     const [ix, iy] = toImage(...local(e));
     oncursor(ix >= 0 && iy >= 0 && ix < W && iy < H ? { ix, iy } : null);
   }
 
   function onpointerup(e: PointerEvent) {
     drag = null;
-    if (canvas?.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+    if (canvas?.hasPointerCapture(e.pointerId)) {
+      canvas.releasePointerCapture(e.pointerId);
+    }
   }
 
   function onwheel(e: WheelEvent) {
@@ -223,47 +273,112 @@
     cfy = (iy - (sy - ch / 2) / z) / H;
   }
 
-  const pct = (v: number) => `${Math.round(v * 100)}%`;
-  const fmt = (v: number) => (Math.abs(v) >= 100 ? v.toFixed(1) : Math.abs(v) >= 1 ? v.toFixed(3) : v.toPrecision(3));
-  const thresholdValue = $derived(mapRange[0] + display.threshold * (mapRange[1] - mapRange[0]));
+  const pct = (v: number) => `${String(Math.round(v * 100))}%`;
+  function fmt(v: number): string {
+    if (Math.abs(v) >= 100) {
+      return v.toFixed(1);
+    }
+    return Math.abs(v) >= 1 ? v.toFixed(3) : v.toPrecision(3);
+  }
+  const thresholdValue = $derived(
+    mapRange[0] + display.threshold * (mapRange[1] - mapRange[0]),
+  );
 </script>
 
 {#snippet part(p: { v: string; u: string }, lastPart: boolean)}
   {@const sup = p.u === 'h' || p.u === 'm' || p.u === 's'}
-  <tspan>{p.v}</tspan><tspan class="u" dy={sup ? '-0.45em' : undefined}>{p.u}</tspan>{#if sup || !lastPart}<tspan dy={sup ? '0.45em' : undefined}>{lastPart ? '' : ' '}</tspan>{/if}
+  <tspan>{p.v}</tspan><tspan class="u" dy={sup ? '-0.45em' : undefined}>{p.u}</tspan
+  >{#if sup || !lastPart}<tspan dy={sup ? '0.45em' : undefined}
+      >{lastPart ? '' : ' '}</tspan
+    >{/if}
 {/snippet}
 
 <section class="plate" aria-label="Plate">
   <div class="toolbar">
     <div class="group">
-      <button class="ctl" onclick={fit} title="Fit the tile to the view (f)">Fit</button>
-      <button class="ctl" onclick={oneToOne} title="One image pixel per screen pixel (0)">1:1</button>
-      <span class="zoom num" title="Screen pixels per image pixel">{zoom.toFixed(2)}<span class="u">&times;</span></span>
-      <button class="ctl" aria-pressed={display.catalogues && hasCatalogues} disabled={!hasCatalogues} onclick={() => (display.catalogues = !display.catalogues)} title={hasCatalogues ? 'Catalogued sources over the tile (c)' : 'Run jwstdetector match to mark catalogued sources'}>Catalogues</button>
+      <button class="ctl" onclick={fit} title="Fit the tile to the view (f)">Fit</button
+      >
+      <button
+        class="ctl"
+        onclick={oneToOne}
+        title="One image pixel per screen pixel (0)">1:1</button
+      >
+      <span class="zoom num" title="Screen pixels per image pixel"
+        >{zoom.toFixed(2)}<span class="u">&times;</span></span
+      >
+      <button
+        class="ctl"
+        aria-pressed={display.catalogues && hasCatalogues}
+        disabled={!hasCatalogues}
+        onclick={() => (display.catalogues = !display.catalogues)}
+        title={hasCatalogues
+          ? 'Catalogued sources over the tile (c)'
+          : 'Run jwstdetector match to mark catalogued sources'}>Catalogues</button
+      >
     </div>
     <span class="sep"></span>
     <div class="group">
-      <button class="ctl" aria-pressed={display.overlay} onclick={() => (display.overlay = !display.overlay)} title="Patch-distance overlay (o)">Overlay</button>
-      <div class="seg" role="group" aria-label="Map">
-        <button class="ctl" aria-pressed={display.source === 'pass2'} onclick={() => (display.source = 'pass2')}>Pass 2</button>
-        <button class="ctl" aria-pressed={display.source === 'pass1'} disabled={!hasPass1} onclick={() => (display.source = 'pass1')}>Pass 1</button>
-        <button class="ctl" aria-pressed={display.source === 'diff'} disabled={!hasPass1} onclick={() => (display.source = 'diff')} title="Pass 2 minus pass 1">Change</button>
-      </div>
+      <button
+        class="ctl"
+        aria-pressed={display.overlay}
+        onclick={() => (display.overlay = !display.overlay)}
+        title="Patch-distance overlay (o)">Overlay</button
+      >
+      {#if hasPass1}
+        <div class="seg" role="group" aria-label="Map">
+          <button
+            class="ctl"
+            aria-pressed={display.source === 'pass2'}
+            onclick={() => (display.source = 'pass2')}>Pass 2</button
+          >
+          <button
+            class="ctl"
+            aria-pressed={display.source === 'pass1'}
+            onclick={() => (display.source = 'pass1')}>Pass 1</button
+          >
+          <button
+            class="ctl"
+            aria-pressed={display.source === 'diff'}
+            onclick={() => (display.source = 'diff')}
+            title="Pass 2 minus pass 1">Change</button
+          >
+        </div>
+      {/if}
       <div class="seg" role="group" aria-label="Overlay style">
-        <button class="ctl" aria-pressed={!display.contours} onclick={() => (display.contours = false)}>Patches</button>
-        <button class="ctl" aria-pressed={display.contours} onclick={() => (display.contours = true)}>Contours</button>
+        <button
+          class="ctl"
+          aria-pressed={!display.contours}
+          onclick={() => (display.contours = false)}>Patches</button
+        >
+        <button
+          class="ctl"
+          aria-pressed={display.contours}
+          onclick={() => (display.contours = true)}>Contours</button
+        >
       </div>
     </div>
     <span class="sep"></span>
     <div class="group sliders">
       <label class="slider">
         <span class="label">Opacity</span>
-        <input type="range" min="0" max="1" step="0.01" bind:value={display.overlayOpacity} />
+        <input
+          type="range"
+          min="0"
+          max="1"
+          step="0.01"
+          bind:value={display.overlayOpacity}
+        />
         <span class="num val">{pct(display.overlayOpacity)}</span>
       </label>
       <label class="slider">
         <span class="label">Threshold</span>
-        <input type="range" min="0" max="0.95" step="0.01" bind:value={display.threshold} />
+        <input
+          type="range"
+          min="0"
+          max="0.95"
+          step="0.01"
+          bind:value={display.threshold}
+        />
         <span class="num val">{fmt(thresholdValue)}</span>
       </label>
       <label class="legend">
@@ -275,7 +390,9 @@
         </select>
         <span class="ramp">
           <span class="num">{fmt(mapRange[0])}</span>
-          <i style:background={cssGradient(display.overlayCmap)}><b style:width="{display.threshold * 100}%"></b></i>
+          <i style:background={cssGradient(display.overlayCmap)}
+            ><b style:width="{display.threshold * 100}%"></b></i
+          >
           <span class="num">{fmt(mapRange[1])}</span>
         </span>
       </label>
@@ -283,15 +400,22 @@
   </div>
 
   <div class="stage">
-    <div class="viewport" style:inset="{M}px" bind:clientWidth={cw} bind:clientHeight={ch}>
+    <div
+      class="viewport"
+      style:inset="{M}px"
+      bind:clientWidth={cw}
+      bind:clientHeight={ch}
+    >
       <canvas
         bind:this={canvas}
-        class:grab={!!data}
+        class:grab={Boolean(data)}
         {onpointerdown}
         {onpointermove}
         {onpointerup}
         onpointercancel={onpointerup}
-        onpointerleave={() => oncursor(null)}
+        onpointerleave={() => {
+          oncursor(null);
+        }}
         {onwheel}
         ondblclick={fit}
         aria-label="Tile {tile.rank}, drag to pan and scroll to zoom"
@@ -302,7 +426,7 @@
           <span class="label">Loading Tile {String(index).padStart(6, '0')}</span>
         </div>
       {/if}
-      {#if error || glError}
+      {#if Boolean(error) || Boolean(glError)}
         <div class="failed" role="alert">
           <p>{glError ?? error}</p>
         </div>
@@ -310,13 +434,26 @@
 
       <svg class="over" width={cw} height={ch} aria-hidden="true">
         {#if owned}
-          <rect class="owned" x={owned.x} y={owned.y} width={owned.w} height={owned.h} />
+          <rect
+            class="owned"
+            x={owned.x}
+            y={owned.y}
+            width={owned.w}
+            height={owned.h}
+          />
         {/if}
         {#if patchBox}
-          <rect class="patch" x={patchBox.x} y={patchBox.y} width={patchBox.w} height={patchBox.h} />
+          <rect
+            class="patch"
+            x={patchBox.x}
+            y={patchBox.y}
+            width={patchBox.w}
+            height={patchBox.h}
+          />
         {/if}
         {#each markers as m, i (i)}
-          <g class="src" transform="translate({m.x} {m.y})"><title>{m.cat} {m.name}</title>
+          <g class="src" transform="translate({m.x} {m.y})"
+            ><title>{m.cat} {m.name}</title>
             <path class="halo" d={catShape(m.cat)} />
             <path d={catShape(m.cat)} />
           </g>
@@ -324,7 +461,10 @@
         {#if ring}
           <g class="ring" transform="translate({ring.x} {ring.y})">
             <circle r={ring.r} />
-            <path d="M0 {-ring.r - 7} V{-ring.r - 2} M0 {ring.r + 2} V{ring.r + 7} M{-ring.r - 7} 0 H{-ring.r - 2} M{ring.r + 2} 0 H{ring.r + 7}" />
+            <path
+              d="M0 {-ring.r - 7} V{-ring.r - 2} M0 {ring.r + 2} V{ring.r +
+                7} M{-ring.r - 7} 0 H{-ring.r - 2} M{ring.r + 2} 0 H{ring.r + 7}"
+            />
           </g>
         {/if}
         {#if compass}
@@ -337,7 +477,12 @@
           </g>
         {/if}
         {#if bar}
-          <g class="scalebar" transform="translate({barRight ? vis.l + vis.w - 14 - bar.px : vis.l + 14} {vis.t + vis.h - 16})">
+          <g
+            class="scalebar"
+            transform="translate({barRight
+              ? vis.l + vis.w - 14 - bar.px
+              : vis.l + 14} {vis.t + vis.h - 16})"
+          >
             <path d="M0 -4 V0 H{bar.px} V-4" />
             <text x={bar.px / 2} y="-8">{bar.label}</text>
           </g>
@@ -352,20 +497,40 @@
           {@const x = L + t.at}
           {@const y = t.edge === 'top' ? T : B}
           <line x1={x} x2={x} y1={y} y2={t.edge === 'top' ? y + 6 : y - 6} />
-          <text class="tl" x={x} y={t.edge === 'top' ? T - 7 : B + 15} text-anchor="middle">
-            {#each t.parts as p, j (j)}{@render part(p, j === t.parts.length - 1)}{/each}
+          <text
+            class="tl"
+            {x}
+            y={t.edge === 'top' ? T - 7 : B + 15}
+            text-anchor="middle"
+          >
+            {#each t.parts as p, j (j)}{@render part(
+                p,
+                j === t.parts.length - 1,
+              )}{/each}
           </text>
         {:else}
           {@const y = T + t.at}
           {@const x = t.edge === 'left' ? L : R}
           <line x1={x} x2={t.edge === 'left' ? x + 6 : x - 6} y1={y} y2={y} />
-          <text class="tl" transform="translate({t.edge === 'left' ? L - 8 : R + 8} {y}) rotate({t.edge === 'left' ? -90 : 90})" text-anchor="middle">
-            {#each t.parts as p, j (j)}{@render part(p, j === t.parts.length - 1)}{/each}
+          <text
+            class="tl"
+            transform="translate({t.edge === 'left'
+              ? L - 8
+              : R + 8} {y}) rotate({t.edge === 'left' ? -90 : 90})"
+            text-anchor="middle"
+          >
+            {#each t.parts as p, j (j)}{@render part(
+                p,
+                j === t.parts.length - 1,
+              )}{/each}
           </text>
         {/if}
       {/each}
-      {#each [[L - 0.5, T - 0.5, -1, -1], [R + 0.5, T - 0.5, 1, -1], [L - 0.5, B + 0.5, -1, 1], [R + 0.5, B + 0.5, 1, 1]] as [x, y, sx, sy], i (i)}
-        <path class="corner" d="M{x + sx * 3} {y} H{x + sx * 12} M{x} {y + sy * 3} V{y + sy * 12}" />
+      {#each corners as [x, y, sx, sy], i (i)}
+        <path
+          class="corner"
+          d="M{x + sx * 3} {y} H{x + sx * 12} M{x} {y + sy * 3} V{y + sy * 12}"
+        />
       {/each}
     </svg>
   </div>

@@ -1,4 +1,4 @@
-"""Expands every .gz in a folder and deletes the archive, for the COSMOS-Web weight maps.
+"""Expands every .gz in a folder and deletes it, for the COSMOS-Web weight maps.
 
 astropy can read a .fits.gz directly, but it can't memmap one, so a big mosaic would
 have to fit in RAM.
@@ -11,8 +11,8 @@ from __future__ import annotations
 import argparse
 import gzip
 import logging
-import shutil
 from pathlib import Path
+import shutil
 
 from tqdm import tqdm
 
@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 def decompress_dir(base_dir: Path) -> int:
-    """Expand each x.gz in `base_dir` to x, delete x.gz, and return how many there were."""
+    """Expand each x.gz in `base_dir` to x and delete x.gz.
+
+    Returns:
+        How many archives there were.
+    """
     gz_paths = sorted(base_dir.glob("*.gz"))
     for gz_path in tqdm(gz_paths, desc="Decompressing", unit="file"):
         out_path = gz_path.with_suffix("")
@@ -31,11 +35,19 @@ def decompress_dir(base_dir: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Expand the archives in the folder named on the command line.
+
+    Returns:
+        The exit code, which is always 0.
+    """
     p = argparse.ArgumentParser(
         description="Expand every .gz in a folder and delete the .gz afterwards."
     )
     p.add_argument(
-        "directory", nargs="?", default=".", help="Folder to expand, the current one by default."
+        "directory",
+        nargs="?",
+        default=".",
+        help="Folder to expand, the current one by default.",
     )
     p.add_argument("--verbose", action="store_true", help="Debug-level logging.")
     args = p.parse_args(argv)

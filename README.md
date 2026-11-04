@@ -16,15 +16,19 @@ These are ranks 2, 3, 11 and 12, as prep cut them. The top of kNN's ranking is l
 
 ## Benchmark
 
-![Share of planted points, arcs, rings and streaks found in the top 5% against AB magnitude, for kNN, the subspace detector and kNN on raw pixels](docs/completeness.png)
+![Share of planted points, arcs, rings and streaks found in the top 5% against AB magnitude, for kNN, the subspace detector, kNN on raw pixels and an isolation forest](docs/completeness.png)
 
-`jwstdetector bench` plants points, arcs, rings and streaks of known AB magnitude in the FITS cutouts, in the mosaic's own units and blurred by each filter's PSF, and renders them back exactly as prep would have. On SMACS 0723, kNN finds half the planted arcs down to AB 27.6 and half the rings to 26.4, against 24.2 and 25.5 for the subspace detector. The same kNN search on raw pixels finds almost nothing, so the backbone is doing the work. [The benchmark page](docs/benchmark.md) has the design, the numbers and the caveats, including why kNN's curves are flat at the bright end.
+`jwstdetector bench` plants points, arcs, rings and streaks of known AB magnitude in the FITS cutouts, in the mosaic's own units and blurred by STPSF's model of each filter's PSF, and renders them back exactly as prep would have. On SMACS 0723, kNN finds half the planted arcs down to AB 27.2 and half the rings to 26.2. The same kNN search on raw pixels does about as well on rings and streaks but finds far fewer arcs, and an isolation forest on hand-built features stays at chance.
+
+`jwstdetector recall` checks the 85 known lensed images in the field. Every detector ranks them above sky at the same distance from the cluster core more often than chance, kNN at 64 where 50 is chance, though no detector clearly beats the others there. [The benchmark page](docs/benchmark.md) has the design, the numbers, the backbones compared and the caveats, including why kNN finds faint arcs more often than bright ones.
 
 ## How It Works
 
 The default detector scores each patch by its cosine distance to the nearest patch of a reference set, after [AnomalyDINO](https://github.com/dammsi/AnomalyDINO) (Damm et al., WACV 2025), and the other by its residual off a PCA subspace, after [SubspaceAD](https://arxiv.org/abs/2602.23013) (Lendering et al., 2026). With no labels, the reference comes from the tiles themselves in two passes, and a tile is never compared with one it overlaps.
 
 Two systematics took over the top of the SMACS ranking before they were fixed at the source. Objects cut off by a tile's edge put 45% of the top 20 peaks on the outermost ring of patches, so each patch now counts only for the tile whose centre it is nearest. Sky covered by one exposure in place of three took the top four places, so prep now weights the flux by depth before rendering, as for a detection image. [The method](docs/method.md) has the equations, the measurements behind both fixes and what each part assumes.
+
+`--reference_roots` scores against other fields instead and gives each tile a calibrated p-value and false discovery rate, though anything that differs between the fields ranks first, so they have to match closely.
 
 Each tile also gets a descriptor built from its anomalous patches only. Sorting by Learned in the viewer spreads your verdicts over those descriptors, so marking one diffraction spike as an artifact sinks the tiles that look like it.
 

@@ -13,12 +13,16 @@ function parseValue(raw: string): string | number | boolean {
   const v = raw.trim();
   if (v.startsWith("'")) {
     // FITS strings escape a quote by doubling it, and trailing spaces are not significant.
-    const body = v.slice(1).match(/^((?:[^']|'')*)'/);
-    return (body ? body[1] : v.slice(1)).replace(/''/g, "'").trimEnd();
+    const body = /^(?<text>(?:[^']|'')*)'/u.exec(v.slice(1))?.groups?.['text'];
+    return (body ?? v.slice(1)).replace(/''/gu, "'").trimEnd();
   }
-  if (v === 'T') return true;
-  if (v === 'F') return false;
-  const n = Number(v.replace(/[dD]/, 'E'));
+  if (v === 'T') {
+    return true;
+  }
+  if (v === 'F') {
+    return false;
+  }
+  const n = Number(v.replace(/[dD]/u, 'E'));
   return Number.isFinite(n) && v !== '' ? n : v;
 }
 
@@ -30,36 +34,50 @@ export function readFits(buf: ArrayBuffer): Fits {
   let offset = 0;
   let ended = false;
   while (!ended) {
-    if (offset + BLOCK > bytes.length) throw new Error(`FITS header has no END card in ${bytes.length} bytes`);
+    if (offset + BLOCK > bytes.length) {
+      throw new Error(`FITS header has no END card in ${String(bytes.length)} bytes`);
+    }
     for (let i = 0; i < 36; i++) {
-      const card = String.fromCharCode(...bytes.subarray(offset + i * 80, offset + i * 80 + 80));
+      const card = String.fromCharCode(
+        ...bytes.subarray(offset + i * 80, offset + i * 80 + 80),
+      );
       const key = card.slice(0, 8).trim();
       if (key === 'END') {
         ended = true;
         break;
       }
-      if (!key) continue;
+      if (!key) {
+        continue;
+      }
       cards.push(card.trimEnd());
-      if (card.slice(8, 10) !== '= ') continue;
+      if (card.slice(8, 10) !== '= ') {
+        continue;
+      }
       const rest = card.slice(10);
       // A slash ends the value, except inside a quoted string.
-      let value = rest;
-      if (!rest.trimStart().startsWith("'")) value = rest.split('/')[0];
-      header[key] = parseValue(value);
+      const slash = rest.trimStart().startsWith("'") ? -1 : rest.indexOf('/');
+      header[key] = parseValue(slash < 0 ? rest : rest.slice(0, slash));
     }
     offset += BLOCK;
   }
 
-  const bitpix = header.BITPIX;
-  const naxis = header.NAXIS;
-  if (bitpix !== -32) throw new Error(`FITS BITPIX is ${bitpix}, the viewer reads -32 only`);
-  if (naxis !== 2 && naxis !== 3) throw new Error(`FITS NAXIS is ${naxis}, the viewer reads 2 or 3`);
-  const width = Number(header.NAXIS1);
-  const height = Number(header.NAXIS2);
-  const nplanes = naxis === 3 ? Number(header.NAXIS3) : 1;
+  const bitpix = header['BITPIX'];
+  const naxis = header['NAXIS'];
+  if (bitpix !== -32) {
+    throw new Error(`FITS BITPIX is ${String(bitpix)}, the viewer reads -32 only`);
+  }
+  if (naxis !== 2 && naxis !== 3) {
+    throw new Error(`FITS NAXIS is ${String(naxis)}, the viewer reads 2 or 3`);
+  }
+  const width = Number(header['NAXIS1']);
+  const height = Number(header['NAXIS2']);
+  const nplanes = naxis === 3 ? Number(header['NAXIS3']) : 1;
   const plane = width * height;
   if (offset + plane * nplanes * 4 > bytes.length) {
-    throw new Error(`FITS data is short: needs ${plane * nplanes * 4} bytes after the header, has ${bytes.length - offset}`);
+    const need = plane * nplanes * 4;
+    throw new Error(
+      `FITS data is short: needs ${String(need)} bytes after the header, has ${String(bytes.length - offset)}`,
+    );
   }
 
   const view = new DataView(buf, offset);
@@ -71,7 +89,9 @@ export function readFits(buf: ArrayBuffer): Fits {
       // FITS row 1 is the bottom of the image, so it becomes the last row here.
       const src = (base + row * width) * 4;
       const dst = (height - 1 - row) * width;
-      for (let x = 0; x < width; x++) out[dst + x] = view.getFloat32(src + x * 4, false);
+      for (let x = 0; x < width; x++) {
+        out[dst + x] = view.getFloat32(src + x * 4, false);
+      }
     }
     planes.push(out);
   }

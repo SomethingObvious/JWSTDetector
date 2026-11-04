@@ -1,20 +1,32 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import IndexList, { type Filters } from './components/IndexList.svelte';
+  import IndexList from './components/IndexList.svelte';
   import Plate from './components/Plate.svelte';
   import Readout from './components/Readout.svelte';
   import { TileFrame } from './lib/frame';
   import type { Renderer } from './lib/gl';
   import { TileCache, computeLimits, type Limits, type TileData } from './lib/tiles';
   import { VERDICT_VALUE, learnedValue, priority, similar, valueAt } from './lib/learn';
-  import { tileId, type Bundle, type Display, type Theme, type TileSource, type Verdict } from './lib/types';
+  import {
+    VERDICTS,
+    tileId,
+    type Bundle,
+    type Display,
+    type Filters,
+    type SortKey,
+    type Theme,
+    type TileInfo,
+    type TileSource,
+    type Verdict,
+    type VerdictRecord,
+  } from './lib/types';
   import { Verdicts } from './lib/verdicts.svelte';
   import { Tan } from './lib/wcs';
 
   const params = new URLSearchParams(location.search);
   const base = (() => {
     const b = params.get('run') ?? './run/';
-    return b.endsWith('/') ? b : b + '/';
+    return b.endsWith('/') ? b : `${b}/`;
   })();
 
   const PREFS = 'jwstdetector:prefs';
@@ -36,7 +48,11 @@
   };
   const saved = (() => {
     try {
-      return JSON.parse(localStorage.getItem(PREFS) ?? '{}') as { display?: Partial<Display>; theme?: Theme; advance?: boolean };
+      return JSON.parse(localStorage.getItem(PREFS) ?? '{}') as {
+        display?: Partial<Display>;
+        theme?: Theme;
+        advance?: boolean;
+      };
     } catch {
       return {};
     }
@@ -50,32 +66,51 @@
   let wcs = new Map<string, Tan>();
 
   const initial: Display = { ...defaults, ...saved.display };
-  if (!Array.isArray(initial.lo) || !Array.isArray(initial.hi)) Object.assign(initial, { lo: [0], hi: [1], limitMode: 'p995' });
+  if (!Array.isArray(initial.lo) || !Array.isArray(initial.hi)) {
+    Object.assign(initial, { lo: [0], hi: [1], limitMode: 'p995' });
+  }
   let display = $state<Display>(initial);
-  let theme = $state<Theme>(saved.theme && ['atlas', 'plate', 'classic'].includes(saved.theme) ? saved.theme : 'atlas');
+  let theme = $state<Theme>(
+    saved.theme && ['atlas', 'plate', 'classic'].includes(saved.theme)
+      ? saved.theme
+      : 'atlas',
+  );
   let advance = $state(saved.advance ?? true);
-  let filters = $state<Filters>({ text: '', verdict: 'all', match: 'all', mosaic: '', scoreMin: null, scoreMax: null, sort: 'rank', desc: false });
+  let filters = $state<Filters>({
+    text: '',
+    verdict: 'all',
+    match: 'all',
+    mosaic: '',
+    scoreMin: null,
+    scoreMax: null,
+    qMax: null,
+    sort: 'rank',
+    desc: false,
+  });
   let embedding = $state.raw<Float32Array | null>(null);
   let sources = $state.raw<TileSource[]>([]);
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- a cache, sources is the state the UI reads
   const sourceCache = new Map<number, TileSource[]>();
 
   let current = $state(0);
+  const tile = $derived(bundle?.tiles[current]);
   let data = $state.raw<TileData | null>(null);
   let tileError = $state<string | null>(null);
   let cursor = $state<{ ix: number; iy: number } | null>(null);
   let lastPos = 0;
 
-  let plate: Plate | undefined = $state();
+  let plate: { fit: () => void; oneToOne: () => void } | undefined = $state();
   let filterInput: HTMLInputElement | undefined = $state();
   let noteEl: HTMLTextAreaElement | undefined = $state();
   let sheet: HTMLDialogElement | undefined = $state();
   let gotoEl: HTMLInputElement | undefined = $state();
   let goto = $state<string | null>(null);
+  let gotoMsg = $state('');
   let narrow = $state(false);
   let tab = $state<'plate' | 'index' | 'readout'>('plate');
 
   $effect(() => {
-    document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset['theme'] = theme;
   });
 
   $effect(() => {
@@ -87,29 +122,22 @@
     }
   });
 
-  onMount(() => {
-    const mq = matchMedia('(max-width: 820px)');
-    narrow = mq.matches;
-    const onmq = () => (narrow = mq.matches);
-    mq.addEventListener('change', onmq);
-    void load();
-    const unload = (e: BeforeUnloadEvent) => {
-      if (verdicts?.hasUnsaved()) e.preventDefault();
-    };
-    addEventListener('beforeunload', unload);
-    return () => {
-      mq.removeEventListener('change', onmq);
-      removeEventListener('beforeunload', unload);
-    };
-  });
-
   async function load() {
     try {
       const res = await fetch(`${base}index.json`, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`${base}index.json returned ${res.status}`);
+      if (!res.ok) {
+        throw new Error(`${base}index.json returned ${String(res.status)}`);
+      }
       const b = (await res.json()) as Bundle;
-      if (b.version !== 1) throw new Error(`index.json is bundle version ${b.version}, and this viewer reads version 1`);
-      if (!b.tiles?.length) throw new Error('index.json lists no tiles');
+      if (b.version !== 1) {
+        throw new Error(
+          `index.json is bundle version ${String(b.version)}, and this viewer reads version 1`,
+        );
+      }
+      // The file comes from outside, so its shape is checked rather than trusted.
+      if (!Array.isArray(b.tiles) || b.tiles.length === 0) {
+        throw new Error('index.json lists no tiles');
+      }
       wcs = new Map(Object.entries(b.mosaics).map(([k, m]) => [k, new Tan(m.wcs)]));
       const v = new Verdicts(b, base);
       await v.load();
@@ -117,12 +145,18 @@
       if (width) {
         // Similar tiles and learning from verdicts need it, and the rest of the viewer doesn't.
         fetch(`${base}embedding.f32`)
-          .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+          .then((r) =>
+            r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status))),
+          )
           .then((buf) => {
             const e = new Float32Array(buf);
-            if (e.length === b.tiles.length * width) embedding = e;
+            if (e.length === b.tiles.length * width) {
+              embedding = e;
+            }
           })
-          .catch(() => {});
+          .catch(() => {
+            // Without it the viewer just has no similar tiles.
+          });
       }
       verdicts = v;
       cache = new TileCache(
@@ -131,8 +165,9 @@
         (d) => renderer?.upload(d, b.run.grid),
         (i) => renderer?.evict(i),
       );
-      const m = location.hash.match(/rank=(\d+)/);
-      const fromHash = m ? b.tiles.findIndex((t) => t.rank === Number(m[1])) : -1;
+      const rank = /rank=(?<rank>\d+)/u.exec(location.hash)?.groups?.['rank'];
+      const fromHash =
+        rank === undefined ? -1 : b.tiles.findIndex((t) => t.rank === Number(rank));
       current = fromHash >= 0 ? fromHash : 0;
       bundle = b;
       document.title = `${b.run.name} · JWSTDetector`;
@@ -141,65 +176,47 @@
     }
   }
 
-  const lowered = $derived(bundle ? bundle.tiles.map((t) => `${t.key} ${t.mosaic}`.toLowerCase()) : []);
-
-  const order = $derived.by(() => {
-    if (!bundle || !verdicts) return new Int32Array(0);
-    const f = filters;
-    const q = f.text.trim().toLowerCase();
-    const out: number[] = [];
-    const tiles = bundle.tiles;
-    for (let i = 0; i < tiles.length; i++) {
-      const t = tiles[i];
-      if (f.mosaic && t.mosaic !== f.mosaic) continue;
-      if (f.match !== 'all' && (!t.xmatch || t.xmatch.uncatalogued !== (f.match === 'uncatalogued'))) continue;
-      if (f.scoreMin !== null && (t.score === null || t.score < f.scoreMin)) continue;
-      if (f.scoreMax !== null && (t.score === null || t.score > f.scoreMax)) continue;
-      if (f.verdict !== 'all' || q) {
-        const v = verdicts.map.get(t.key);
-        if (f.verdict === 'unreviewed' && v?.verdict) continue;
-        if (f.verdict === 'starred' && !v?.star) continue;
-        if (f.verdict !== 'all' && f.verdict !== 'unreviewed' && f.verdict !== 'starred' && v?.verdict !== f.verdict) continue;
-        if (q && !lowered[i].includes(q) && !(v?.note ?? '').toLowerCase().includes(q)) continue;
+  onMount(() => {
+    const mq = matchMedia('(max-width: 820px)');
+    narrow = mq.matches;
+    const onmq = () => (narrow = mq.matches);
+    mq.addEventListener('change', onmq);
+    void load();
+    const unload = (e: BeforeUnloadEvent) => {
+      if (verdicts?.hasUnsaved()) {
+        e.preventDefault();
       }
-      out.push(i);
-    }
-    if (f.sort !== 'rank' || f.desc) {
-      const pr = f.sort === 'priority' ? priorities : null;
-      const key: (i: number) => number =
-        pr
-          ? (i) => -pr[i]
-          : f.sort === 'score'
-          ? (i) => tiles[i].score ?? -Infinity
-          : f.sort === 'delta'
-            ? (i) => (tiles[i].score ?? 0) - (tiles[i].score_pass1 ?? tiles[i].score ?? 0)
-            : f.sort === 'ra'
-              ? (i) => tiles[i].ra
-              : f.sort === 'dec'
-                ? (i) => tiles[i].dec
-                : (i) => tiles[i].rank;
-      const dir = f.desc ? -1 : 1;
-      out.sort((a, b) => (key(a) - key(b)) * dir || tiles[a].rank - tiles[b].rank);
-    }
-    return Int32Array.from(out);
+    };
+    addEventListener('beforeunload', unload);
+    return () => {
+      mq.removeEventListener('change', onmq);
+      removeEventListener('beforeunload', unload);
+    };
   });
+
+  const lowered = $derived(
+    bundle ? bundle.tiles.map((t) => `${t.key} ${t.mosaic}`.toLowerCase()) : [],
+  );
 
   const indexOfKey = $derived(new Map(bundle?.tiles.map((t, i) => [t.key, i]) ?? []));
 
   // Verdicts as values to learn from, by tile index.
-  const labels = $derived.by(() => {
-    const m = new Map<number, number>();
-    if (!verdicts) return m;
-    for (const [key, v] of verdicts.map) {
-      const i = indexOfKey.get(key);
-      if (v.verdict && i !== undefined) m.set(i, VERDICT_VALUE[v.verdict]);
-    }
-    return m;
-  });
+  const labels = $derived(
+    new Map(
+      [...(verdicts?.map ?? [])].flatMap(([key, v]) => {
+        const i = indexOfKey.get(key);
+        return v.verdict && i !== undefined
+          ? [[i, VERDICT_VALUE[v.verdict]] as const]
+          : [];
+      }),
+    ),
+  );
   const dims = $derived(bundle?.run.embedding_dims ?? 0);
   // Only worked out for every tile while the list is sorted by it.
   const priorities = $derived.by(() => {
-    if (!bundle || !embedding || filters.sort !== 'priority') return null;
+    if (!bundle || !embedding || filters.sort !== 'priority') {
+      return null;
+    }
     const value = learnedValue(embedding, dims, labels);
     return priority(
       bundle.tiles.map((t) => t.rank),
@@ -207,23 +224,130 @@
       value,
     );
   });
-  const learned = $derived(embedding ? { value: valueAt(embedding, dims, labels, current), from: labels.size } : null);
+  const learned = $derived(
+    embedding
+      ? { value: valueAt(embedding, dims, labels, current), from: labels.size }
+      : null,
+  );
   const alike = $derived(embedding ? similar(embedding, dims, current, 6) : []);
+
+  function passesFields(t: TileInfo, f: Filters): boolean {
+    if (f.mosaic && t.mosaic !== f.mosaic) {
+      return false;
+    }
+    if (f.match !== 'all' && t.xmatch?.uncatalogued !== (f.match === 'uncatalogued')) {
+      return false;
+    }
+    if (f.scoreMin !== null && (t.score === null || t.score < f.scoreMin)) {
+      return false;
+    }
+    if (f.scoreMax !== null && (t.score === null || t.score > f.scoreMax)) {
+      return false;
+    }
+    return !(f.qMax !== null && (t.q === undefined || t.q > f.qMax));
+  }
+
+  function passesReview(
+    f: Filters,
+    q: string,
+    text: string,
+    v: VerdictRecord | undefined,
+  ): boolean {
+    if (f.verdict === 'unreviewed' && v?.verdict) {
+      return false;
+    }
+    if (f.verdict === 'starred' && !v?.star) {
+      return false;
+    }
+    if (
+      f.verdict !== 'all' &&
+      f.verdict !== 'unreviewed' &&
+      f.verdict !== 'starred' &&
+      v?.verdict !== f.verdict
+    ) {
+      return false;
+    }
+    return !q || text.includes(q) || (v?.note ?? '').toLowerCase().includes(q);
+  }
+
+  function sortKey(
+    sort: SortKey,
+    tiles: TileInfo[],
+    pr: Float32Array | null,
+  ): (i: number) => number {
+    if (pr) {
+      return (i) => -(pr[i] ?? NaN);
+    }
+    switch (sort) {
+      case 'score':
+        return (i) => tiles[i]?.score ?? -Infinity;
+      case 'delta':
+        return (i) => {
+          const t = tiles[i];
+          return t ? (t.score ?? 0) - (t.score_pass1 ?? t.score ?? 0) : NaN;
+        };
+      case 'ra':
+        return (i) => tiles[i]?.ra ?? NaN;
+      case 'dec':
+        return (i) => tiles[i]?.dec ?? NaN;
+      default:
+        return (i) => tiles[i]?.rank ?? NaN;
+    }
+  }
+
+  const order = $derived.by(() => {
+    if (!bundle || !verdicts) {
+      return new Int32Array(0);
+    }
+    const f = filters;
+    const q = f.text.trim().toLowerCase();
+    const out: number[] = [];
+    const tiles = bundle.tiles;
+    const map = verdicts.map;
+    tiles.forEach((t, i) => {
+      if (!passesFields(t, f)) {
+        return;
+      }
+      // The verdict is only looked up when a filter needs it.
+      if (
+        (f.verdict !== 'all' || q) &&
+        !passesReview(f, q, lowered[i] ?? '', map.get(t.key))
+      ) {
+        return;
+      }
+      out.push(i);
+    });
+    if (f.sort !== 'rank' || f.desc) {
+      const key = sortKey(f.sort, tiles, f.sort === 'priority' ? priorities : null);
+      const rank = (i: number) => tiles[i]?.rank ?? NaN;
+      const dir = f.desc ? -1 : 1;
+      out.sort((a, b) => (key(a) - key(b)) * dir || rank(a) - rank(b));
+    }
+    return Int32Array.from(out);
+  });
 
   // Catalogued sources over the current tile, for the plate markers and the readout.
   $effect(() => {
     const i = current;
-    if (!bundle?.run.xmatch) return;
+    if (!bundle?.run.xmatch) {
+      return;
+    }
     const hit = sourceCache.get(i);
     sources = hit ?? [];
-    if (hit) return;
+    if (hit) {
+      return;
+    }
     fetch(`${base}cats/${tileId(i)}.json`)
       .then((r) => (r.ok ? (r.json() as Promise<TileSource[]>) : []))
       .then((s) => {
         sourceCache.set(i, s);
-        if (current === i) sources = s;
+        if (current === i) {
+          sources = s;
+        }
       })
-      .catch(() => {});
+      .catch(() => {
+        // A tile without a catalogue file just has no markers.
+      });
   });
 
   const posOf = $derived.by(() => {
@@ -233,13 +357,21 @@
   });
   const pos = $derived(posOf[current] ?? -1);
   $effect(() => {
-    if (pos >= 0) lastPos = pos;
+    if (pos >= 0) {
+      lastPos = pos;
+    }
   });
 
   const reviewed = $derived.by(() => {
-    if (!verdicts) return 0;
+    if (!verdicts) {
+      return 0;
+    }
     let n = 0;
-    for (const v of verdicts.map.values()) if (v.verdict) n++;
+    for (const v of verdicts.map.values()) {
+      if (v.verdict) {
+        n++;
+      }
+    }
     return n;
   });
 
@@ -249,7 +381,9 @@
     // bundle comes first so the effect always tracks it. cache isn't reactive, and
     // bailing on it alone would leave the effect waiting for current to change,
     // which it never does when the first tile is the one asked for.
-    if (!bundle || !cache) return;
+    if (!bundle || !cache) {
+      return;
+    }
     const c = cache;
     cursor = null;
     const hit = c.peek(i);
@@ -258,90 +392,146 @@
     if (!hit) {
       c.get(i).then(
         (d) => {
-          if (current === i) data = d;
+          if (current === i) {
+            data = d;
+          }
         },
-        (err) => {
-          if (current === i) tileError = `Couldn't load tile ${i}. ${err instanceof Error ? err.message : String(err)}`;
+        (err: unknown) => {
+          if (current === i) {
+            tileError = `Couldn't load tile ${String(i)}. ${err instanceof Error ? err.message : String(err)}`;
+          }
         },
       );
     }
     const p = untrack(() => (pos >= 0 ? pos : lastPos));
     const ord = untrack(() => order);
-    const ahead = [1, 2, 3, -1].map((d) => ord[p + d]).filter((x) => x !== undefined && x !== i);
+    const ahead = [1, 2, 3, -1].flatMap((d) => {
+      const x = ord[p + d];
+      return x !== undefined && x !== i ? [x] : [];
+    });
     void c.prefetch(ahead, [i, ...ahead]);
-    if (bundle) history.replaceState(null, '', `${location.pathname}${location.search}#rank=${bundle.tiles[i].rank}`);
+    const t = bundle.tiles[i];
+    if (t) {
+      history.replaceState(
+        null,
+        '',
+        `${location.pathname}${location.search}#rank=${String(t.rank)}`,
+      );
+    }
   });
 
   const limits = $derived.by((): Limits => {
     const n = data?.channels ?? 1;
     // A PNG was already stretched when it was cut, so it's shown as it is.
-    if (data && !data.planes) return { lo: Array(n).fill(0), hi: Array(n).fill(255) };
-    if (display.limitMode === 'manual' && Array.isArray(display.lo) && display.lo.length >= n) {
+    if (data && !data.planes) {
+      return { lo: new Array<number>(n).fill(0), hi: new Array<number>(n).fill(255) };
+    }
+    if (
+      display.limitMode === 'manual' &&
+      Array.isArray(display.lo) &&
+      display.lo.length >= n
+    ) {
       return { lo: display.lo.slice(0, n), hi: display.hi.slice(0, n) };
     }
-    if (!data) return { lo: [0], hi: [1] };
-    return computeLimits(data, display.limitMode === 'manual' ? 'p995' : display.limitMode);
+    if (!data) {
+      return { lo: [0], hi: [1] };
+    }
+    return computeLimits(
+      data,
+      display.limitMode === 'manual' ? 'p995' : display.limitMode,
+    );
   });
 
   const mapRange = $derived.by((): [number, number] => {
-    if (!data) return [0, 1];
-    let src: ArrayLike<number> = data.map2;
-    if (display.source === 'pass1' && data.map1) src = data.map1;
+    if (!data) {
+      return [0, 1];
+    }
+    let src = data.map2;
+    if (display.source === 'pass1' && data.map1) {
+      src = data.map1;
+    }
     const run = bundle?.run.map_range;
-    if (display.source !== 'diff' && run) return run;
-    if (display.source === 'diff' && data.map1) {
+    if (display.source !== 'diff' && run) {
+      return run;
+    }
+    const map1 = data.map1;
+    if (display.source === 'diff' && map1) {
       let m = 0;
-      for (let k = 0; k < data.map2.length; k++) m = Math.max(m, Math.abs(data.map2[k] - data.map1[k]));
+      data.map2.forEach((v, k) => {
+        m = Math.max(m, Math.abs(v - (map1[k] ?? NaN)));
+      });
       return [-m || -1, m || 1];
     }
     let lo = Infinity;
     let hi = -Infinity;
-    for (let k = 0; k < src.length; k++) {
-      lo = Math.min(lo, src[k]);
-      hi = Math.max(hi, src[k]);
+    for (const v of src) {
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
     }
     return [lo, hi > lo ? hi : lo + 1];
   });
 
   const frame = $derived.by(() => {
-    if (!bundle || !data) return null;
-    const t = bundle.tiles[current];
-    const m = bundle.mosaics[t.mosaic];
-    const w = wcs.get(t.mosaic);
-    return m && w ? new TileFrame(t, m, w, data.width, data.height) : null;
+    if (!bundle || !data || !tile) {
+      return null;
+    }
+    const m = bundle.mosaics[tile.mosaic];
+    const w = wcs.get(tile.mosaic);
+    return m && w ? new TileFrame(tile, m, w, data.width, data.height) : null;
   });
 
   function select(i: number) {
-    if (bundle && i >= 0 && i < bundle.tiles.length) current = i;
+    if (bundle && i >= 0 && i < bundle.tiles.length) {
+      current = i;
+    }
+  }
+
+  function selectAt(k: number) {
+    const i = order[k];
+    if (i !== undefined) {
+      select(i);
+    }
   }
 
   function step(d: number) {
-    if (!order.length) return;
-    const p = pos >= 0 ? pos : d > 0 ? lastPos - 1 : lastPos;
-    const k = Math.max(0, Math.min(order.length - 1, p + d));
-    select(order[k]);
+    if (!order.length) {
+      return;
+    }
+    let p = pos;
+    if (p < 0) {
+      p = d > 0 ? lastPos - 1 : lastPos;
+    }
+    selectAt(Math.max(0, Math.min(order.length - 1, p + d)));
   }
 
   function neighbour(): number | null {
     const p = pos >= 0 ? pos + 1 : lastPos;
-    return p < order.length ? order[p] : null;
+    return order[p] ?? null;
   }
 
   function setVerdict(v: Verdict | null) {
-    if (!bundle || !verdicts) return;
+    if (!verdicts || !tile) {
+      return;
+    }
     const next = neighbour();
-    verdicts.update(bundle.tiles[current].key, { verdict: v });
-    if (advance && v && next !== null) select(next);
+    verdicts.update(tile.key, { verdict: v });
+    if (advance && v && next !== null) {
+      select(next);
+    }
   }
 
   function toggleStar() {
-    if (!bundle || !verdicts) return;
-    const key = bundle.tiles[current].key;
+    if (!verdicts || !tile) {
+      return;
+    }
+    const key = tile.key;
     verdicts.update(key, { star: !verdicts.get(key)?.star });
   }
 
   function setTheme(t: Theme) {
-    if (t === theme) return;
+    if (t === theme) {
+      return;
+    }
     // The plate world reads tiles as a negative, the way plates were inspected on a light table.
     if (t === 'plate') {
       display.invert = true;
@@ -355,103 +545,208 @@
   }
 
   function jump() {
-    if (!bundle || goto === null) return;
+    if (!bundle || goto === null) {
+      return;
+    }
     const r = parseInt(goto, 10);
     const i = bundle.tiles.findIndex((t) => t.rank === r);
     if (i >= 0) {
       select(i);
       goto = null;
-    } else gotoMsg = `No tile has rank ${goto}. Ranks run from 1 to ${bundle.tiles.length}.`;
-  }
-  let gotoMsg = $state('');
-
-  function onkeydown(e: KeyboardEvent) {
-    const el = e.target as HTMLElement;
-    const type = el instanceof HTMLInputElement ? el.type : '';
-    // Sliders and checkboxes keep their own arrow keys but let every other key through.
-    const widget = type === 'range' || type === 'checkbox';
-    const typing = el.isContentEditable || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || (el instanceof HTMLInputElement && !widget);
-    if (e.key === 'Escape') {
-      if (goto !== null) goto = null;
-      if (typing || widget) el.blur();
-      return;
+    } else {
+      gotoMsg = `No tile has rank ${goto}. Ranks run from 1 to ${String(bundle.tiles.length)}.`;
     }
-    if (typing || e.ctrlKey || e.metaKey || e.altKey || !bundle) return;
-    if (widget && /^(Arrow|Home|End|Page)/.test(e.key)) return;
-    if (sheet?.open && e.key !== '?') return;
-    const k = e.key;
-    let handled = true;
-    if (k === 'j' || k === 'ArrowDown' || k === 'ArrowRight') step(1);
-    else if (k === 'k' || k === 'ArrowUp' || k === 'ArrowLeft') step(-1);
-    else if (k === 'Home') order.length && select(order[0]);
-    else if (k === 'End') order.length && select(order[order.length - 1]);
-    else if (k === 'PageDown') step(10);
-    else if (k === 'PageUp') step(-10);
-    else if (k === 'g') {
+  }
+
+  // Handles the keys that move through the list or open an input. Any other key
+  // returns false.
+  function moveKey(k: string): boolean {
+    if (k === 'j' || k === 'ArrowDown' || k === 'ArrowRight') {
+      step(1);
+    } else if (k === 'k' || k === 'ArrowUp' || k === 'ArrowLeft') {
+      step(-1);
+    } else if (k === 'Home') {
+      selectAt(0);
+    } else if (k === 'End') {
+      selectAt(order.length - 1);
+    } else if (k === 'PageDown') {
+      step(10);
+    } else if (k === 'PageUp') {
+      step(-10);
+    } else if (k === 'g') {
       goto = '';
       gotoMsg = '';
       queueMicrotask(() => gotoEl?.focus());
     } else if (k === '/') {
-      if (narrow) tab = 'index';
+      if (narrow) {
+        tab = 'index';
+      }
       queueMicrotask(() => filterInput?.focus());
-    } else if (k === 'f') plate?.fit();
-    else if (k === '0') plate?.oneToOne();
-    else if (k === 'o') display.overlay = !display.overlay;
-    else if (k === 'c') display.catalogues = !display.catalogues;
-    else if (k === '?') sheet?.open ? sheet.close() : sheet?.showModal();
-    else if (k >= '1' && k <= '4') setVerdict((['interesting', 'artifact', 'known', 'not_anomalous'] as const)[Number(k) - 1]);
-    else if (k === 'Delete' || k === 'Backspace') setVerdict(null);
-    else if (k === 's') toggleStar();
-    else if (k === 'n') {
-      if (narrow) tab = 'readout';
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  // Handles the keys that change the view or the verdict. Any other key returns false.
+  function actKey(k: string): boolean {
+    const verdict = VERDICTS.find((d) => d.key === k);
+    if (k === 'f') {
+      plate?.fit();
+    } else if (k === '0') {
+      plate?.oneToOne();
+    } else if (k === 'o') {
+      display.overlay = !display.overlay;
+    } else if (k === 'c') {
+      display.catalogues = !display.catalogues;
+    } else if (k === '?') {
+      if (sheet?.open) {
+        sheet.close();
+      } else {
+        sheet?.showModal();
+      }
+    } else if (verdict) {
+      setVerdict(verdict.id);
+    } else if (k === 'Delete' || k === 'Backspace') {
+      setVerdict(null);
+    } else if (k === 's') {
+      toggleStar();
+    } else if (k === 'n') {
+      if (narrow) {
+        tab = 'readout';
+      }
       queueMicrotask(() => noteEl?.focus());
-    } else handled = false;
-    if (handled) e.preventDefault();
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  function focusKind(el: HTMLElement): { typing: boolean; widget: boolean } {
+    const type = el instanceof HTMLInputElement ? el.type : '';
+    // Sliders and checkboxes keep their own arrow keys but let every other key through.
+    const widget = type === 'range' || type === 'checkbox';
+    const typing =
+      el.isContentEditable ||
+      el instanceof HTMLTextAreaElement ||
+      el instanceof HTMLSelectElement ||
+      (el instanceof HTMLInputElement && !widget);
+    return { typing, widget };
+  }
+
+  function onkeydown(e: KeyboardEvent) {
+    const el = e.target as HTMLElement;
+    const { typing, widget } = focusKind(el);
+    if (e.key === 'Escape') {
+      if (goto !== null) {
+        goto = null;
+      }
+      if (typing || widget) {
+        el.blur();
+      }
+      return;
+    }
+    if (typing || e.ctrlKey || e.metaKey || e.altKey || !bundle) {
+      return;
+    }
+    if (widget && /^(?:Arrow|Home|End|Page)/u.test(e.key)) {
+      return;
+    }
+    if (sheet?.open && e.key !== '?') {
+      return;
+    }
+    if (moveKey(e.key) || actKey(e.key)) {
+      e.preventDefault();
+    }
   }
 
   const save = $derived(verdicts?.state ?? { kind: 'idle' as const });
   const clock = (iso: string) => {
     const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? iso : d.toLocaleTimeString('en-CA', { hour12: false });
+    return Number.isNaN(d.getTime())
+      ? iso
+      : d.toLocaleTimeString('en-CA', { hour12: false });
   };
 </script>
 
 <!-- A select keeps focus after a choice, which would swallow J and K, so it lets go once it changes. -->
-<svelte:window {onkeydown} onchange={(e) => e.target instanceof HTMLSelectElement && e.target.blur()} />
+<svelte:window
+  {onkeydown}
+  onchange={(e: Event) => {
+    if (e.target instanceof HTMLSelectElement) {
+      e.target.blur();
+    }
+  }}
+/>
 
 {#if loadError}
   <main class="fatal">
     <h1>Couldn't Open the Run</h1>
     <p>{loadError}</p>
-    <p class="dim">The viewer reads <code>{base}index.json</code>. Point it at another run folder with <code>?run=path/to/run/</code> in the address.</p>
+    <p class="dim">
+      The viewer reads <code>{base}index.json</code>. Point it at another run folder
+      with <code>?run=path/to/run/</code> in the address.
+    </p>
   </main>
-{:else if !bundle || !verdicts}
+{:else if !bundle || !verdicts || !tile}
   <main class="fatal">
     <p class="label">Opening Run</p>
   </main>
 {:else}
-  {@const tile = bundle.tiles[current]}
   <div class="app" class:narrow data-tab={tab}>
     {#if !bundle.writable}
       <div class="demo">
         <span class="label">Demo Run</span>
         <span class="name">{bundle.run.name}</span>
-        <span class="dim">Verdicts stay in this browser. Export them from the Verdict block.</span>
-        <a href="https://github.com/SomethingObvious/JWSTDetector" target="_blank" rel="noopener noreferrer">JWSTDetector on GitHub</a>
+        <span class="dim"
+          >Verdicts stay in this browser. Export them from the Verdict block.</span
+        >
+        <a
+          href="https://github.com/SomethingObvious/JWSTDetector"
+          target="_blank"
+          rel="noopener noreferrer">JWSTDetector on GitHub</a
+        >
       </div>
     {/if}
 
     {#if narrow}
       <nav class="tabs" aria-label="Panels">
-        <button class="ctl" aria-pressed={tab === 'index'} onclick={() => (tab = 'index')}>Index</button>
-        <button class="ctl" aria-pressed={tab === 'plate'} onclick={() => (tab = 'plate')}>Plate</button>
-        <button class="ctl" aria-pressed={tab === 'readout'} onclick={() => (tab = 'readout')}>Readout</button>
+        <button
+          class="ctl"
+          aria-pressed={tab === 'index'}
+          onclick={() => (tab = 'index')}>Index</button
+        >
+        <button
+          class="ctl"
+          aria-pressed={tab === 'plate'}
+          onclick={() => (tab = 'plate')}>Plate</button
+        >
+        <button
+          class="ctl"
+          aria-pressed={tab === 'readout'}
+          onclick={() => (tab = 'readout')}>Readout</button
+        >
       </nav>
     {/if}
 
     <div class="cols">
       <div class="col index-col">
-        <IndexList {bundle} {order} {pos} {current} {verdicts} {reviewed} bind:filters bind:filterInput onselect={(i) => { select(i); if (narrow) tab = 'plate'; }} />
+        <IndexList
+          {bundle}
+          {order}
+          {pos}
+          {current}
+          {verdicts}
+          {reviewed}
+          bind:filters
+          bind:filterInput
+          onselect={(i: number) => {
+            select(i);
+            if (narrow) {
+              tab = 'plate';
+            }
+          }}
+        />
       </div>
       <div class="col plate-col">
         <Plate
@@ -469,9 +764,9 @@
           {theme}
           {cursor}
           sources={bundle.run.xmatch && display.catalogues ? sources : []}
-          hasCatalogues={!!bundle.run.xmatch}
-          onrenderer={(r) => (renderer = r)}
-          oncursor={(c) => (cursor = c)}
+          hasCatalogues={Boolean(bundle.run.xmatch)}
+          onrenderer={(r: Renderer | null) => (renderer = r)}
+          oncursor={(c: { ix: number; iy: number } | null) => (cursor = c)}
         />
       </div>
       <div class="col readout-col">
@@ -501,8 +796,21 @@
 
     <footer class="rail">
       {#if goto !== null}
-        <form class="goto" onsubmit={(e) => { e.preventDefault(); jump(); }}>
-          <label><span class="label">Go to Rank</span><input class="ctl num" bind:this={gotoEl} bind:value={goto} inputmode="numeric" /></label>
+        <form
+          class="goto"
+          onsubmit={(e) => {
+            e.preventDefault();
+            jump();
+          }}
+        >
+          <label
+            ><span class="label">Go to Rank</span><input
+              class="ctl num"
+              bind:this={gotoEl}
+              bind:value={goto}
+              inputmode="numeric"
+            /></label
+          >
           <button class="ctl" type="submit">Go</button>
           {#if gotoMsg}<span class="dim">{gotoMsg}</span>{/if}
         </form>
@@ -514,18 +822,36 @@
           <span><kbd>n</kbd> Note</span>
           <span><kbd>o</kbd> Overlay</span>
           <span><kbd>g</kbd> Rank</span>
-          <button class="keys" onclick={() => sheet?.showModal()}><kbd>?</kbd> All Keys</button>
+          <button class="keys" onclick={() => sheet?.showModal()}
+            ><kbd>?</kbd> All Keys</button
+          >
         </span>
       {/if}
       {#if narrow}
         <span class="step" role="group" aria-label="Step Through the List">
-          <button class="ctl" disabled={pos === 0} onclick={() => step(-1)}>Prev</button>
-          <button class="ctl" disabled={pos === order.length - 1} onclick={() => step(1)}>Next</button>
+          <button
+            class="ctl"
+            disabled={pos === 0}
+            onclick={() => {
+              step(-1);
+            }}>Prev</button
+          >
+          <button
+            class="ctl"
+            disabled={pos === order.length - 1}
+            onclick={() => {
+              step(1);
+            }}>Next</button
+          >
         </span>
       {/if}
       <span class="where">
         <span>Rank <b class="num">{tile.rank}</b></span>
-        <span class="dim num">{pos >= 0 ? `${pos + 1} of ${order.length} shown` : 'not in the filtered list'}</span>
+        <span class="dim num"
+          >{pos >= 0
+            ? `${String(pos + 1)} of ${String(order.length)} shown`
+            : 'not in the filtered list'}</span
+        >
       </span>
       <span class="save" role="status">
         {#if save.kind === 'saved'}
@@ -533,8 +859,11 @@
         {:else if save.kind === 'saving'}
           <i class="led busy"></i>Saving {save.pending}
         {:else if save.kind === 'retrying'}
-          <i class="led bad"></i>Not saved, {save.pending} waiting. Retrying in {save.inSeconds} s ({save.error})
-          <button class="ctl mini" onclick={() => verdicts?.retryNow()}>Retry Now</button>
+          <i class="led bad"></i>Not saved, {save.pending} waiting. Retrying in {save.inSeconds}
+          s ({save.error})
+          <button class="ctl mini" onclick={() => verdicts?.retryNow()}
+            >Retry Now</button
+          >
         {:else if save.kind === 'local'}
           <i class="led ok"></i>{save.count} in this browser
         {:else}
@@ -542,38 +871,86 @@
         {/if}
       </span>
       <span class="themes" role="group" aria-label="Theme">
-        <button class="ctl mini" aria-pressed={theme === 'atlas'} onclick={() => setTheme('atlas')}>Atlas</button>
-        <button class="ctl mini" aria-pressed={theme === 'plate'} onclick={() => setTheme('plate')}>Plate</button>
-        <button class="ctl mini" aria-pressed={theme === 'classic'} onclick={() => setTheme('classic')}>Classic</button>
+        <button
+          class="ctl mini"
+          aria-pressed={theme === 'atlas'}
+          onclick={() => {
+            setTheme('atlas');
+          }}>Atlas</button
+        >
+        <button
+          class="ctl mini"
+          aria-pressed={theme === 'plate'}
+          onclick={() => {
+            setTheme('plate');
+          }}>Plate</button
+        >
+        <button
+          class="ctl mini"
+          aria-pressed={theme === 'classic'}
+          onclick={() => {
+            setTheme('classic');
+          }}>Classic</button
+        >
       </span>
     </footer>
 
-    <dialog bind:this={sheet} class="sheet" aria-label="Keyboard Keys" onclick={(e) => e.target === sheet && sheet.close()}>
+    <dialog
+      bind:this={sheet}
+      class="sheet"
+      aria-label="Keyboard Keys"
+      onclick={(e) => {
+        if (e.target === sheet) {
+          sheet.close();
+        }
+      }}
+    >
       <div class="sheet-head">
         <h2 class="label">Keys</h2>
         <button class="ctl mini" onclick={() => sheet?.close()}>Close</button>
       </div>
       <dl>
-        <dt><kbd>j</kbd> <kbd>Down</kbd> <kbd>Right</kbd></dt><dd>Next candidate</dd>
-        <dt><kbd>k</kbd> <kbd>Up</kbd> <kbd>Left</kbd></dt><dd>Previous candidate</dd>
-        <dt><kbd>Home</kbd> <kbd>End</kbd></dt><dd>First or last in the list</dd>
-        <dt><kbd>PgDn</kbd> <kbd>PgUp</kbd></dt><dd>Ten forward or back</dd>
-        <dt><kbd>g</kbd></dt><dd>Go to a rank</dd>
-        <dt><kbd>1</kbd></dt><dd>Interesting</dd>
-        <dt><kbd>2</kbd></dt><dd>Artifact</dd>
-        <dt><kbd>3</kbd></dt><dd>Known object</dd>
-        <dt><kbd>4</kbd></dt><dd>Not anomalous</dd>
-        <dt><kbd>Del</kbd></dt><dd>Clear the verdict</dd>
-        <dt><kbd>s</kbd></dt><dd>Star or unstar</dd>
-        <dt><kbd>n</kbd></dt><dd>Write a note, <kbd>Esc</kbd> to leave it</dd>
-        <dt><kbd>/</kbd></dt><dd>Filter the index</dd>
-        <dt><kbd>f</kbd></dt><dd>Fit the tile</dd>
-        <dt><kbd>0</kbd></dt><dd>One image pixel per screen pixel</dd>
-        <dt><kbd>o</kbd></dt><dd>Overlay on or off</dd>
-        <dt><kbd>c</kbd></dt><dd>Catalogue markers on or off</dd>
-        <dt><kbd>?</kbd></dt><dd>This sheet</dd>
+        <dt><kbd>j</kbd> <kbd>Down</kbd> <kbd>Right</kbd></dt>
+        <dd>Next candidate</dd>
+        <dt><kbd>k</kbd> <kbd>Up</kbd> <kbd>Left</kbd></dt>
+        <dd>Previous candidate</dd>
+        <dt><kbd>Home</kbd> <kbd>End</kbd></dt>
+        <dd>First or last in the list</dd>
+        <dt><kbd>PgDn</kbd> <kbd>PgUp</kbd></dt>
+        <dd>Ten forward or back</dd>
+        <dt><kbd>g</kbd></dt>
+        <dd>Go to a rank</dd>
+        <dt><kbd>1</kbd></dt>
+        <dd>Interesting</dd>
+        <dt><kbd>2</kbd></dt>
+        <dd>Artifact</dd>
+        <dt><kbd>3</kbd></dt>
+        <dd>Known object</dd>
+        <dt><kbd>4</kbd></dt>
+        <dd>Not anomalous</dd>
+        <dt><kbd>Del</kbd></dt>
+        <dd>Clear the verdict</dd>
+        <dt><kbd>s</kbd></dt>
+        <dd>Star or unstar</dd>
+        <dt><kbd>n</kbd></dt>
+        <dd>Write a note, <kbd>Esc</kbd> to leave it</dd>
+        <dt><kbd>/</kbd></dt>
+        <dd>Filter the index</dd>
+        <dt><kbd>f</kbd></dt>
+        <dd>Fit the tile</dd>
+        <dt><kbd>0</kbd></dt>
+        <dd>One image pixel per screen pixel</dd>
+        <dt><kbd>o</kbd></dt>
+        <dd>Overlay on or off</dd>
+        <dt><kbd>c</kbd></dt>
+        <dd>Catalogue markers on or off</dd>
+        <dt><kbd>?</kbd></dt>
+        <dd>This sheet</dd>
       </dl>
-      <p class="dim">A verdict moves to the next tile unless you turn that off in the Verdict block. Drag the plate to pan, scroll to zoom and double-click to fit.</p>
+      <p class="dim">
+        A verdict moves to the next tile unless you turn that off in the Verdict block.
+        Drag the plate to pan, scroll to zoom and double-click to fit.
+      </p>
     </dialog>
   </div>
 {/if}

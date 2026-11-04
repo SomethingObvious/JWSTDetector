@@ -12,13 +12,16 @@ import random
 import numpy as np
 
 
-def set_seed(seed: int, deterministic: bool = False) -> None:
-    """Seed random, NumPy and torch, and with `deterministic` put cuDNN in its slower exact mode."""
+def set_seed(seed: int, *, deterministic: bool = False) -> None:
+    """Seed random, NumPy and torch.
+
+    With `deterministic`, cuDNN goes into its slower exact mode as well.
+    """
     random.seed(seed)
-    np.random.seed(seed)
+    np.random.seed(seed)  # noqa: NPY002 the global stream is the one being pinned
 
     try:
-        import torch
+        import torch  # noqa: PLC0415 torch is optional for the CPU-only tests
     except ImportError:
         return
 

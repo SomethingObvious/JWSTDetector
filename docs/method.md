@@ -48,9 +48,35 @@ Scoring that way, 3 of kNN's top 20 tiles peak on the outer ring of the part the
 
 ## The Bootstrap
 
-There are no labels, so the reference has to come from the tiles themselves. Pass 1 draws a random 10% of them, clamped to between 500 and 5,000 and to at most half the set. Pass 2 rebuilds the reference from the lowest-scoring 20% of pass 1 and scores everything again. The overlap exclusion means an object in the random reference can't match itself, but a second object like it elsewhere in the field would match it and score low, which [the benchmark](benchmark.md#why-knns-curves-are-flat-when-bright) measures. Pass 2's reference is the most ordinary tiles, which keeps rare things out of it. The viewer shows both passes and the change between them.
+There are no labels, so the reference has to come from the tiles themselves. Pass 1 draws a random 10% of them, clamped to between 500 and 5,000 and to at most half the set. Pass 2 rebuilds the reference from the lowest-scoring 20% of pass 1 and scores everything again. The overlap exclusion means an object in the random reference can't match itself, but a second object like it elsewhere in the field would match it and score low, which [the benchmark](benchmark.md#why-knn-finds-faint-arcs-more-often-than-bright-ones) measures. Pass 2's reference is the most ordinary tiles, which keeps rare things out of it. The viewer shows both passes and the change between them.
 
 That pruning doesn't know a rare object from a rare kind of ordinary sky, though. Before the noise was evened out, two tiles in the gap between the modules ranked 216th and 175th in pass 1 and 2nd and 3rd in pass 2, because pass 2 had dropped every tile like them from its reference. So anything systematic and rare, like depth, has to be dealt with before scoring rather than left to the bootstrap.
+
+## Twins in the Reference
+
+`--places N` scores a patch by its distance to the nearest match in the N-th separate place in the bank instead of the nearest match anywhere, where two places are separate when their tiles share no sky:
+
+```math
+d_N(p) = \min_{m \in \mathcal{M}_N(p)} \left(1 - \cos(f_p, f_m)\right)
+```
+
+with $\mathcal{M}_N(p)$ the bank patches left once the closest matches from $N - 1$ separate places are set aside. Ordinary sky has close matches all over the field, so its score hardly moves. A rare object with a twin or two in the reference can only fill some of the places, so it keeps a high score. It's off by default, as [the benchmark](benchmark.md#why-knn-finds-faint-arcs-more-often-than-bright-ones) found no gain on the seeds kept back to check it.
+
+## Another Field as Reference
+
+`--reference_roots` takes the reference from other fields cut the same way, which keeps a rare object's twins in the target field out of it entirely and gives each tile a p-value. Each reference field is scored against the other reference fields, and those scores are the calibration set. A tile with score $s$ then gets the conformal p-value
+
+```math
+p = \frac{1 + \left|\{ j : c_j \ge s \}\right|}{n + 1}
+```
+
+over the $n$ calibration scores $c_j$ (Bates et al. 2023), and Benjamini-Hochberg turns those into q-values, so the tiles with $q \le 0.1$ are a set where about a tenth or fewer are expected to be ordinary. It is valid when the calibration tiles are exchangeable with the ordinary tiles of the target. The target is scored against every reference field and each calibration field against one fewer, which only lowers the target's scores, so the p-values err high.
+
+On SMACS 0723 against Abell 370, MACS J0416, CEERS and GLASS, no tile reaches $q \le 0.1$. The lowest p is 0.0085, as the arcs and bright stars of the other three clusters score as high as SMACS's do, and with 1,056 calibration tiles p can't go below 0.00095 anyway. The top tile in that ranking is blank sky with faint horizontal striping, whose row medians scatter by about 1 sigma there against 0.2 in a typical tile. All five mosaics went through the same pipeline version, so it's something in the SMACS data itself that the other fields don't share. That is the catch with another field as reference, as anything that differs between the fields ranks ahead of what is rare within one, so the reference fields need to match the target in instrument, filters, depth and reduction as closely as they can.
+
+## Precision and Speed
+
+The backbone runs in fp16 when a probe tile's features come out finite and in bf16 when they don't, which is the case for the LVD-1689M checkpoints on every input. The memory bank is kept in fp16 with fp32 results, normalised first, and on SMACS 0723 that gives the same ranking as an fp32 bank (Spearman 1.00000, the same top 50) and the same recall, in two thirds of the time. The search is bound by memory rather than arithmetic, and against a 500,000 patch bank it scores 17.4 tiles a second on a laptop RTX 4070, so 50,000 tiles against a million patches take about an hour and three quarters. A backbone too big for the GPU, like the 7B, streams its layers from disk two at a time.
 
 ## Tile Descriptors
 
@@ -103,3 +129,5 @@ The score is relative to the reference, so an artifact shared by most tiles coun
 - Siméoni et al. DINOv3. arXiv:2508.10104, 2025.
 - Lochner, Bassett. Astronomaly: Personalised Active Anomaly Detection in Astronomical Data. Astronomy and Computing 36, 100481, 2021.
 - Lupton et al. Preparing Red-Green-Blue Images from CCD Data. PASP 116, 133, 2004.
+- Bates, Candès, Lei, Romano, Sesia. Testing for Outliers with Conformal p-values. Annals of Statistics 51, 149, 2023.
+- Benjamini, Hochberg. Controlling the False Discovery Rate. JRSS B 57, 289, 1995.

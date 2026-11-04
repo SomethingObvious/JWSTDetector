@@ -20,10 +20,25 @@ dependencies = [
   "tqdm",
   "matplotlib",
   "pyvo",  # SIMBAD, NED and Gaia over TAP for `jwstdetector match`
+  "scikit-learn",  # the isolation forest baseline in `jwstdetector bench`
+  "typing_extensions",  # @override on Python 3.11
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = [
+  "basedpyright",
+  "mypy",
+  "pandas-stubs",
+  "pre-commit",
+  "pytest",
+  "ruff",
+  "scipy-stubs",
+  "stpsf",
+  "types-PyYAML",
+  "types-tqdm",
+]
+# STScI's Webb PSF model, which `jwstdetector bench` plants sources with when it's installed.
+webb = ["stpsf"]
 
 [project.scripts]
 jwstdetector = "jwstdetector.cli:main"
@@ -40,28 +55,104 @@ packages = ["jwstdetector"]
 jwstdetector = ["viewer_static/**/*"]
 
 [tool.ruff]
-line-length = 100
+line-length = 88
 target-version = "py311"
+preview = true
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RET", "PIE", "PT", "PTH", "ARG", "RUF", "S"]
-ignore = ["S101"]
+select = ["ALL"]
+explicit-preview-rules = true
+extend-select = ["DOC201", "DOC202", "DOC402", "DOC403", "DOC501", "PLR0904", "PLR0914", "PLR0916"]
+ignore = [
+  "COM812",  # the formatter owns trailing commas
+  "CPY001",  # the licence is in LICENSE.md
+  "D107",
+  "D203",
+  "D213",
+  "FIX002",
+  "N803",  # X and Y for arrays, as in numpy and scikit-learn
+  "N806",
+  "S311",  # seeded generators for reproducible sampling, not secrets
+]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*.py" = ["S", "ARG", "PT", "SLF", "N818"]
+"tests/*.py" = ["S101", "PLR2004", "SLF001", "ARG001", "ARG002", "FBT001", "FBT002", "FBT003", "PLC0415", "D", "INP001"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8
+
+[tool.ruff.lint.pylint]
+max-args = 5
+max-positional-args = 3
+max-returns = 4
+max-branches = 10
+max-statements = 30
+max-locals = 12
+max-bool-expr = 4
+max-nested-blocks = 4
+max-public-methods = 15
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"pickle".msg = "Use JSON or npz, which can't run code on load."
+"typing.Optional".msg = "Write X | None."
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+force-sort-within-sections = true
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.ruff.format]
-quote-style = "double"
-
 [tool.mypy]
 python_version = "3.11"
+strict = true
+warn_unreachable = true
+strict_bytes = true
+extra_checks = true
+disallow_any_unimported = true
+enable_error_code = [
+  "redundant-expr",
+  "truthy-bool",
+  "truthy-iterable",
+  "ignore-without-code",
+  "unused-awaitable",
+  "possibly-undefined",
+  "redundant-self",
+  "explicit-override",
+  "mutable-override",
+  "unimported-reveal",
+  "narrowed-type-not-subtype",
+  "deprecated",
+  "exhaustive-match",
+]
+
+[[tool.mypy.overrides]]
+# No stubs ship for these.
+module = ["astropy.*", "reproject.*", "pyvo.*", "tifffile.*", "safetensors.*", "stpsf.*", "sklearn.*", "transformers.*", "huggingface_hub.*"]
 ignore_missing_imports = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-no_implicit_optional = true
+
+[tool.basedpyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["jwstdetector", "tests"]
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+
+[tool.vulture]
+min_confidence = 60
+paths = ["jwstdetector", "tests"]
 
 [tool.bandit]
 skips = ["B101"]

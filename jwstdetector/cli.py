@@ -10,22 +10,56 @@ import importlib
 import sys
 
 COMMANDS = {
-    "prep": ("jwstdetector.prep", "run", "Cut FITS mosaics into tiles and FITS cutouts."),
-    "run": ("jwstdetector.bootstrap", "main", "Rank every tile with no labels, in two passes."),
-    "score": ("jwstdetector.reference", "main", "Score tiles against tiles known to be normal."),
-    "match": ("jwstdetector.catalogues", "main", "Cross-match the candidates with catalogues."),
+    "prep": (
+        "jwstdetector.prep",
+        "run",
+        "Cut FITS mosaics into tiles and FITS cutouts.",
+    ),
+    "run": (
+        "jwstdetector.bootstrap",
+        "main",
+        "Rank every tile with no labels, in two passes.",
+    ),
+    "score": (
+        "jwstdetector.reference",
+        "main",
+        "Score tiles against tiles known to be normal.",
+    ),
+    "match": (
+        "jwstdetector.catalogues",
+        "main",
+        "Cross-match the candidates with catalogues.",
+    ),
     "candidates": (
         "jwstdetector.candidates",
         "main",
         "Write the candidates as a table and regions.",
     ),
-    "view": ("jwstdetector.server", "main", "Open a run in the viewer, or export it as a site."),
-    "bench": ("jwstdetector.benchmark", "main", "Plant sources and measure how many are found."),
-    "unzip": ("jwstdetector.unzip", "main", "Expand .gz mosaics so they can be memory-mapped."),
+    "view": (
+        "jwstdetector.server",
+        "main",
+        "Open a run in the viewer, or export it as a site.",
+    ),
+    "bench": (
+        "jwstdetector.benchmark",
+        "main",
+        "Plant sources and measure how many are found.",
+    ),
+    "recall": (
+        "jwstdetector.recall",
+        "main",
+        "Rank objects already known to be in the field.",
+    ),
+    "unzip": (
+        "jwstdetector.unzip",
+        "main",
+        "Expand .gz mosaics so they can be memory-mapped.",
+    ),
 }
 
 
 def usage() -> str:
+    """Return the top-level help, with one line per command."""
     width = max(map(len, COMMANDS))
     lines = [f"  {name:<{width}}  {help_}" for name, (_, _, help_) in COMMANDS.items()]
     return (
@@ -37,12 +71,19 @@ def usage() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the subcommand named in `argv`.
+
+    Returns:
+        The subcommand's exit code, or 2 when there's no such command.
+    """
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help"):
-        print(usage())
+        sys.stdout.write(usage() + "\n")
         return 0
     if argv[0] not in COMMANDS:
-        print(f"jwstdetector: there's no {argv[0]!r} command.\n\n{usage()}", file=sys.stderr)
+        sys.stderr.write(
+            f"jwstdetector: there's no {argv[0]!r} command.\n\n{usage()}\n"
+        )
         return 2
     module, func, _ = COMMANDS[argv[0]]
     # argparse names the program after argv[0], and this makes its usage line say
