@@ -57,3 +57,29 @@ def test_cross_field_calibrates_against_the_other_fields(tmp_path: Path) -> None
     assert sorted(set(fields)) == ["ctrl0", "ctrl1", "ctrl2"]
     assert len(fields) == 24
     assert (out / "measurements_final.csv").is_file()
+
+
+def test_no_calibrate_ranks_without_p_values(tmp_path: Path) -> None:
+    _field(tmp_path / "target", 6, seed=1, odd=True)
+    for j in range(2):
+        _field(tmp_path / f"ctrl{j}", 8, seed=10 + j)
+    out = tmp_path / "out"
+    bootstrap.main(
+        [
+            "--data_root", str(tmp_path / "target"),
+            "--reference_roots", *(str(tmp_path / f"ctrl{j}") for j in range(2)),
+            "--no-calibrate",
+            "--out_dir", str(out),
+            "--model_name", "pixels",
+            "--knn_metric", "L2",
+            "--resolution", str(SIZE),
+            "--device", "cpu",
+            "--num_workers", "0",
+            "--feature_cache", "none",
+        ]
+    )  # fmt: skip
+    with (out / "measurements_final.csv").open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert max(rows, key=lambda r: float(r["AnomalyScore"]))["Sample"] == "t000.png"
+    assert not (out / "significance.csv").exists()
+    assert not (out / "calibration.csv").exists()

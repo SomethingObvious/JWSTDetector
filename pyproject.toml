@@ -156,3 +156,15 @@ paths = ["jwstdetector", "tests"]
 
 [tool.bandit]
 skips = ["B101"]
+
+[tool.typos.default.extend-words]
+# The FITS weight extension and its file suffix, a row index, the NASA/IPAC
+# Extragalactic Database, Canadian spelling, and parts of PNGs and 255ths.
+WHT = "WHT"
+wht = "wht"
+iy = "iy"
+NED = "NED"
+uncatalogued = "uncatalogued"
+Uncatalogued = "Uncatalogued"
+PN = "PN"
+ths = "ths"

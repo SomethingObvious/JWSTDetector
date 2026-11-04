@@ -268,6 +268,24 @@ def test_excluded_refs_follow_the_footprints() -> None:
     assert excluded_refs(q, refs, feet) == [[0, 2], [0, 2], [1], []]
 
 
+def test_excluded_refs_cross_mosaics_on_the_sky() -> None:
+    # Two survey visits that overlap: tiles 20 arcsec across, half-diagonal 14.1.
+    r = 20 / 3600 / 2**0.5
+    q = [Path("v1a"), Path("v1b")]
+    refs = [Path("v2a"), Path("v2b"), Path("v3")]
+    feet = {
+        q[0]: Footprint("v1", 0, 0, 320, ra=10.0, dec=0.0, radius_deg=r),
+        q[1]: Footprint("v1", 320, 0, 320, ra=10.1, dec=0.0, radius_deg=r),
+        # 25 arcsec from v1a, close enough that the corners can meet.
+        refs[0]: Footprint("v2", 0, 0, 320, ra=10.0 + 25 / 3600, dec=0.0, radius_deg=r),
+        # 30 arcsec off, past the two half-diagonals.
+        refs[1]: Footprint("v2", 320, 0, 320, ra=10.0, dec=30 / 3600, radius_deg=r),
+        # No sky position, so only its own mosaic's pixels count.
+        refs[2]: Footprint("v3", 0, 0, 320),
+    }
+    assert excluded_refs(q, refs, feet) == [[0], []]
+
+
 def test_dihedral_is_lossless() -> None:
     x = torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(2, 3, 4, 4)
     views = dihedral(x)
@@ -343,7 +361,13 @@ def test_end_to_end_options() -> None:
         assert tiff.exists()
 
 
-def _bank(max_patches: int, seed: int = 0, *, masking: bool = False) -> MemoryBank:
+def _bank(
+    max_patches: int,
+    seed: int = 0,
+    *,
+    masking: bool = False,
+    dtype: torch.dtype = torch.float32,
+) -> MemoryBank:
     with tempfile.TemporaryDirectory() as td:
         query_dir = Path(td) / "query"
         _write_tiles(query_dir)
@@ -352,7 +376,9 @@ def _bank(max_patches: int, seed: int = 0, *, masking: bool = False) -> MemoryBa
             _stub_backbone(),
             paths,
             query_dir,
-            settings=BankSettings(max_patches=max_patches, seed=seed, masking=masking),
+            settings=BankSettings(
+                max_patches=max_patches, seed=seed, masking=masking, dtype=dtype
+            ),
             options=EmbedOptions(num_workers=0),
         )
 
@@ -382,6 +408,14 @@ def test_bank_sample_fills_the_cap_evenly_and_repeats() -> None:
     assert torch.equal(bank.features, again.features)
     assert torch.equal(_owners(bank), _owners(again))
     assert not torch.equal(_owners(bank), _owners(_bank(cap, seed=1)))
+
+
+def test_fp16_bank_samples_past_the_cap() -> None:
+    cap = 13 * GRID * GRID // 2
+    half = _bank(cap, dtype=torch.float16)
+    full = _bank(cap)
+    assert half.features.dtype == torch.float16
+    assert torch.equal(_owners(half), _owners(full))
 
 
 def test_masked_bank_still_fills_the_cap() -> None:
