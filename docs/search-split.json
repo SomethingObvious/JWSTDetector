@@ -156,7 +156,7 @@
   "jw01727-o166_t139"
  ],
  "alpha": 0.1,
- "tile_grid_px": 320,
+ "tile_px": 320,
  "claims": "Only search tiles with BH q <= alpha over the search set are reported as detections. Every other tile is a ranked candidate at most. Detections are then looked at in each filter and matched against catalogues before anyone calls them anything.",
- "amended": "Before any tile was scored, the other 88 COSMOS-Web visits with F150W, F277W and F444W at 1031 s joined the calibration. The search and the bank are unchanged."
+ "amended": "Before any tile was scored, the other 88 COSMOS-Web visits with F150W, F277W and F444W at 1031 s joined the calibration. The search and the bank are unchanged. Then, also before any tile was scored, every tile came to count instead of only those on a 320 px grid, as each tile only scores the sky nearer its centre than any other tile's and the grid left three quarters of the sky unsearched."
 }

@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 from jwstdetector.survey import (
+    check_owned,
     near_bright_star,
-    on_grid,
     overlaps_other_visit,
     parse_key,
     read_stars,
@@ -33,11 +33,12 @@ def test_parse_key_refuses_a_key_without_a_position() -> None:
         parse_key("tile_00012.png")
 
 
-def test_grid_tiles_share_no_pixel() -> None:
-    cx, cy = np.meshgrid(np.arange(320, 1600, 160), np.arange(320, 1600, 160))
-    keep = on_grid(cx.ravel(), cy.ravel(), 320)
-    assert keep.sum() == 16
-    assert keep.size == 64
+def test_a_run_that_scored_every_patch_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "args.yaml").write_text("score_region: owned\nstride: 160\n")
+    check_owned(tmp_path)
+    (tmp_path / "args.yaml").write_text("score_region: all\nstride: 160\n")
+    with pytest.raises(ValueError, match="wasn't scored with --score_region owned"):
+        check_owned(tmp_path)
 
 
 def _sky(*points: tuple[float, float]) -> SkyCoords:
