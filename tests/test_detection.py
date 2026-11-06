@@ -327,6 +327,61 @@ def test_end_to_end_with_directions_dropped_still_ranks_the_odd_tile_first() -> 
         assert ranked[0] == ANOMALOUS, ranked[:3]
 
 
+def test_rerun_reuses_bank_and_unchanged_tiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A bench scores the same bank and tiles once per magnitude, and planting a source
+    # changes only some tiles. The second run has to give the same scores without
+    # building the bank again, and search only the tile that changed.
+    monkeypatch.setattr(detection, "_REUSED", {})
+    builds: list[int] = []
+    searched: list[int] = []
+    build = detection.build_memory_bank
+    search = MemoryBank.distances
+
+    def counting_build(*args: object, **kwargs: object) -> MemoryBank:
+        builds.append(1)
+        return build(*args, **kwargs)  # type: ignore[arg-type]
+
+    def counting_search(
+        self: MemoryBank, queries: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        searched.append(queries.shape[0])
+        return search(self, queries, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(detection, "build_memory_bank", counting_build)
+    monkeypatch.setattr(MemoryBank, "distances", counting_search)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        query_dir = tmp / "query"
+        names = _write_tiles(query_dir)
+        refs = [query_dir / n for n in names if n != ANOMALOUS]
+        backbone = _stub_backbone()
+
+        def run() -> dict[str, float]:
+            return run_anomaly_detection(
+                backbone,
+                refs,
+                query_dir,
+                query_paths=sorted(query_dir.glob("*.png")),
+                query_root=query_dir,
+                out_dir=tmp / "out",
+                num_workers=0,
+                batch_size=4,
+            )[0]
+
+        first = run()
+        tile = np.asarray(Image.open(query_dir / ANOMALOUS)).copy()
+        tile[48:80, :, :] = 55
+        Image.fromarray(tile).save(query_dir / ANOMALOUS)
+        searched.clear()
+        second = run()
+
+    assert len(builds) == 1
+    assert sum(searched) == GRID * GRID
+    assert second[ANOMALOUS] != first[ANOMALOUS]
+    del first[ANOMALOUS], second[ANOMALOUS]
+    assert second == first
+
+
 def test_reference_tile_is_scored_against_the_others() -> None:
     # The label-free runner scores tiles that are also in its reference. Matched
     # against its own patches, the odd tile would score 0 and sink to the bottom.
