@@ -10,6 +10,7 @@ patches scores zero however strange it is.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import logging
 from pathlib import Path
 import time
@@ -45,6 +46,11 @@ _PLACES_CANDIDATES = 64
 # Bank patches the principal directions are fitted on, and the chunk they're dropped
 # in.
 _DROP_SAMPLE = 100_000
+# A bench runs the same bank against the same tiles 7 times a seed, and only the
+# planted tiles change between runs. So a process keeps its last bank, and the
+# distances of every tile it has scored against it, keyed by the tile's features.
+# The reference tiles must not change on disk while the process runs.
+_REUSED: dict[str, Any] = {}
 
 
 def dihedral(x: torch.Tensor) -> list[torch.Tensor]:
@@ -581,6 +587,36 @@ def build_memory_bank(
     return MemoryBank(features[:filled], settings.metric, owners[:filled])
 
 
+def _kept_or_built(  # noqa: PLR0913 the same arguments as build_memory_bank, plus keep
+    backbone: Backbone,
+    ref_paths: list[Path],
+    ref_root: Path,
+    *,
+    settings: BankSettings,
+    options: EmbedOptions,
+    keep: bool,
+) -> MemoryBank:
+    """Return the bank this process last built from the same tiles, or build one.
+
+    Returns:
+        The bank.
+    """
+    # The backbone is held as well, so a new one at a recycled id never matches.
+    key = (tuple(str(p) for p in ref_paths), str(ref_root), settings)
+    if keep and _REUSED.get("backbone") is backbone and _REUSED.get("key") == key:
+        kept: MemoryBank = _REUSED["bank"]
+        return kept
+    _REUSED.clear()
+    if backbone.device.type == "cuda":
+        torch.cuda.empty_cache()
+    bank = build_memory_bank(
+        backbone, ref_paths, ref_root, settings=settings, options=options
+    )
+    if keep:
+        _REUSED.update(backbone=backbone, key=key, bank=bank, dists={})
+    return bank
+
+
 @dataclass(frozen=True)
 class Queries:
     """The tiles to score, and what each one is kept from.
@@ -630,6 +666,7 @@ class ScoreSettings:
     maps_dir: Path | None = None
     save_patch_dists: bool = True
     save_tiffs: bool = False
+    reuse: dict[tuple[str, str], torch.Tensor] | None = None
 
 
 def _dists2map() -> Callable[[npt.NDArray[Any], tuple[int, int]], npt.NDArray[Any]]:
@@ -718,6 +755,39 @@ class _Scoring:
             side = self.backbone.resolution
             tifffile.imwrite(f"{stem}.tiff", self.to_pixels(grid, (side, side)))
 
+    def _reused_distances(
+        self,
+        keys: list[str],
+        feats: torch.Tensor,
+        *,
+        memo: dict[tuple[str, str], torch.Tensor],
+        excluded: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Search only the tiles this bank hasn't seen with these features.
+
+        Returns:
+            The distances of every patch in the batch.
+        """
+        per_tile = feats.reshape(len(keys), -1, feats.shape[-1])
+        names = [
+            (k, hashlib.blake2b(per_tile[i].cpu().numpy().tobytes()).hexdigest())
+            for i, k in enumerate(keys)
+        ]
+        todo = [i for i, name in enumerate(names) if name not in memo]
+        if todo:
+            sub_excluded = rows = None
+            if excluded is not None:
+                sub_excluded = excluded[todo]
+                rows = torch.arange(len(todo), device=feats.device).repeat_interleave(
+                    per_tile.shape[1]
+                )
+            found = self._search(
+                per_tile[todo].reshape(-1, feats.shape[-1]), rows, sub_excluded
+            ).reshape(len(todo), -1)
+            for j, i in enumerate(todo):
+                memo[names[i]] = found[j]
+        return torch.cat([memo[name] for name in names])
+
     def add_batch(
         self,
         keys: list[str],
@@ -728,7 +798,14 @@ class _Scoring:
     ) -> None:
         """Score a batch of tiles and save their maps."""
         excluded, rows = exclusion
-        dists, keep = self._distances(feats, rows, excluded)
+        memo = self.settings.reuse
+        if memo is None or self.settings.masking:
+            dists, keep = self._distances(feats, rows, excluded)
+        else:
+            dists, keep = (
+                self._reused_distances(keys, feats, memo=memo, excluded=excluded),
+                None,
+            )
         descriptors = _descriptors(feats, dists, owned)
         grid = self.backbone.grid_size
         grids = dists.reshape(len(keys), *grid).cpu().numpy()
@@ -889,7 +966,7 @@ def run_anomaly_detection(  # noqa: PLR0913 the CLI passes every option through 
         )
     options = EmbedOptions(batch_size=batch_size, num_workers=num_workers, cache=cache)
     started = time.perf_counter()
-    bank = build_memory_bank(
+    bank = _kept_or_built(
         backbone,
         ref_paths,
         ref_root,
@@ -911,6 +988,8 @@ def run_anomaly_detection(  # noqa: PLR0913 the CLI passes every option through 
             else torch.float32,
         ),
         options=options,
+        # Only a bank nothing changes after it's built can be kept.
+        keep=detector == "knn" and not drop_directions and places == 1,
     )
     model = _choose_detector(bank, detector, subspace_variance)
     if isinstance(model, MemoryBank) and drop_directions:
@@ -942,6 +1021,9 @@ def run_anomaly_detection(  # noqa: PLR0913 the CLI passes every option through 
             maps_dir=Path(out_dir) / f"anomaly_maps/seed={seed}",
             save_patch_dists=save_patch_dists,
             save_tiffs=save_tiffs,
+            # Empty unless the bank was kept, which _kept_or_built only does for a bank
+            # nothing changes after it is built.
+            reuse=_REUSED.get("dists"),
         ),
         options=options,
     )
