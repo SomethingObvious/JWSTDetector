@@ -59,16 +59,19 @@ def parse_key(key: str) -> tuple[int, int, float, float]:
     return int(m[1]), int(m[2]), float(m[3]), dec
 
 
-def on_grid(
-    cx: npt.NDArray[np.int64], cy: npt.NDArray[np.int64], grid: int
-) -> npt.NDArray[np.bool_]:
-    """True for tiles centred on a multiple of `grid` pixels, which share no pixel.
+def check_owned(run_dir: Path) -> None:
+    """Refuse a run that scored every patch, as its tiles would count shared sky twice.
 
-    Returns:
-        One flag per tile.
+    Raises:
+        ValueError: If the run's args.yaml doesn't say score_region: owned.
     """
-    keep: npt.NDArray[np.bool_] = (cx % grid == 0) & (cy % grid == 0)
-    return keep
+    text = (run_dir / "args.yaml").read_text(encoding="utf-8")
+    if not re.search(r"^score_region: owned$", text, re.MULTILINE):
+        msg = (
+            f"{run_dir} wasn't scored with --score_region owned, so its overlapping "
+            "tiles share sky and can't all count."
+        )
+        raise ValueError(msg)
 
 
 def overlaps_other_visit(
@@ -190,7 +193,6 @@ def _sky_of_every_tile(
 
 @dataclass(frozen=True)
 class _Rules:
-    grid: int
     size_arcsec: float
     every: SkyCoords
     every_visit: npt.NDArray[np.str_]
@@ -204,7 +206,6 @@ def _filter_visit(
     keys = sorted(scores)
     p = np.array([parse_key(k) for k in keys])
     c = SkyCoord(p[:, 2], p[:, 3], unit="deg")
-    grid = on_grid(p[:, 0].astype(np.int64), p[:, 1].astype(np.int64), rules.grid)
     overlap = overlaps_other_visit(
         c,
         np.full(len(keys), visit),
@@ -215,19 +216,15 @@ def _filter_visit(
     star = near_bright_star(
         c, stars=rules.stars, star_g=rules.star_g, size_arcsec=rules.size_arcsec
     )
-    keep = grid & ~overlap & ~star
-    counts = {
-        "off_grid": int((~grid).sum()),
-        "overlap": int((grid & overlap).sum()),
-        "star": int((grid & ~overlap & star).sum()),
-    }
+    keep = ~overlap & ~star
+    counts = {"overlap": int(overlap.sum()), "star": int((~overlap & star).sum())}
     return {k: scores[k] for k, ok in zip(keys, keep, strict=True) if ok}, counts
 
 
 def _kept_tiles(
     split: dict[str, Any], *, stars_json: Path, data: Path, results: Path
 ) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
-    """Apply the grid, overlap and star rules to each search and calibration visit.
+    """Apply the overlap and star rules to each search and calibration visit.
 
     Returns:
         The kept scores per visit, and how many tiles each rule dropped.
@@ -238,16 +235,16 @@ def _kept_tiles(
     every, every_name = _sky_of_every_tile(data, every_visit)
     stars, star_g = read_stars(stars_json, every)
     rules = _Rules(
-        grid=int(split["tile_grid_px"]),
-        size_arcsec=int(split["tile_grid_px"]) * scale,
+        size_arcsec=int(split["tile_px"]) * scale,
         every=every,
         every_visit=every_name,
         stars=stars,
         star_g=star_g,
     )
     kept: dict[str, dict[str, float]] = {}
-    dropped = {"off_grid": 0, "overlap": 0, "star": 0}
+    dropped = {"overlap": 0, "star": 0}
     for v in [*split["search"], *split["calibration"]]:
+        check_owned(results / v)
         scores = _read_scores(results / v / "measurements_final.csv")
         kept[v], counts = _filter_visit(v, scores, rules)
         for rule, n in counts.items():
@@ -291,7 +288,7 @@ def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/s
     cal = np.array([x for v in split["calibration"] for x in kept[v].values()])
     keys = sorted(search)
     if not keys:
-        msg = "Every search tile was dropped by the grid, overlap or star rules."
+        msg = "Every search tile was dropped by the overlap or star rules."
         raise ValueError(msg)
     p = conformal_p(np.array([search[k] for k in keys]), cal)
     q = bh_q(p)
