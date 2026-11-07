@@ -18,8 +18,8 @@ means ranked in the top 5% rather than first.
 
 It needs a dataset cut with --save_cutouts. Anything after `--` goes to
 every `jwstdetector run`. Writes injections.csv with each planted source's rank,
-summary.csv with recall and its 95% Wilson interval per detector, kind and
-magnitude, and completeness.png.
+and its null rank among the tiles nothing was planted in, summary.csv with recall
+and its 95% Wilson interval per detector, kind and magnitude, and completeness.png.
 """  # noqa: E501 --help prints this, so the summary line stays whole
 
 from __future__ import annotations
@@ -59,6 +59,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 KINDS = ("point", "arc", "ring", "streak")
+# Shapes no model or setting was ever chosen on, so a gain that only holds for the
+# four above shows up as tuning to them. Ask for them with --kinds.
+HELD_OUT = ("clumps", "diffuse", "pair")
 # f_nu goes as wavelength to this power, so red sources are brighter in F444W.
 SEDS = {"flat": 0.0, "red": 2.0, "blue": -2.0}
 # What each detector adds to every `jwstdetector run`. Pixels is the kNN search on raw
@@ -152,9 +155,8 @@ def intrinsic(source: Source, size: int) -> npt.NDArray[np.float64]:
     y, x = np.mgrid[0:size, 0:size].astype(np.float64)
     dx, dy = x - source.cx, y - source.cy
     shape: npt.NDArray[np.float64]
-    if source.kind == "point":
-        shape = np.exp(-(dx**2 + dy**2) / (2 * 0.25**2))
-        return shape
+    if source.kind in {"point", "diffuse", "pair", "clumps"}:
+        return _blobs(source, dx, dy)
     if source.kind == "streak":
         d = dx * np.sin(source.theta) - dy * np.cos(source.theta)
         shape = np.exp(-(d**2) / (2 * 0.5**2))
@@ -167,6 +169,34 @@ def intrinsic(source: Source, size: int) -> npt.NDArray[np.float64]:
     angle = (np.arctan2(dy, dx) - source.theta) % (2 * np.pi)
     shape = ring * (angle < source.span)
     return shape
+
+
+def _blobs(
+    source: Source, dx: npt.NDArray[np.float64], dy: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    """Equal round Gaussians on a line through the centre, along theta.
+
+    A point is one a quarter pixel wide, and diffuse is one of half the radius, so
+    the same flux spreads out to a low surface brightness. A chain galaxy gets 3 to 6
+    knots a pixel wide over twice the radius, and a pair is two points 2 to 5 pixels
+    apart, with the span setting the count or the gap.
+
+    Returns:
+        A (size, size) map.
+    """
+    # The span is drawn from 60 to 140 degrees, so this runs from 0 to 1.
+    t = float(np.clip((np.rad2deg(source.span) - 60) / 80, 0, 1))
+    n, length, sigma = {
+        "point": (1, 0.0, 0.25),
+        "diffuse": (1, 0.0, source.radius / 2),
+        "pair": (2, 2 + 3 * t, 0.25),
+        "clumps": (3 + round(3 * t), 2 * source.radius, 1.0),
+    }[source.kind]
+    out = np.zeros_like(dx)
+    for u in np.linspace(-length / 2, length / 2, n):
+        kx, ky = u * np.cos(source.theta), u * np.sin(source.theta)
+        out += np.exp(-((dx - kx) ** 2 + (dy - ky) ** 2) / (2 * sigma**2))
+    return out
 
 
 @functools.cache
@@ -292,6 +322,19 @@ def ranks_of(scores: dict[str, float]) -> dict[str, int]:
     return {k: i + 1 for i, k in enumerate(order)}
 
 
+def null_ranks(scores: dict[str, float], planted: set[str]) -> dict[str, int]:
+    """Rank each planted tile among the tiles nothing was planted in.
+
+    A null rank of 1 means it scored above every ordinary tile, so other planted
+    tiles don't push it down.
+
+    Returns:
+        Each planted tile's rank, starting at 1.
+    """
+    rest = {k: v for k, v in scores.items() if k not in planted}
+    return {t: ranks_of({**rest, t: scores[t]})[t] for t in planted}
+
+
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """95% Wilson score interval for k successes in n, which behaves at 0 and n.
 
@@ -314,12 +357,13 @@ def summarise(rows: list[dict[str, Any]], n_tiles: int) -> list[dict[str, Any]]:
         kind together.
     """
     top = max(1, round(TOP_SHARE * n_tiles))
-    groups: dict[tuple[str, str, float], list[int]] = {}
+    groups: dict[tuple[str, str, float], list[dict[str, Any]]] = {}
     for r in rows:
         for kind in (r["kind"], "all"):
-            groups.setdefault((r["detector"], kind, r["mag"]), []).append(r["rank"])
+            groups.setdefault((r["detector"], kind, r["mag"]), []).append(r)
     out: list[dict[str, Any]] = []
-    for (det, kind, mag), ranks in sorted(groups.items()):
+    for (det, kind, mag), group in sorted(groups.items()):
+        ranks = [r["rank"] for r in group]
         found = sum(r <= top for r in ranks)
         lo, hi = wilson(found, len(ranks))
         out.append({
@@ -332,18 +376,25 @@ def summarise(rows: list[dict[str, Any]], n_tiles: int) -> list[dict[str, Any]]:
             "recall_lo": lo,
             "recall_hi": hi,
             "median_rank": float(np.median(ranks)),
+            # Last, as readers of older files index the columns.
+            "beats_all": sum(r.get("null_rank") == 1 for r in group),
         })
     return out
 
 
-def m50(summary: list[dict[str, Any]], detector: str, kind: str) -> float | None:
+def m50(
+    summary: list[dict[str, Any]], detector: str, kind: str, *, key: str = "recall"
+) -> float | None:
     """Find the magnitude where recall falls through 50%, interpolated.
+
+    With key recall_lo or recall_hi, it's where that end of the 95% interval
+    crosses, which brackets m50.
 
     Returns:
         That magnitude, or None if recall never falls through 50%.
     """
     pts = sorted(
-        (s["mag"], s["recall"])
+        (s["mag"], s[key])
         for s in summary
         if (s["detector"], s["kind"]) == (detector, kind)
     )
@@ -415,7 +466,7 @@ def plot(summary: list[dict[str, Any]], path: Path, n_tiles: int) -> None:
     import matplotlib.pyplot as plt  # noqa: PLC0415 matplotlib is slow to load
 
     detectors = [d for d in DETECTORS if any(s["detector"] == d for s in summary)]
-    kinds = [k for k in KINDS if any(s["kind"] == k for s in summary)]
+    kinds = [k for k in (*KINDS, *HELD_OUT) if any(s["kind"] == k for s in summary)]
     fig, axes = plt.subplots(
         1, len(kinds), figsize=(3.1 * len(kinds), 3.3), sharey=True, dpi=160
     )
@@ -596,7 +647,9 @@ def _parser() -> argparse.ArgumentParser:
         "--seeds", type=int, default=3, help="Independent placements per magnitude."
     )
     ap.add_argument("--n_inject", type=int, default=12, help="Sources planted per run.")
-    ap.add_argument("--kinds", nargs="+", default=list(KINDS), choices=KINDS)
+    ap.add_argument(
+        "--kinds", nargs="+", default=list(KINDS), choices=(*KINDS, *HELD_OUT)
+    )
     ap.add_argument(
         "--detectors", nargs="+", default=list(DETECTORS), choices=list(DETECTORS)
     )
@@ -719,7 +772,9 @@ def _run_planted(
                 *bench.runner_args,
             ]
         )  # fmt: skip
-        rank = ranks_of(read_measurements(run_dir / det / "measurements_final.csv"))
+        scores = read_measurements(run_dir / det / "measurements_final.csv")
+        rank = ranks_of(scores)
+        null = null_ranks(scores, {s.tile for s in sources})
         rows.extend(
             {
                 "seed": seed,
@@ -729,6 +784,7 @@ def _run_planted(
                 "kind": s.kind,
                 "sed": s.sed,
                 "rank": rank[s.tile],
+                "null_rank": null[s.tile],
             }
             for s in sources
         )
