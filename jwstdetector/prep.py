@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import gc
 import json
 import logging
@@ -132,6 +132,66 @@ def measure_mosaic(data: Array, p_lo: float, p_hi: float) -> MosaicStats:
     if hi <= lo:
         lo, hi = float(sample.min()), float(sample.max()) + 1e-6
     return MosaicStats(sky=sky, sigma=sigma, lo=lo, hi=hi)
+
+
+def survey_levels(datasets: Sequence[Path]) -> dict[str, Any]:
+    """Take the median stretch range of each filter over the mosaics prep cut.
+
+    A per-mosaic percentile follows whatever is brightest in the mosaic, so one
+    bright star can push a filter's range several times above the other visits' and
+    render the whole visit darker. Measured over many visits the median doesn't move.
+
+    Returns:
+        The levels file's contents, a range per filter with how many mosaics it saw.
+
+    Raises:
+        SystemExit: If no mosaic in `datasets` has a Lupton render record.
+    """
+    ranges: dict[str, list[float]] = {}
+    for root in datasets:
+        for path in sorted(Path(root).glob("mosaics/*.json")):
+            info = json.loads(path.read_text(encoding="utf-8"))
+            render = info.get("render") or {}
+            if render.get("kind") != "lupton":
+                continue
+            for filt, v in zip(info["filters"], render["levels"], strict=True):
+                ranges.setdefault(str(filt or "").upper(), []).append(
+                    v["hi"] - v["sky"]
+                )
+    if not ranges:
+        msg = f"No mosaic under {', '.join(map(str, datasets))} was cut in colour."
+        raise SystemExit(msg)
+    return {
+        "range": {f: float(np.median(r)) for f, r in ranges.items()},
+        "mosaics": {f: len(r) for f, r in ranges.items()},
+    }
+
+
+def read_levels(path: Path, filt: str) -> float:
+    """Read one filter's range from a file `survey_levels` wrote.
+
+    Returns:
+        The range above the sky, in the mosaic's flux units.
+
+    Raises:
+        SystemExit: If the file has no range for `filt`.
+    """
+    ranges: dict[str, float] = json.loads(path.read_text(encoding="utf-8"))["range"]
+    key = filt.upper()
+    if key not in ranges:
+        msg = f"{path} has no range for {filt or 'this file'}, only {sorted(ranges)}."
+        raise SystemExit(msg)
+    return ranges[key]
+
+
+def levels_main(argv: list[str] | None = None) -> None:
+    """Write one stretch range per filter, measured over datasets prep already cut."""
+    p = argparse.ArgumentParser(prog="jwstdetector levels")
+    p.add_argument("datasets", nargs="+", type=Path, help="Folders prep wrote.")
+    p.add_argument("--out", type=Path, required=True, help="The levels file.")
+    args = p.parse_args(argv)
+    levels = survey_levels(args.datasets)
+    args.out.write_text(json.dumps(levels, indent=1) + "\n", encoding="utf-8")
 
 
 def asinh_to_uint8(
@@ -1012,7 +1072,11 @@ class _Layers:
     levels: list[MosaicStats] = field(default_factory=list)
     infos: list[dict[str, Any]] = field(default_factory=list)
 
-    def add(self, f: _File, info: dict[str, Any]) -> None:
+    def add(self, f: _File, info: dict[str, Any], levels: Path | None) -> None:
+        if levels is not None:
+            # The sky stays per mosaic and only the range is shared.
+            hi = f.level.sky + read_levels(levels, str(info["filter"] or ""))
+            f.level = replace(f.level, hi=hi)
         self.levels.append(f.level)
         self.infos.append(info)
         self.planes.append(f.data)
@@ -1150,7 +1214,8 @@ class NircamSensor(Sensor):
         target = celestial_wcs(f.headers[1], path, required=args.wcs_in_name)
         args.bunit = f.headers[1].get("BUNIT")
         layers = _Layers(signal=np.asarray(f.data), target=target, headers=f.headers)
-        layers.add(f, plane_info(f.headers, path, own=target, target=target, filt=filt))
+        info = plane_info(f.headers, path, own=target, target=target, filt=filt)
+        layers.add(f, info, args.levels)
         return layers
 
     def _next_plane(
@@ -1182,7 +1247,7 @@ class NircamSensor(Sensor):
                     np.asarray(f.wht), own, target=layers.target, shape=shape
                 )
         info = plane_info(f.headers, path, own=own, target=layers.target, filt=filt)
-        layers.add(f, info)
+        layers.add(f, info, args.levels)
 
     @override
     def process_one_mosaic(
@@ -1199,6 +1264,10 @@ class NircamSensor(Sensor):
             layers = self._first_plane(args, stack, path=first_path, filt=first_filt)
             for filt, path in rest:
                 self._next_plane(args, stack, layers, path=path, filt=filt)
+            if args.levels is not None and len(layers.planes) != _RGB_PLANES:
+                # A grey mosaic's tiles take their stretch from _Cutter, not these.
+                msg = f"--levels is for colour mosaics, and {spec.tile_id} is grey"
+                raise SystemExit(msg)
             mosaic = Mosaic(
                 spec.tile_id,
                 layers.signal,
@@ -1565,6 +1634,14 @@ def build_parser() -> argparse.ArgumentParser:
         "per tile.",
     )
     p.add_argument(
+        "--levels",
+        type=Path,
+        default=None,
+        help="Use one stretch range per filter for every mosaic, from a file "
+        "`jwstdetector levels` wrote, so all the visits of a survey look alike. "
+        "Colour mosaics only.",
+    )
+    p.add_argument(
         "--p_lo",
         "--plo",
         dest="p_lo",
@@ -1653,6 +1730,13 @@ def _check_args(args: argparse.Namespace) -> None:
         raise SystemExit(msg)
     if args.asinh_q <= 0:
         msg = f"--asinh_q has to be above 0, got {args.asinh_q}"
+        raise SystemExit(msg)
+    if args.levels is not None and args.stretch_scope != "mosaic":
+        msg = "--levels replaces the stretch of each mosaic, so it needs "
+        msg += "--stretch_scope mosaic"
+        raise SystemExit(msg)
+    if args.levels is not None and not args.levels.is_file():
+        msg = f"There is no levels file at {args.levels}"
         raise SystemExit(msg)
     if args.sensor != "fits" and not args.indir:
         msg = f"--sensor {args.sensor} needs --indir"

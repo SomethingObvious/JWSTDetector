@@ -15,6 +15,11 @@ COMMANDS = {
         "run",
         "Cut FITS mosaics into tiles and FITS cutouts.",
     ),
+    "levels": (
+        "jwstdetector.prep",
+        "levels_main",
+        "Measure one stretch per filter over datasets already cut.",
+    ),
     "run": (
         "jwstdetector.bootstrap",
         "main",

@@ -57,6 +57,17 @@ jwstdetector prep --sensor miri --indir rawfits --out datasets/miri --pattern "*
   --source_sigma 5 --min_source_frac 2e-4 --stretch_scope mosaic --wcs_in_name --save_cutouts
 ```
 
+### One Stretch for a Survey
+
+Each mosaic's colour stretch comes from its own 99.8th percentile, which is fine for one field but not for a survey. A bright star in one visit pushes that percentile up and the whole visit comes out darker than the rest, and in COSMOS-Web that one visit made most of the strangest tiles the search had to beat ([search.md](search.md#the-result)). `jwstdetector levels` takes the median range of each filter over datasets prep already cut, and `--levels` gives every mosaic that range above its own sky.
+
+```
+jwstdetector levels datasets/cosmosweb/* --out levels.json
+jwstdetector prep --sensor nircam ... --levels levels.json
+```
+
+The median needs a fair number of visits to settle, so the usual way is to cut the first batch of a survey with its own stretch, write the levels from them, and cut everything again with the file. It's for colour mosaics only. Visits of quite different depth (like a deep field and a shallow one in the same programme) probably want a file each, since the noise sits at a different place in the same range.
+
 ### Choosing the Thresholds
 
 A tile is kept when all of it is covered (`--min_wht_frac`) and enough of it sits `--source_sigma` above the noise (`--min_source_frac`). Both are measured against each mosaic's own sky level and noise, so the same values work across units and depths. `--dry-run` cuts and filters without writing anything, which is the quick way to see what a threshold keeps.

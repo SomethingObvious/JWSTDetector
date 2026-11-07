@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import io
 import json
 from pathlib import Path
@@ -410,6 +411,98 @@ def test_nircam_colour_tiles_match_the_whole_mosaic() -> None:
                 assert np.array_equal(
                     np.asarray(img), whole[y : y + 100, x : x + 100][::-1]
                 )
+
+
+_FILTERS = ("f444w", "f277w", "f150w")
+
+
+def _three_visits(raw: Path) -> dict[str, list[npt.NDArray[np.float32]]]:
+    # Three colour visits, the last with a bright star that takes 2% of its pixels.
+    raw.mkdir()
+    planes: dict[str, list[npt.NDArray[np.float32]]] = {}
+    for i, tile in enumerate(("A1", "A2", "A3")):
+        planes[tile] = [
+            np.abs(_sky_with_sources(100, 200, peak=20.0 + 5 * i, seed=10 * i + s))
+            for s in (1, 2, 3)
+        ]
+        for filt, plane in zip(_FILTERS, planes[tile], strict=True):
+            if tile == "A3":
+                plane[20:40, 20:40] += 400.0
+            name = f"mosaic_nircam_{filt}_COSMOS-Web_60mas_{tile}_v1.0_i2d.fits"
+            fits.HDUList([
+                fits.PrimaryHDU(),
+                fits.ImageHDU(plane, name="SCI"),
+            ]).writeto(raw / name)
+    return planes
+
+
+def _nircam_args(raw: Path) -> list[str]:
+    return [
+        "--sensor", "nircam", "--indir", str(raw), "--tile_size", "100",
+        "--upscale", "1", "--stride", "100", "--min_wht_frac", "0",
+    ]  # fmt: skip
+
+
+def test_levels_give_every_visit_the_survey_stretch() -> None:
+    # The star pushes A3's percentile range up, and with --levels A3 gets the median
+    # range of the three visits while keeping its own sky.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        planes = _three_visits(tmp / "raw")
+        common = _nircam_args(tmp / "raw")
+
+        prep.run([*common, "--out", str(tmp / "own")])
+        prep.levels_main([str(tmp / "own"), "--out", str(tmp / "levels.json")])
+        prep.run([
+            *common,
+            "--out",
+            str(tmp / "survey"),
+            "--levels",
+            str(tmp / "levels.json"),
+        ])
+
+        own = {t: [measure_mosaic(p, 1.0, 99.8) for p in planes[t]] for t in planes}
+        written = json.loads((tmp / "levels.json").read_text(encoding="utf-8"))
+        assert written["mosaics"] == {"F444W": 3, "F277W": 3, "F150W": 3}
+        for k, filt in enumerate(_FILTERS):
+            ranges = sorted(own[t][k].hi - own[t][k].sky for t in own)
+            assert own["A3"][k].hi - own["A3"][k].sky == ranges[2]
+            assert written["range"][filt.upper()] == pytest.approx(ranges[1])
+
+        record = json.loads(
+            (tmp / "survey/mosaics/A3.json").read_text(encoding="utf-8")
+        )
+        shared = [
+            replace(v, hi=v.sky + written["range"][f.upper()])
+            for v, f in zip(own["A3"], _FILTERS, strict=True)
+        ]
+        assert record["render"]["levels"] == [
+            {"sky": v.sky, "hi": v.hi} for v in shared
+        ]
+        whole = prep.lupton(
+            argparse.Namespace(stretch=0.05, Q=10.0), planes["A3"], shared
+        )
+        pngs = sorted((tmp / "survey/query").glob("A3_*.png"))
+        assert len(pngs) == 2
+        for png in pngs:
+            x, y = _tile_origin(png.name)
+            with Image.open(png) as img:
+                assert np.array_equal(
+                    np.asarray(img), whole[y : y + 100, x : x + 100][::-1]
+                )
+
+
+def test_levels_refuse_a_per_tile_stretch_and_a_missing_filter() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _three_visits(tmp / "raw")
+        levels = tmp / "levels.json"
+        levels.write_text(json.dumps({"range": {"F444W": 1.0}}), encoding="utf-8")
+        common = [*_nircam_args(tmp / "raw"), "--levels", str(levels)]
+        with pytest.raises(SystemExit, match="needs --stretch_scope mosaic"):
+            prep.run([*common, "--out", str(tmp / "a"), "--stretch_scope", "tile"])
+        with pytest.raises(SystemExit, match="has no range for F277W"):
+            prep.run([*common, "--out", str(tmp / "b")])
 
 
 def test_cutout_pixels_and_wcs_match_the_mosaic() -> None:
