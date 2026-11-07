@@ -79,6 +79,8 @@ The other measure in selection.md asks whether the search itself would have name
 
 None of them was found, at any magnitude, for any shape. The brightest planted sources still had plenty of calibration tiles above them. With seed 0, where the bench's bank is exactly the search's (every unplanted tile scores the same in both), the best of the 24 sources planted at AB 22 was a ring with 64 calibration tiles at or above it, and the other rings and streaks had 70 to 515. A tile needs at most one above it. So the search's completeness is zero for every shape here, and what limits it is the few dozen most unusual calibration tiles, not how the detector ranks tiles within a visit.
 
+Most of those come from one visit whose stretch a bright star threw off ([search.md](search.md#the-result) has the details). Leaving it out of the calibration afterwards, which is a check and not a result, the search would have named 15 of 27 rings at AB 22, 16 at 23, 12 at 24 and 4 at 25, plus 6 streaks in all over AB 22 to 24, and still nothing of the other five shapes.
+
 ## What This Doesn't Show
 
 Every source is synthetic, and each goes into one tile only, though in the sky the tiles that overlap it would see part of it too. Nothing here is a real, labelled class of rare object. The gain is in shapes that already stood out (bright arcs and streaks), and at AB 25 G is a little worse on rings and streaks. The 10 confirmation visits were also used to choose between F and G (with alpha split between them) and then again for the held-out shapes, but never with those shapes. And the bank is a random million of its visits' 2.85 million patches, so a different seed moves a few tiles' scores by up to 0.06.
