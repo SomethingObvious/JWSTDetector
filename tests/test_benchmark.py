@@ -32,7 +32,7 @@ def _band(micron: float | None = 2.0) -> dict[str, Any]:
 
 
 def test_shapes_stay_inside_the_tile() -> None:
-    for kind in benchmark.KINDS:
+    for kind in (*benchmark.KINDS, *benchmark.HELD_OUT):
         img = benchmark.intrinsic(_source(kind), SIZE)
         assert img.shape == (SIZE, SIZE)
         assert np.max(img) > 0.5
@@ -41,6 +41,34 @@ def test_shapes_stay_inside_the_tile() -> None:
     arc = benchmark.intrinsic(_source("arc"), SIZE).sum()
     # A 2 radian arc is about a third of the ring.
     assert abs(arc / ring - 2 / (2 * math.pi)) < 0.05
+
+
+def _peaks(img: np.ndarray) -> list[tuple[int, int]]:
+    """Find the pixels above half the maximum that beat their eight neighbours.
+
+    Returns:
+        Each peak's row and column.
+    """
+    pad = np.pad(img, 1)
+    out = []
+    for y, x in zip(*np.nonzero(img > 0.5 * img.max()), strict=True):
+        around = pad[y : y + 3, x : x + 3]
+        if img[y, x] == around.max():
+            out.append((int(y), int(x)))
+    return out
+
+
+def test_held_out_shapes() -> None:
+    # A span of 2 radians sits 0.68 of the way from 60 to 140 degrees, which gives
+    # 3 + round(2.05) = 5 knots and a pair 2 + 2.05 pixels apart.
+    assert len(_peaks(benchmark.intrinsic(_source("clumps"), SIZE))) == 5
+    pair = _peaks(benchmark.intrinsic(_source("pair"), SIZE))
+    assert len(pair) == 2
+    (y1, x1), (y2, x2) = pair
+    assert abs(math.hypot(y1 - y2, x1 - x2) - 4.05) < 1
+    diffuse = benchmark.intrinsic(_source("diffuse"), SIZE)
+    # A Gaussian of sigma 4.5 has 2 pi sigma^2 of volume for a peak of 1.
+    assert abs(diffuse.sum() / (2 * math.pi * 4.5**2) - 1) < 0.01
 
 
 def test_planted_flux_matches_the_magnitude() -> None:
@@ -86,6 +114,16 @@ def test_ranks_put_nan_last() -> None:
     }
 
 
+def test_null_ranks_ignore_other_planted_tiles() -> None:
+    scores = {"a": 5.0, "b": 4.0, "p1": 3.0, "c": 2.0, "p2": 6.0, "p3": float("nan")}
+    # p2 sits above p1's way, but only the unplanted a and b beat p1.
+    assert benchmark.null_ranks(scores, {"p1", "p2", "p3"}) == {
+        "p1": 3,
+        "p2": 1,
+        "p3": 4,
+    }
+
+
 def test_wilson_interval() -> None:
     lo, hi = benchmark.wilson(0, 10)
     assert lo == 0.0
@@ -114,6 +152,17 @@ def test_summary_and_m50() -> None:
     # Recall is exactly 0.5 at AB 25 and drops after it, so that's where it crosses.
     assert benchmark.m50(summary, "knn", "point") == 25.0
     assert benchmark.m50(summary, "pixels", "point") is None
+    # The interval's low end is under 0.5 at AB 25, so it crosses between 24 and 25.
+    lo = benchmark.m50(summary, "knn", "point", key="recall_lo")
+    assert lo is not None
+    assert 24 < lo < 25
+    # Without null ranks nothing counts as beating every ordinary tile.
+    assert {s["beats_all"] for s in summary} == {0}
+    strict = benchmark.summarise(
+        [{**r, "null_rank": 1 if r["rank"] == 1 else 2} for r in rows], 100
+    )
+    assert [s["beats_all"] for s in strict if s["kind"] == "point"] == [1, 1, 0]
+    assert list(strict[0])[-1] == "beats_all"
 
 
 def test_check_dataset_refuses_what_it_cannot_plant(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@ There is no labelled set of JWST anomalies to score against, so there are two ch
 
 ## What Is Planted
 
-Each run picks 12 tiles and adds one source to each, three points, three arcs, three rings and three streaks. The arcs, rings and streaks are half a pixel wide before the PSF, like a thin lensed arc or a satellite trail, and a ring or arc has a radius of 6 to 15% of the tile. A source gets a flat, red or blue spectrum ($f_\nu \propto \lambda^{\beta}$ with $\beta$ of 0, 2 or -2) and a total AB magnitude, which is its flux inside the tile at the filters' geometric mean wavelength.
+Each run picks 12 tiles and adds one source to each, three points, three arcs, three rings and three streaks. The arcs, rings and streaks are half a pixel wide before the PSF, like a thin lensed arc or a satellite trail, and a ring or arc has a radius of 6 to 15% of the tile. A source gets a flat, red or blue spectrum ($f_\nu \propto \lambda^{\beta}$ with $\beta$ of 0, 2 or -2) and a total AB magnitude, which is its flux inside the tile at the filters' geometric mean wavelength. `--kinds clumps diffuse pair` plants three shapes no setting has been chosen on instead, a chain of 3 to 6 knots, one wide faint blob, and two points 2 to 5 pixels apart, in the same tiles and places a seed gives the other four.
 
 The source goes into the tile's float FITS cutout, in the mosaic's own units (MJy/sr here, from `BUNIT`), blurred by each filter's PSF. For JWST that's STPSF's model of the filter on its detector, distortion included, turned to the mosaic's position angle. Laid over stars in SMACS 0723 and Abell 370, the model's spikes line up with theirs. Other telescopes get a Gaussian of the diffraction-limited width, and `--psf gaussian` forces that. The tile is then rendered back to its PNG with the exact stretch and noise weighting prep used, which reproduces every unplanted tile bit for bit. A seed fixes the tiles, shapes, positions and colours for every magnitude, so the curves differ by brightness alone. There are 5 seeds, so each point below is 15 sources of a kind, with a 95% Wilson interval.
 
@@ -82,7 +82,7 @@ jwstdetector bench --data_root datasets/smacs_nircam --out_dir bench --mags 22 2
 jwstdetector recall results_smacs datasets/smacs_nircam --objects lensed.csv --centre 110.8270 -73.4541
 ```
 
-The bench writes `injections.csv` with every planted source's rank, `summary.csv` with recall and its interval per detector, kind and magnitude, and `completeness.png`. The 140 runs here took 42 minutes on a laptop RTX 4070, as each embeds only the tiles that changed. STPSF comes with `pip install -e .[webb]` and needs its data files, which its documentation explains how to fetch.
+The bench writes `injections.csv` with every planted source's rank, and its null rank among the tiles nothing was planted in, where 1 means it beat every ordinary tile, `summary.csv` with recall and its interval per detector, kind and magnitude and how many beat every ordinary tile, and `completeness.png`. The 140 runs here took 42 minutes on a laptop RTX 4070, as each embeds only the tiles that changed. STPSF comes with `pip install -e .[webb]` and needs its data files, which its documentation explains how to fetch.
 
 ## References
 
