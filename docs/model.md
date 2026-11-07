@@ -71,8 +71,14 @@ COSMOS-Web isn't UDS, so both models were also benched on two COSMOS-Web calibra
 | Streak | 86/210 | 98/210 | 24.36 (23.96 to 24.71) | 24.50 (24.13 to 24.87) | 53/210 | 64/210 |
 | All | 264/840 | 296/840 | 24.13 (23.39 to 24.46) | 24.31 (24.01 to 24.59) | 160/840 | 184/840 |
 
-On the three held-out shapes, the default found 48 of 840 and G 61, with 42 or so expected by chance, and 0 and 2 above every ordinary tile. The other measure in selection.md, whether the search itself would name a planted tile, needs the search's scores, so it gets added here after the search's verdict.
+On the three held-out shapes, the default found 48 of 840 and G 61, with 42 or so expected by chance, and 0 and 2 above every ordinary tile.
+
+### Found by the Search
+
+The other measure in selection.md asks whether the search itself would have named a planted source. Each planted tile from G's benches on the two visits gets a conformal p against the search's kept calibration tiles, leaving out its own visit's, and it counts as found if that p is at or below 0.1 / 1,345, which is what BH needs to name one tile alone. Only tiles the overlap and star rules keep are counted, 206 a magnitude over all seven shapes and 5 seeds.
+
+None of them was found, at any magnitude, for any shape. The brightest planted sources still had plenty of calibration tiles above them. With seed 0, where the bench's bank is exactly the search's (every unplanted tile scores the same in both), the best of the 24 sources planted at AB 22 was a ring with 64 calibration tiles at or above it, and the other rings and streaks had 70 to 515. A tile needs at most one above it. So the search's completeness is zero for every shape here, and what limits it is the few dozen most unusual calibration tiles, not how the detector ranks tiles within a visit.
 
 ## What This Doesn't Show
 
-Every source is synthetic, and each goes into one tile only, though in the sky the tiles that overlap it would see part of it too. Nothing here is a real, labelled class of rare object. The gain is in shapes that already stood out (bright arcs and streaks), and at AB 25 G is a little worse on rings and streaks. The 10 confirmation visits were also used to choose between F and G (with alpha split between them) and then again for the held-out shapes, but never with those shapes.
+Every source is synthetic, and each goes into one tile only, though in the sky the tiles that overlap it would see part of it too. Nothing here is a real, labelled class of rare object. The gain is in shapes that already stood out (bright arcs and streaks), and at AB 25 G is a little worse on rings and streaks. The 10 confirmation visits were also used to choose between F and G (with alpha split between them) and then again for the held-out shapes, but never with those shapes. And the bank is a random million of its visits' 2.85 million patches, so a different seed moves a few tiles' scores by up to 0.06.

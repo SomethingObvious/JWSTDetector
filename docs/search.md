@@ -46,6 +46,14 @@ jwstdetector prep --sensor nircam --rgb_filters f444w f277w f150w --tile_size 32
 
 and the search and the first 60 visits also with `--save_cutouts`, for looking at what's found.
 
+## The Result
+
+Every visit was scored on 2026-11-07 with the model in [model.md](model.md), and `results_cosmosweb/verdict.json` has the numbers. After the overlap and star rules, 1,345 search tiles were tested against 39,298 calibration tiles (3,048 tiles were dropped as overlaps and 6,355 as near a bright star). The rehearsal passed, with 2.8% of its 1,000 draws getting any detection, and nothing in the search reached $q \le 0.1$. The lowest p of a search tile was 0.0018, so 70 or so calibration tiles scored above it, where naming a tile on its own needed $7.4 \times 10^{-5}$ (at most one calibration tile above it). Every q came out at 0.70. As far as this detector can tell, the four search visits hold nothing stranger than the 134 calibration visits do.
+
+How far it can tell is the catch. Planted into two calibration visits, none of the 1,442 sources the rules kept would have been named, not even rings at AB 22 that score above every other tile in their own visit, as 60 to 500 calibration tiles score higher than those (the numbers are in [model.md](model.md#found-by-the-search)). So this says the search tiles aren't stranger than the strangest few dozen calibration tiles, and not much more. What those tiles are is the next thing to look at.
+
+The bank is also a random sample. Its 10 visits have about 2.85 million patches and the bank keeps 1 million, so the draw depends on the seed, and a different seed moves a few tiles' scores by up to 0.06 while most don't move at all. The search used seed 0 only.
+
 ## References
 
 - Bates, Candès, Lei, Romano, Sesia. Testing for Outliers with Conformal p-values. Annals of Statistics 51, 149, 2023.
