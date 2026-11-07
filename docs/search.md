@@ -26,7 +26,7 @@ The kNN bank is the 10 bank visits, scored with `--reference_roots` and `--no-ca
 
 ## The Model
 
-The search uses DINOv3 ViT-L SAT unless one of two changes beats it on the PRIMER-UDS bench, which never touches COSMOS-Web. The changes are a fine-tune on COSMOS-Web tiles (its step picked on SMACS 0723), and subtracting each grid cell's mean patch feature (the input-independent position term of Yang et al. 2024). A change wins if it puts more planted sources in the top 5% over AB 22 to 28 than the default, in total and on at least 4 of the 5 seeds. A winner is then rebuilt from the 10 bank visits alone, since a model that saw search or calibration tiles in training would treat them differently, and it has to win on the UDS bench again before it scores anything.
+The search uses a LoRA fine-tune of DINOv3 ViT-L SAT that makes the same sky give the same patch features in two overlapping tiles, and [model.md](model.md) has how it was trained and every result behind it. The first version of this section said the default would be used unless a change beat it on the UDS bench in total and on 4 of 5 seeds. The first fine-tune failed that on o008 (148 to 145), though it won on two other UDS visits, and that verdict stands. A separate and larger test on 10 UDS visits nobody had used was then written down before any of its benches ran, with alpha split between the tries it allowed, and [selection.md](selection.md) has it and every rule after it. All of that came before any COSMOS-Web tile was scored, but it is still a second try after a failure, which is worth keeping in mind when reading its p-value. The model that came out of it found more planted sources than the default on those 10 visits, with p = 0.0078 against the 0.0125 of alpha it had. The other condition here still holds as written. A model that saw search or calibration tiles in training would treat them differently, so it trained only on the 10 bank visits and four fields outside COSMOS-Web.
 
 ## The Rehearsal
 
@@ -50,4 +50,3 @@ and the search and the first 60 visits also with `--save_cutouts`, for looking a
 
 - Bates, Candès, Lei, Romano, Sesia. Testing for Outliers with Conformal p-values. Annals of Statistics 51, 149, 2023.
 - Dunn, Wasserman, Ramdas. Distribution-Free Prediction Sets for Two-Layer Hierarchical Models. Journal of the American Statistical Association, 2023.
-- Yang et al. Denoising Vision Transformers. ECCV 2024.

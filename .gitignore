@@ -30,6 +30,7 @@ datasets*/
 rawfits/*
 rawfits*/
 rawfits_miri*/
+models/
 results
 results*/
 paper_plots*/
