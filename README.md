@@ -22,6 +22,8 @@ These are ranks 2, 3, 11 and 12, as prep cut them. The top of kNN's ranking is l
 
 `jwstdetector recall` checks the 85 known lensed images in the field. Every detector ranks them above sky at the same distance from the cluster core more often than chance, kNN at 64 where 50 is chance, though no detector clearly beats the others there. [The benchmark page](docs/benchmark.md) has the design, the numbers, the backbones compared and the caveats, including why kNN finds faint arcs more often than bright ones.
 
+A LoRA fine-tune trained so the same sky gives the same features wherever it falls in a tile finds 1,475 planted sources to the default's 1,359 on 10 PRIMER-UDS visits it never saw (p = 0.008 over visits), mostly bright arcs and streaks. [The model page](docs/model.md) has how it was trained and chosen, and where it doesn't help.
+
 ## How It Works
 
 The default detector scores each patch by its cosine distance to the nearest patch of a reference set, after [AnomalyDINO](https://github.com/dammsi/AnomalyDINO) (Damm et al., WACV 2025), and the other by its residual off a PCA subspace, after [SubspaceAD](https://arxiv.org/abs/2602.23013) (Lendering et al., 2026). With no labels, the reference comes from the tiles themselves in two passes, and a tile is never compared with one it overlaps.

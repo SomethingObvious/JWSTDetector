@@ -57,6 +57,8 @@ jwstdetector = ["viewer_static/**/*"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+# The training script is kept exactly as it ran for the published weights.
+extend-exclude = ["training"]
 preview = true
 
 [tool.ruff.lint]
