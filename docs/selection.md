@@ -208,3 +208,48 @@ its 95% Wilson interval, and m50 with the range between where the interval's two
 cross 50%. It also says what this still can't show. The shapes are all synthetic. A
 source goes into one tile only, though in the sky the overlapping tiles would see
 part of it too. And nothing here is a real, labelled class of rare object.
+
+## After the COSMOS-Web Search
+
+Written 2026-11-07, before any of the runs below. MINERVA's search has its own plan in
+[minerva.md](minerva.md), and the AEGIS confirmation here picks the model it uses.
+
+## S, G With Stretch Jitter
+
+S is G's recipe exactly (same roots, 2,000 steps, batch 12, seed 0, flux noise 0.5) plus
+`--stretch 4`, so each view drawn from flux gets each filter's range scaled by its own
+log-uniform factor in [1/4, 4]. Steps 500, 1000 and 2000 are exported and the step is
+picked the way G's was, the most found on SMACS 0723.
+
+Dev check, reported and not tested: score jw01727-o165_t131 and six ordinary calibration
+visits with S against the same bank, and compare the ratio of o165's median score to the
+six visits' median with G's ratio from the search (0.2208 / 0.0644 = 3.43, the six being
+the first six calibration visits in the split after leaving out o165, o005 and o008). If
+S's ratio isn't 1.72 or less (half of G's), S is dropped and nothing else is run for it.
+If it is, S joins the MINERVA confirmation as a candidate.
+
+## The Model Confirmation on AEGIS
+
+MINERVA's 10 AEGIS visits (o024 to o033, all 1,890 s in F182M and 3,779 s in F250M and
+F460M) are one depth, so they're the confirmation set, and with 10 visits a search there
+could never name a lone tile anyway. The deep mosaics (o001 to o004) are for the search.
+Every tile is F460M, F250M and F182M as red, green and blue.
+
+- The 10 AEGIS visits and the two small UDS tiles (o050, o051) are cut with their own
+  stretch first, a levels file is written from all 12, and all 12 are cut again with
+  `--levels` and `--save_cutouts`. That's the only thing anyone looks at before the
+  benches, and it's the records, not the tiles.
+- M is G's recipe (noise 0.5, 2,000 steps, batch 12, seed 0) trained on the four control
+  fields plus o050 and o051, and it's step 2,000 with no step pick, since G's pick was
+  2,000 and SMACS has none of these filters.
+- Each AEGIS visit is benched in bank mode against the other 9, with 5 seeds, AB 22 to
+  28 and arcs, points, rings and streaks, the same as the PRIMER confirmation. The
+  default DINOv3 is benched too, for the record.
+- The candidates are S (only if it passed its dev check) and M, each against G. A
+  candidate passes if its total found beats G's with the exact one-sided sign-flip test
+  over the 10 visit differences at p <= 0.025 / (number of candidates). If more than one
+  passes, the higher total is adopted. If none does, G stays. The
+  above-every-ordinary-tile counts are reported and not tested.
+- AEGIS lies in the EGS, where CEERS is, and CEERS1 tiles are in every candidate's
+  training set, G's included. Any of those visits that shares sky with CEERS1 is said so
+  in the results.

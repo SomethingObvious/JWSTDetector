@@ -19,6 +19,11 @@ the stretch, with Gaussian noise of U(0, S) times its own sky sigma added to eac
 filter, the same way the bench renders a planted source. Each view gets its own draw,
 so the loss also pulls apart what the sky's noise pattern does to a feature.
 
+With `--stretch J`, each view of a tile drawn from flux also gets each filter's range
+above the sky multiplied by its own factor, log-uniform between 1/J and J. One bright
+star pushed a COSMOS-Web visit's range 4 to 12 times above the others', and every tile
+in it scored like an outlier, so this asks the features to not care about the stretch.
+
 The export folds the LoRA into an fp32 copy of the original weights, saved as a folder
 that `--model_name <folder>` loads.
 """
@@ -144,7 +149,8 @@ def cutouts(roots: list[Path]) -> dict[Path, tuple[Path, dict]]:
     return out
 
 
-def noisy(cutout: Path, render: dict, scale: float, rng: np.random.Generator) -> Image.Image:
+def noisy(cutout: Path, render: dict, scale: float, rng: np.random.Generator,
+          stretch: float = 1.0) -> Image.Image:
     from astropy.io import fits
 
     from jwstdetector.prep import equalise, render_cutout
@@ -159,16 +165,23 @@ def noisy(cutout: Path, render: dict, scale: float, rng: np.random.Generator) ->
         ok = np.isfinite(p) & (p != 0)
         sigma = scale * sky_sigma(p)
         out.append(np.where(ok, p + rng.normal(0, sigma, p.shape).astype(np.float32), p))
+    if stretch > 1 and render["kind"] == "lupton":
+        span = np.log(stretch)
+        levels = [{"sky": v["sky"], "hi": v["sky"] + (v["hi"] - v["sky"]) * float(np.exp(rng.uniform(-span, span)))}
+                  for v in render["levels"]]
+        render = {**render, "levels": levels}
     tile = render_cutout(out if len(out) > 1 else out[0], render, None)
     return Image.fromarray(tile)
 
 
 class Pairs(torch.utils.data.Dataset):
-    def __init__(self, pairs, mean, std, epoch: int, flux=None, noise: float = 0.0) -> None:
+    def __init__(self, pairs, mean, std, epoch: int, flux=None, noise: float = 0.0,
+                 stretch: float = 1.0) -> None:
         self.pairs, self.epoch = pairs, epoch
         self.mean = torch.tensor(mean).view(3, 1, 1)
         self.std = torch.tensor(std).view(3, 1, 1)
-        self.flux, self.noise = flux or {}, noise
+        self.flux, self.noise, self.stretch = flux or {}, noise, stretch
+        self.redraw = noise > 0 or stretch > 1
         # Only the control fields kept their cutouts, so half the draws come from them,
         # or the noise would reach about a quarter of the pairs.
         self.with_flux = [p for p in pairs if p[0] in self.flux and p[1] in self.flux]
@@ -178,9 +191,9 @@ class Pairs(torch.utils.data.Dataset):
         return self.epoch
 
     def view(self, path: Path) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.noise and path in self.flux:
+        if self.redraw and path in self.flux:
             rng = np.random.default_rng(random.getrandbits(64))
-            img = noisy(*self.flux[path], random.uniform(0, self.noise), rng).convert("RGB")
+            img = noisy(*self.flux[path], random.uniform(0, self.noise), rng, self.stretch).convert("RGB")
         else:
             img = Image.open(path).convert("RGB")
         img = img.resize((RES, RES), Image.Resampling.BICUBIC)
@@ -196,7 +209,7 @@ class Pairs(torch.utils.data.Dataset):
         return x, where
 
     def __getitem__(self, i: int):
-        if self.noise and self.with_flux and self.without:
+        if self.redraw and self.with_flux and self.without:
             a, b, direction = random.choice(self.with_flux if random.random() < 0.5 else self.without)
         else:
             a, b, direction = random.choice(self.pairs)
@@ -230,6 +243,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--noise", type=float, default=0.0)
+    ap.add_argument("--stretch", type=float, default=1.0)
     args = ap.parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -238,9 +252,10 @@ def main() -> None:
 
     pairs = [p for root in args.roots for p in pairs_of(root)]
     tiles = sorted({p for a, b, _ in pairs for p in (a, b)})
-    flux = cutouts(args.roots) if args.noise else {}
+    flux = cutouts(args.roots) if args.noise or args.stretch > 1 else {}
     print(f"{len(pairs)} pairs from {len(tiles)} tiles in {len(args.roots)} datasets, "
-          f"{sum(t in flux for t in tiles)} drawn from flux with noise up to {args.noise} sigma", flush=True)
+          f"{sum(t in flux for t in tiles)} drawn from flux with noise up to {args.noise} sigma "
+          f"and stretch within {args.stretch}x", flush=True)
 
     model, loras = build(args.rank, 2.0 * args.rank)
     model.cuda().train()
@@ -270,7 +285,8 @@ def main() -> None:
         tmp.replace(ckpt)
 
     pre = json.loads(Path(hf_hub_download(REPO, "preprocessor_config.json")).read_text(encoding="utf-8"))
-    data = Pairs(pairs, pre["image_mean"], pre["image_std"], (args.steps - done) * args.batch, flux, args.noise)
+    data = Pairs(pairs, pre["image_mean"], pre["image_std"], (args.steps - done) * args.batch, flux, args.noise,
+                 args.stretch)
     # A new seed after a resume, so the workers don't replay the draws they already made.
     loader = torch.utils.data.DataLoader(
         data, batch_size=args.batch, num_workers=args.workers, persistent_workers=args.workers > 0,

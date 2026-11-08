@@ -10,8 +10,10 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import sys
 from typing import TYPE_CHECKING, Any
 
@@ -59,6 +61,22 @@ def parse_key(key: str) -> tuple[int, int, float, float]:
     return int(m[1]), int(m[2]), float(m[3]), dec
 
 
+def mosaic_of(key: str) -> str:
+    """The mosaic a tile key was cut from, which is everything before its position.
+
+    Returns:
+        The mosaic's tile id.
+
+    Raises:
+        ValueError: If the key has no position in it.
+    """
+    m = _KEY.search(key)
+    if m is None:
+        msg = f"{key} has no _cx_cy_ra_dec_ position in it."
+        raise ValueError(msg)
+    return key[: m.start()]
+
+
 def check_owned(run_dir: Path) -> None:
     """Refuse a run that scored every patch, as its tiles would count shared sky twice.
 
@@ -74,26 +92,38 @@ def check_owned(run_dir: Path) -> None:
         raise ValueError(msg)
 
 
+@dataclass(frozen=True)
+class Tiles:
+    """Where a set of tiles sit, on the sky and in their mosaics."""
+
+    coords: SkyCoords
+    visit: npt.NDArray[np.str_]
+    mosaic: npt.NDArray[np.str_]
+    centre: npt.NDArray[np.int64]
+
+
 def overlaps_other_visit(
-    coords: SkyCoords,
-    visits: npt.NDArray[np.str_],
-    *,
-    every: SkyCoords,
-    every_visit: npt.NDArray[np.str_],
-    size_arcsec: float,
+    tiles: Tiles, every: Tiles, *, size_arcsec: float, size_px: int
 ) -> npt.NDArray[np.bool_]:
     """True for tiles that may share sky with a tile of another visit.
 
-    Visits sit at different position angles, so two tiles can only be apart when
-    their centres are a full diagonal apart.
+    Visits sit at different position angles, so two tiles from different mosaics can
+    only be apart when their centres are a full diagonal apart. Two from the same
+    mosaic share its grid, so they overlap only if their boxes do, which lets blocks
+    of one mosaic sit side by side.
 
     Returns:
-        One flag per tile in `coords`.
+        One flag per tile in `tiles`.
     """
     reach = size_arcsec * np.sqrt(2) * u.arcsec
-    near_idx, self_idx, _, _ = coords.search_around_sky(every, reach)
-    out = np.zeros(len(coords), dtype=bool)
-    out[self_idx[every_visit[near_idx] != visits[self_idx]]] = True
+    near_idx, self_idx, _, _ = tiles.coords.search_around_sky(every.coords, reach)
+    other = every.visit[near_idx] != tiles.visit[self_idx]
+    same_mosaic = every.mosaic[near_idx] == tiles.mosaic[self_idx]
+    apart = (
+        np.abs(every.centre[near_idx] - tiles.centre[self_idx]).max(axis=1) >= size_px
+    )
+    out = np.zeros(len(tiles.coords), dtype=bool)
+    out[self_idx[other & ~(same_mosaic & apart)]] = True
     return out
 
 
@@ -178,24 +208,40 @@ def read_stars(
     return SkyCoord(arr[:, 0], arr[:, 1], unit="deg"), arr[:, 2]
 
 
-def _sky_of_every_tile(
-    data: Path, visits: list[str]
-) -> tuple[SkyCoords, npt.NDArray[np.str_]]:
-    names, pos = [], []
-    for v in visits:
-        with (data / v / "manifest.csv").open(encoding="utf-8", newline="") as f:
+def tiles_of(keys: list[str], visits: list[str]) -> Tiles:
+    """Read where each tile sits from its key.
+
+    Returns:
+        The tiles, in the order given.
+    """
+    p = [parse_key(k) for k in keys]
+    return Tiles(
+        coords=SkyCoord([x[2] for x in p], [x[3] for x in p], unit="deg"),
+        visit=np.array(visits),
+        mosaic=np.array([mosaic_of(k) for k in keys]),
+        centre=np.array([x[:2] for x in p], dtype=np.int64).reshape(-1, 2),
+    )
+
+
+def _every_tile(data: Path, visits: list[str], training: list[Path]) -> Tiles:
+    # A training tile counts as another visit to every tile, so a tile on sky the
+    # model was trained on is dropped like one seen twice.
+    keys: list[str] = []
+    names: list[str] = []
+    roots = [(data / v, v) for v in visits] + [(t, "training") for t in training]
+    for root, name in roots:
+        with (root / "manifest.csv").open(encoding="utf-8", newline="") as f:
             for r in csv.DictReader(f):
-                names.append(v)
-                pos.append(parse_key(r["key"])[2:])
-    p = np.array(pos)
-    return SkyCoord(p[:, 0], p[:, 1], unit="deg"), np.array(names)
+                keys.append(r["key"])
+                names.append(name)
+    return tiles_of(keys, names)
 
 
 @dataclass(frozen=True)
 class _Rules:
     size_arcsec: float
-    every: SkyCoords
-    every_visit: npt.NDArray[np.str_]
+    size_px: int
+    every: Tiles
     stars: SkyCoords
     star_g: npt.NDArray[np.float64]
 
@@ -204,15 +250,11 @@ def _filter_visit(
     visit: str, scores: dict[str, float], rules: _Rules
 ) -> tuple[dict[str, float], dict[str, int]]:
     keys = sorted(scores)
-    p = np.array([parse_key(k) for k in keys])
-    c = SkyCoord(p[:, 2], p[:, 3], unit="deg")
+    tiles = tiles_of(keys, [visit] * len(keys))
     overlap = overlaps_other_visit(
-        c,
-        np.full(len(keys), visit),
-        every=rules.every,
-        every_visit=rules.every_visit,
-        size_arcsec=rules.size_arcsec,
+        tiles, rules.every, size_arcsec=rules.size_arcsec, size_px=rules.size_px
     )
+    c = tiles.coords
     star = near_bright_star(
         c, stars=rules.stars, star_g=rules.star_g, size_arcsec=rules.size_arcsec
     )
@@ -232,12 +274,13 @@ def _kept_tiles(
     every_visit = [*split["search"], *split["bank"], *split["calibration"]]
     mosaic = next((data / every_visit[0] / "mosaics").glob("*.json"))
     scale = float(json.loads(mosaic.read_text(encoding="utf-8"))["pixel_scale_arcsec"])
-    every, every_name = _sky_of_every_tile(data, every_visit)
-    stars, star_g = read_stars(stars_json, every)
+    training = [Path(t) for t in split.get("training_data", [])]
+    every = _every_tile(data, every_visit, training)
+    stars, star_g = read_stars(stars_json, every.coords)
     rules = _Rules(
         size_arcsec=int(split["tile_px"]) * scale,
+        size_px=int(split["tile_px"]),
         every=every,
-        every_visit=every_name,
         stars=stars,
         star_g=star_g,
     )
@@ -250,6 +293,72 @@ def _kept_tiles(
         for rule, n in counts.items():
             dropped[rule] += n
     return kept, dropped
+
+
+def cut_blocks(
+    dataset: Path, out: Path, *, block_px: int, min_tiles: int
+) -> dict[str, int]:
+    """Split a cut mosaic into square blocks that can stand in for visits.
+
+    A tile goes to a block only if all of it lies inside, so tiles of two blocks never
+    share a pixel and the tiles that straddle a border belong to none. The tiles,
+    cutouts and mosaic records are hard links, not copies.
+
+    Returns:
+        How many tiles each written block holds.
+    """
+    with (dataset / "manifest.csv").open(encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    blocks: dict[tuple[str, int, int], list[dict[str, str]]] = {}
+    for r in rows:
+        x0, y0, size = int(r["x0"]), int(r["y0"]), int(r["size"])
+        bx, by = x0 // block_px, y0 // block_px
+        if (x0 + size - 1) // block_px == bx and (y0 + size - 1) // block_px == by:
+            blocks.setdefault((r["mosaic"], by, bx), []).append(r)
+    written: dict[str, int] = {}
+    for (mosaic, by, bx), members in sorted(blocks.items()):
+        if len(members) < min_tiles:
+            continue
+        name = f"{mosaic}_b{by:02d}_{bx:02d}"
+        root = out / name
+        (root / "query").mkdir(parents=True)
+        shutil.copytree(dataset / "mosaics", root / "mosaics")
+        for r in members:
+            os.link(dataset / "query" / r["key"], root / "query" / r["key"])
+            if r.get("cutout"):
+                (root / r["cutout"]).parent.mkdir(exist_ok=True)
+                os.link(dataset / r["cutout"], root / r["cutout"])
+        with (root / "manifest.csv").open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(members)
+        written[name] = len(members)
+    return written
+
+
+def standardise(kept: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    """Put each visit's scores on its own median and MAD.
+
+    A visit rendered darker or brighter than the rest shifts every one of its scores,
+    and in COSMOS-Web one such visit made most of the calibration tail. Done the same
+    way for every visit, it keeps search and calibration visits exchangeable.
+
+    Returns:
+        The kept scores per visit, each as `(score - median) / (1.4826 * MAD)`.
+
+    Raises:
+        ValueError: If a visit's scores have no spread to divide by.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for v, scores in kept.items():
+        x = np.array(list(scores.values()))
+        med = float(np.median(x))
+        mad = 1.4826 * float(np.median(np.abs(x - med)))
+        if not mad > 0:
+            msg = f"{v}'s {x.size} kept scores have no spread to divide by"
+            raise ValueError(msg)
+        out[v] = {k: (s - med) / mad for k, s in scores.items()}
+    return out
 
 
 def _write_pvalues(
@@ -283,6 +392,8 @@ def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/s
     kept, dropped = _kept_tiles(
         split, stars_json=Path(argv[1]), data=Path(argv[2]), results=results
     )
+    if split.get("standardise"):
+        kept = standardise(kept)
 
     search = {k: x for v in split["search"] for k, x in kept[v].items()}
     cal = np.array([x for v in split["calibration"] for x in kept[v].values()])
