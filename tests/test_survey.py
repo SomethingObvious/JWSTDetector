@@ -127,6 +127,15 @@ def test_star_mask_grows_with_brightness() -> None:
     )
     # At G = 12 the reach is 14.1 + 1.5 * 10**1.4 = 51.8 arcsec, at 15.9 it's 20.3.
     assert (g16.tolist(), g12.tolist(), faint.tolist()) == ([False], [True], [False])
+    # A fainter cut-off masks the G = 17 star too, whose reach is 14.1 + 3.8 arcsec.
+    near = near_bright_star(
+        _sky((150.0, 2.0 + 15 / 3600)),
+        stars=_sky((150.0, 2.0)),
+        star_g=np.array([17.0]),
+        size_arcsec=20.0,
+        g_max=19.0,
+    )
+    assert near.tolist() == [True]
 
 
 def test_rehearsal_on_exchangeable_visits_stays_near_alpha() -> None:
@@ -173,5 +182,18 @@ def test_star_list_must_reach_past_every_tile(tmp_path: Path) -> None:
     stars.write_text(json.dumps(doc), encoding="utf-8")
     _, g = read_stars(stars, _sky((150.0, 2.5)))
     assert g.tolist() == [12.0]
-    with pytest.raises(ValueError, match=r"only lists stars out to 1.0 degrees"):
+    with pytest.raises(ValueError, match=r"0.3 degrees inside any cone"):
         read_stars(stars, _sky((150.0, 2.8)))
+
+
+def test_star_list_can_cover_two_fields(tmp_path: Path) -> None:
+    stars = tmp_path / "stars.json"
+    doc = {
+        "cones": [[150.0, 2.0, 1.0], [34.4, -5.2, 1.0]],
+        "rows": [[150.0, 2.0, 12.0], [34.4, -5.2, 14.0]],
+    }
+    stars.write_text(json.dumps(doc), encoding="utf-8")
+    _, g = read_stars(stars, _sky((150.0, 2.5), (34.4, -5.5)))
+    assert g.tolist() == [12.0, 14.0]
+    with pytest.raises(ValueError, match=r"at 34.4000 -6.0000 isn't"):
+        read_stars(stars, _sky((150.0, 2.5), (34.4, -6.0)))

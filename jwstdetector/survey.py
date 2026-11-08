@@ -133,13 +133,14 @@ def near_bright_star(
     stars: SkyCoords,
     star_g: npt.NDArray[np.float64],
     size_arcsec: float,
+    g_max: float = STAR_G_MAX,
 ) -> npt.NDArray[np.bool_]:
     """True for tiles within reach of a bright star's spikes.
 
     Returns:
         One flag per tile in `coords`.
     """
-    bright = star_g < STAR_G_MAX
+    bright = star_g < g_max
     out = np.zeros(len(coords), dtype=bool)
     if not bright.any():
         return out
@@ -186,22 +187,28 @@ def _read_scores(path: Path) -> dict[str, float]:
 def read_stars(
     path: Path, tiles: SkyCoords
 ) -> tuple[SkyCoords, npt.NDArray[np.float64]]:
-    """The bright-star list, after checking its cone covers every tile with margin.
+    """The bright-star list, after checking its cones cover every tile with margin.
+
+    The list has one cone (`centre` and `radius_deg`) or several (`cones`, each RA,
+    Dec and radius in degrees), for a survey of more than one field.
 
     Returns:
         The stars' positions and G magnitudes.
 
     Raises:
-        ValueError: If a tile is within STAR_MARGIN_DEG of the cone's edge.
+        ValueError: If a tile is within STAR_MARGIN_DEG of every cone's edge.
     """
     doc = json.loads(path.read_text(encoding="utf-8"))
-    centre = SkyCoord(*doc["centre"], unit="deg")
-    sep: Any = centre.separation(tiles)
-    furthest = float(np.max(np.asarray(sep.deg, dtype=np.float64)))
-    if furthest > float(doc["radius_deg"]) - STAR_MARGIN_DEG:
+    cones = doc.get("cones") or [[*doc["centre"], doc["radius_deg"]]]
+    inside = np.zeros(len(tiles), dtype=bool)
+    for ra, dec, radius in cones:
+        sep: Any = SkyCoord(ra, dec, unit="deg").separation(tiles)
+        inside |= np.asarray(sep.deg, dtype=np.float64) <= radius - STAR_MARGIN_DEG
+    if not inside.all():
+        worst = tiles[~inside][0]
         msg = (
-            f"A tile is {furthest:.3f} degrees from the centre of {path}, which only "
-            f"lists stars out to {doc['radius_deg']} degrees."
+            f"The tile at {worst.ra.deg:.4f} {worst.dec.deg:+.4f} isn't at least "
+            f"{STAR_MARGIN_DEG} degrees inside any cone of {path}."
         )
         raise ValueError(msg)
     arr = np.array(doc["rows"], dtype=np.float64).reshape(-1, 3)
@@ -244,6 +251,7 @@ class _Rules:
     every: Tiles
     stars: SkyCoords
     star_g: npt.NDArray[np.float64]
+    star_g_max: float
 
 
 def _filter_visit(
@@ -256,14 +264,18 @@ def _filter_visit(
     )
     c = tiles.coords
     star = near_bright_star(
-        c, stars=rules.stars, star_g=rules.star_g, size_arcsec=rules.size_arcsec
+        c,
+        stars=rules.stars,
+        star_g=rules.star_g,
+        size_arcsec=rules.size_arcsec,
+        g_max=rules.star_g_max,
     )
     keep = ~overlap & ~star
     counts = {"overlap": int(overlap.sum()), "star": int((~overlap & star).sum())}
     return {k: scores[k] for k, ok in zip(keys, keep, strict=True) if ok}, counts
 
 
-def _kept_tiles(
+def kept_tiles(
     split: dict[str, Any], *, stars_json: Path, data: Path, results: Path
 ) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
     """Apply the overlap and star rules to each search and calibration visit.
@@ -283,6 +295,7 @@ def _kept_tiles(
         every=every,
         stars=stars,
         star_g=star_g,
+        star_g_max=float(split.get("star_g_max", STAR_G_MAX)),
     )
     kept: dict[str, dict[str, float]] = {}
     dropped = {"overlap": 0, "star": 0}
@@ -389,7 +402,7 @@ def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/s
     split = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
     results = Path(argv[3])
     alpha = float(split["alpha"])
-    kept, dropped = _kept_tiles(
+    kept, dropped = kept_tiles(
         split, stars_json=Path(argv[1]), data=Path(argv[2]), results=results
     )
     if split.get("standardise"):
