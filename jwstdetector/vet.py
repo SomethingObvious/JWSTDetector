@@ -158,7 +158,12 @@ def _planes(path: Path) -> npt.NDArray[np.float64]:
     return planes
 
 
-def _catalogue_note(hot: SkyCoords) -> dict[str, str]:
+def catalogue_note(hot: SkyCoords) -> dict[str, str]:
+    """Look up what SIMBAD and NED have near a source.
+
+    Returns:
+        The nearest entry within MATCH_ARCSEC in each catalogue that has one.
+    """
     note: dict[str, str] = {}
     at = SkyCoord([hot.ra.deg], [hot.dec.deg], unit="deg")
     for cat in ("SIMBAD", "NED"):
@@ -259,7 +264,7 @@ def _write(args: argparse.Namespace, sources: list[Source], n_clean: int) -> Non
     cutouts = _cutouts(args.data, sorted({s.visit for s in sources}))
     rows = []
     for src in sources:
-        src.near = {} if args.no_catalogues else _catalogue_note(src.hot)
+        src.near = {} if args.no_catalogues else catalogue_note(src.hot)
         sheet = f"source{src.rank:03d}.png"
         _sheet(
             src,

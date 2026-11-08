@@ -20,6 +20,7 @@ dependencies = [
   "tqdm",
   "matplotlib",
   "pyvo",  # SIMBAD, NED and Gaia over TAP for `jwstdetector match`
+  "photutils",  # finds and measures sources for the colour search
   "scikit-learn",  # the isolation forest baseline in `jwstdetector bench`
   "typing_extensions",  # @override on Python 3.11
 ]
@@ -140,7 +141,7 @@ enable_error_code = [
 
 [[tool.mypy.overrides]]
 # No stubs ship for these.
-module = ["astropy.*", "reproject.*", "pyvo.*", "tifffile.*", "safetensors.*", "stpsf.*", "sklearn.*", "transformers.*", "huggingface_hub.*"]
+module = ["astropy.*", "photutils.*", "reproject.*", "pyvo.*", "tifffile.*", "safetensors.*", "stpsf.*", "sklearn.*", "transformers.*", "huggingface_hub.*"]
 ignore_missing_imports = true
 
 [tool.basedpyright]
@@ -161,7 +162,8 @@ skips = ["B101"]
 
 [tool.typos.default.extend-words]
 # The FITS weight extension and its file suffix, a row index, the NASA/IPAC
-# Extragalactic Database, Canadian spelling, and parts of PNGs and 255ths.
+# Extragalactic Database, Canadian spelling, parts of PNGs and 255ths, and the
+# EAZY photometric redshift code.
 WHT = "WHT"
 wht = "wht"
 iy = "iy"
@@ -170,3 +172,4 @@ uncatalogued = "uncatalogued"
 Uncatalogued = "Uncatalogued"
 PN = "PN"
 ths = "ths"
+EAZY = "EAZY"
