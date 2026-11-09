@@ -253,3 +253,11 @@ Every tile is F460M, F250M and F182M as red, green and blue.
 - AEGIS lies in the EGS, where CEERS is, and CEERS1 tiles are in every candidate's
   training set, G's included. Any of those visits that shares sky with CEERS1 is said so
   in the results.
+
+S failed its dev check at a ratio of 2.29 against the 1.72 it needed, so M was the only
+candidate. Out of 420 planted sources a visit, G found 1,253 over the 10 visits, M found
+1,249 and the default DINOv3 found 1,246. M beat G on 3 visits and lost on 6 (p = 0.67),
+so G stays. It's hardly ahead of the default, though. The default beat it on 4 of the 10
+visits and they end up 7 sources apart, so on MINERVA's filters the fine-tune is about
+level with DINOv3 rather than better. o024 lies wholly on CEERS1, and it isn't where G
+gains (137 there against 139 for the default).
