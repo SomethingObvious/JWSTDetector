@@ -22,10 +22,10 @@ import torch
 from torch.nn import functional as tnf
 from tqdm import tqdm
 
-from jwstdetector.backbones import Backbone, background_mask
-from jwstdetector.data import owned_patches, tile_loader
-from jwstdetector.features import EmbedOptions, FeatureCache, embedded
-from jwstdetector.scoring import aggregate_score
+from jwst_peculiar.backbones import Backbone, background_mask
+from jwst_peculiar.data import owned_patches, tile_loader
+from jwst_peculiar.features import EmbedOptions, FeatureCache, embedded
+from jwst_peculiar.scoring import aggregate_score
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -72,7 +72,7 @@ def dihedral(x: torch.Tensor) -> list[torch.Tensor]:
 
 def _mean_of_nearest(d: torch.Tensor, k: int) -> torch.Tensor:
     if k == 1:
-        # A plain minimum skips the sort topk sets up, about a quarter of the time.
+        # amin skips the sort topk sets up, which saves about a quarter of the time.
         nearest = d.amin(dim=1)
         return torch.where(torch.isfinite(nearest), nearest, torch.nan)
     top = d.topk(k, dim=1, largest=False).values
@@ -549,8 +549,8 @@ def build_memory_bank(
 ) -> MemoryBank:
     """Embed the reference tiles and keep a uniform random sample of their patches.
 
-    It keeps up to `settings.max_patches`, as not all of them fit, since 425 tiles at
-    672 px through DINOv3 ViT-L with --rotation come to about 25 GB.
+    It keeps up to `settings.max_patches`, as 425 tiles at 672 px through DINOv3
+    ViT-L with --rotation come to about 25 GB.
 
     Returns:
         The bank, with each patch's reference tile.
@@ -670,7 +670,7 @@ class ScoreSettings:
 
 
 def _dists2map() -> Callable[[npt.NDArray[Any], tuple[int, int]], npt.NDArray[Any]]:
-    from jwstdetector.utils import dists2map  # noqa: PLC0415 utils loads matplotlib
+    from jwst_peculiar.utils import dists2map  # noqa: PLC0415 utils loads matplotlib
 
     return dists2map
 
@@ -908,12 +908,12 @@ def _owned(
     *,
     grid: tuple[int, int],
 ) -> list[npt.NDArray[np.bool_] | None] | None:
-    if score_region == "owned" and footprints:
-        mine = owned_patches(footprints, grid)
-        return [mine.get(p) for p in query_paths]
-    if score_region not in ("owned", "all"):
-        msg = f"Unknown score_region {score_region!r}, expected owned or all"
+    if score_region not in ("owned", "middle", "all"):
+        msg = f"Unknown score_region {score_region!r}, expected owned, middle or all"
         raise ValueError(msg)
+    if score_region != "all" and footprints:
+        mine = owned_patches(footprints, grid, middle=score_region == "middle")
+        return [mine.get(p) for p in query_paths]
     return None
 
 
@@ -1021,8 +1021,7 @@ def run_anomaly_detection(  # noqa: PLR0913 the CLI passes every option through 
             maps_dir=Path(out_dir) / f"anomaly_maps/seed={seed}",
             save_patch_dists=save_patch_dists,
             save_tiffs=save_tiffs,
-            # Empty unless the bank was kept, which _kept_or_built only does for a bank
-            # nothing changes after it is built.
+            # None unless the bank was kept above.
             reuse=_REUSED.get("dists"),
         ),
         options=options,

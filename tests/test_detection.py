@@ -15,9 +15,9 @@ from PIL import Image
 import torch
 from typing_extensions import Unpack
 
-from jwstdetector import detection
-from jwstdetector.backbones import Backbone, background_mask, hub_repo, parse_layers
-from jwstdetector.detection import (
+from jwst_peculiar import detection
+from jwst_peculiar.backbones import Backbone, background_mask, hub_repo, parse_layers
+from jwst_peculiar.detection import (
     BankSettings,
     Footprint,
     MemoryBank,
@@ -27,7 +27,7 @@ from jwstdetector.detection import (
     excluded_refs,
     run_anomaly_detection,
 )
-from jwstdetector.features import EmbedOptions, FeatureCache
+from jwst_peculiar.features import EmbedOptions, FeatureCache
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -40,9 +40,8 @@ ANOMALOUS = "A5_cx000264_cy000264_ra150.999999_decm2.197645_i00000099.png"
 
 
 def _stub_backbone(seed: int = 0) -> Backbone:
-    # Each patch averaged down to its mean colour and projected, which is
-    # content-sensitive and deterministic, and that's all the detector needs from a
-    # backbone.
+    # Each patch's mean colour, projected. Deterministic and content-sensitive, which
+    # is all the detector needs from a backbone.
     projection = torch.randn(3, DIM, generator=torch.Generator().manual_seed(seed))
 
     def forward_patches(x: torch.Tensor) -> torch.Tensor:
@@ -177,7 +176,7 @@ def test_too_few_candidates_average_what_is_left() -> None:
     )
     query = torch.tensor([[1.0, 0.0, 0.0]])
     rows = torch.zeros(1, dtype=torch.long)
-    # k=3 with tile 0 excluded leaves one patch, at 1 - 0. It used to be inf, then 0.
+    # k=3 with tile 0 excluded leaves one patch, at 1 - 0.
     one_left = bank.distances(
         query, 3, rows=rows, excluded=torch.tensor([[True, False]])
     )
@@ -454,8 +453,7 @@ def test_bank_sample_fills_the_cap_evenly_and_repeats() -> None:
     bank = _bank(cap)
     assert len(bank) == cap
     per_tile = np.bincount(_owners(bank).numpy(), minlength=13)
-    # Each tile should give about 32 of its 64 patches, the last tile as much as the
-    # first.
+    # About 32 of each tile's 64 patches, the last tile as many as the first.
     assert np.min(per_tile) >= 20, per_tile
     assert np.max(per_tile) <= 44, per_tile
 
@@ -474,16 +472,15 @@ def test_fp16_bank_samples_past_the_cap() -> None:
 
 
 def test_masked_bank_still_fills_the_cap() -> None:
-    # Masking leaves fewer patches than the tile count suggests, and the bank should
-    # still fill all the way to the cap.
+    # Masking leaves fewer patches than the tile count suggests.
     everything = len(_bank(10**9, masking=True))
     assert everything < 13 * GRID * GRID
     assert len(_bank(everything // 2, masking=True)) == everything // 2
 
 
 def test_background_mask_ignores_sign_and_random_state() -> None:
-    # A bright square off the centre: the side picked can't depend on the PCA sign or
-    # on how many random numbers were drawn before.
+    # A bright square off centre. The side picked can't depend on the PCA sign or on
+    # how many random numbers were drawn before.
     torch.manual_seed(0)
     grid = (12, 12)
     feats = torch.randn(1, 144, 32) * 0.1
@@ -534,7 +531,7 @@ def test_parse_layers() -> None:
 
 
 def test_subset_size() -> None:
-    from jwstdetector.bootstrap import subset_size
+    from jwst_peculiar.bootstrap import subset_size
 
     assert subset_size(1000, 0.1, minimum=500, maximum=5000) == 500
     assert subset_size(100_000, 0.1, minimum=500, maximum=5000) == 5000
@@ -584,8 +581,7 @@ def _check_descriptors(path: Path, paths: list[Path]) -> None:
         keys, vectors = f["keys"].tolist(), f["vectors"].astype(np.float32)
     assert sorted(keys) == sorted(p.name for p in paths)
     assert vectors.shape == (len(paths), DIM)
-    # The odd tile's descriptor describes its bright bar, so it sits apart from the
-    # rest.
+    # The odd tile's bright bar sets its descriptor apart from the rest.
     odd = vectors[keys.index(ANOMALOUS)]
     others = np.delete(vectors, keys.index(ANOMALOUS), 0)
     spread = np.linalg.norm(others - others.mean(0), axis=1).max()
@@ -613,7 +609,7 @@ def test_cached_features_give_the_same_scores_and_embed_once() -> None:
 
 
 def test_overlapping_tiles_share_out_their_patches() -> None:
-    from jwstdetector.data import owned_patches
+    from jwst_peculiar.data import owned_patches
 
     # 320 px tiles at a 160 px stride, and one more flush against the far edge.
     fp: dict[tuple[int, int] | str, Footprint] = {
@@ -640,9 +636,16 @@ def test_overlapping_tiles_share_out_their_patches() -> None:
     gap = np.abs(points[:, None, :] - centres[None, :, :]).max(axis=2).min(axis=1)
     assert gap.max() <= patch
 
+    # The bottom tile has no neighbour below, and its middle stops where a tile with
+    # every neighbour stops.
+    middle = owned_patches(fp, (28, 28), middle=True)
+    rows, _ = np.nonzero(middle[(320, 0)])
+    assert [int(np.min(rows)), int(np.max(rows))] == [7, 20]
+    assert np.array_equal(middle[(320, 160)], owned[(320, 160)])
+
 
 def test_pixel_backbone_returns_raw_patches() -> None:
-    from jwstdetector.backbones import get_backbone
+    from jwst_peculiar.backbones import get_backbone
 
     b = get_backbone("pixels", "cpu", resolution=32)
     x = torch.arange(3 * 32 * 32, dtype=torch.float32).reshape(1, 3, 32, 32)

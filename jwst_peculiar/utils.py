@@ -14,15 +14,15 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter, zoom
 
-from jwstdetector.backbones import background_mask, embedding_rgb
-from jwstdetector.data import TileDataset, relative_key
+from jwst_peculiar.backbones import background_mask, embedding_rgb
+from jwst_peculiar.data import TileDataset, relative_key
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     import numpy.typing as npt
 
-    from jwstdetector.backbones import Backbone
+    from jwst_peculiar.backbones import Backbone
 
 # astropy ships no type information, so its objects are Any to the type checkers.
 # Naming them still says what each value is.
@@ -61,8 +61,8 @@ def plot_reference_masks(  # noqa: PLR0917 bootstrap and reference pass all four
 ) -> None:
     """Draw a few reference tiles beside their embedding PCA and background mask.
 
-    It's only worth it while tuning --masking, which otherwise stays invisible until
-    the scores start looking wrong.
+    Only worth it while tuning --masking, whose effect is otherwise invisible until
+    the scores look wrong.
     """
     mpl.use("Agg")
 

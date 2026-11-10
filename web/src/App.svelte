@@ -29,7 +29,7 @@
     return b.endsWith('/') ? b : `${b}/`;
   })();
 
-  const PREFS = 'jwstdetector:prefs';
+  const PREFS = 'jwst-peculiar:prefs';
   const defaults: Display = {
     stretch: 'asinh',
     limitMode: 'p995',
@@ -109,7 +109,9 @@
   let narrow = $state(false);
   let tab = $state<'plate' | 'index' | 'readout'>('plate');
 
-  $effect(() => {
+  // Before the other effects, as the plate and the locator read their colours from
+  // the theme's CSS when it changes.
+  $effect.pre(() => {
     document.documentElement.dataset['theme'] = theme;
   });
 
@@ -121,6 +123,12 @@
       // Prefs are a convenience, so a blocked store just means defaults next time.
     }
   });
+
+  /** The tile the address names with #rank=N, or -1. */
+  function hashTile(b: Bundle): number {
+    const rank = /rank=(?<rank>\d+)/u.exec(location.hash)?.groups?.['rank'];
+    return rank === undefined ? -1 : b.tiles.findIndex((t) => t.rank === Number(rank));
+  }
 
   async function load() {
     try {
@@ -143,7 +151,7 @@
       await v.load();
       const width = b.run.embedding_dims ?? 0;
       if (width) {
-        // Similar tiles and learning from verdicts need it, and the rest of the viewer doesn't.
+        // Only similar tiles and the Learned sort use it, so nothing waits for it.
         fetch(`${base}embedding.f32`)
           .then((r) =>
             r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status))),
@@ -165,12 +173,9 @@
         (d) => renderer?.upload(d, b.run.grid),
         (i) => renderer?.evict(i),
       );
-      const rank = /rank=(?<rank>\d+)/u.exec(location.hash)?.groups?.['rank'];
-      const fromHash =
-        rank === undefined ? -1 : b.tiles.findIndex((t) => t.rank === Number(rank));
-      current = fromHash >= 0 ? fromHash : 0;
+      current = Math.max(0, hashTile(b));
       bundle = b;
-      document.title = `${b.run.name} · JWSTDetector`;
+      document.title = `${b.run.name} · jwst-peculiar`;
     } catch (err) {
       loadError = err instanceof Error ? err.message : String(err);
     }
@@ -188,9 +193,18 @@
       }
     };
     addEventListener('beforeunload', unload);
+    // A link to another rank pasted into this tab changes the hash without a reload.
+    const onhash = () => {
+      const at = bundle ? hashTile(bundle) : -1;
+      if (at >= 0) {
+        current = at;
+      }
+    };
+    addEventListener('hashchange', onhash);
     return () => {
       mq.removeEventListener('change', onmq);
       removeEventListener('beforeunload', unload);
+      removeEventListener('hashchange', onhash);
     };
   });
 
@@ -375,7 +389,6 @@
     return n;
   });
 
-  // Loads the current tile, from the cache when it is there, and prefetches its neighbours.
   $effect(() => {
     const i = current;
     // bundle comes first so the effect always tracks it. cache isn't reactive, and
@@ -412,11 +425,15 @@
     void c.prefetch(ahead, [i, ...ahead]);
     const t = bundle.tiles[i];
     if (t) {
-      history.replaceState(
-        null,
-        '',
-        `${location.pathname}${location.search}#rank=${String(t.rank)}`,
-      );
+      try {
+        history.replaceState(
+          null,
+          '',
+          `${location.pathname}${location.search}#rank=${String(t.rank)}`,
+        );
+      } catch {
+        // Safari refuses more than 100 of these in 10 seconds, which holding J reaches.
+      }
     }
   });
 
@@ -558,8 +575,7 @@
     }
   }
 
-  // Handles the keys that move through the list or open an input. Any other key
-  // returns false.
+  // Keys that move through the list or open an input. Returns false for any other key.
   function moveKey(k: string): boolean {
     if (k === 'j' || k === 'ArrowDown' || k === 'ArrowRight') {
       step(1);
@@ -588,7 +604,7 @@
     return true;
   }
 
-  // Handles the keys that change the view or the verdict. Any other key returns false.
+  // Keys that change the view or the verdict. Returns false for any other key.
   function actKey(k: string): boolean {
     const verdict = VERDICTS.find((d) => d.key === k);
     if (k === 'f') {
@@ -655,7 +671,8 @@
     if (sheet?.open && e.key !== '?') {
       return;
     }
-    if (moveKey(e.key) || actKey(e.key)) {
+    // A held key steps through the list, but it mustn't mark every tile it passes.
+    if (moveKey(e.key) || (!e.repeat && actKey(e.key))) {
       e.preventDefault();
     }
   }
@@ -694,6 +711,7 @@
   </main>
 {:else}
   <div class="app" class:narrow data-tab={tab}>
+    <h1 class="sr">jwst-peculiar, {bundle.run.name}</h1>
     {#if !bundle.writable}
       <div class="demo">
         <span class="label">Demo Run</span>
@@ -702,9 +720,9 @@
           >Verdicts stay in this browser. Export them from the Verdict block.</span
         >
         <a
-          href="https://github.com/SomethingObvious/JWSTDetector"
+          href="https://github.com/SomethingObvious/jwst-peculiar"
           target="_blank"
-          rel="noopener noreferrer">JWSTDetector on GitHub</a
+          rel="noopener noreferrer">jwst-peculiar on GitHub</a
         >
       </div>
     {/if}
@@ -748,7 +766,7 @@
           }}
         />
       </div>
-      <div class="col plate-col">
+      <main class="col plate-col" aria-label="Plate">
         <Plate
           bind:this={plate}
           {tile}
@@ -768,7 +786,7 @@
           onrenderer={(r: Renderer | null) => (renderer = r)}
           oncursor={(c: { ix: number; iy: number } | null) => (cursor = c)}
         />
-      </div>
+      </main>
       <div class="col readout-col">
         <Readout
           {bundle}
@@ -845,12 +863,11 @@
           >
         </span>
       {/if}
-      <span class="where">
+      <span class="where" aria-live="polite" aria-atomic="true">
         <span>Rank <b class="num">{tile.rank}</b></span>
-        <span class="dim num"
-          >{pos >= 0
-            ? `${String(pos + 1)} of ${String(order.length)} shown`
-            : 'not in the filtered list'}</span
+        <span class="dim"
+          >{#if pos >= 0}<span class="num">{pos + 1}</span> of
+            <span class="num">{order.length}</span> shown{:else}not in the filtered list{/if}</span
         >
       </span>
       <span class="save" role="status">
@@ -865,7 +882,10 @@
             >Retry Now</button
           >
         {:else if save.kind === 'local'}
-          <i class="led ok"></i>{save.count} in this browser
+          <i class="led ok"></i><span
+            ><span class="num">{save.count}</span>
+            {save.count === 1 ? 'verdict' : 'verdicts'} in this browser</span
+          >
         {:else}
           <i class="led ok"></i>Every verdict saved
         {/if}
@@ -1009,6 +1029,8 @@
   }
   .demo a {
     margin-left: auto;
+    padding-block: 4px;
+    margin-block: -4px;
   }
   .demo,
   .tabs {
@@ -1063,6 +1085,7 @@
     display: inline-flex;
     gap: 6px;
     align-items: center;
+    min-height: 24px;
   }
   .keys:hover {
     color: var(--anno);
@@ -1106,7 +1129,7 @@
     margin-left: -1px;
   }
   .mini {
-    height: 19px;
+    height: 24px;
     padding: 0 7px;
     font-size: 11px;
   }
@@ -1241,5 +1264,18 @@
   }
   .narrow :global(.plate .toolbar) {
     padding: 6px 16px;
+  }
+  @media (pointer: coarse) {
+    .demo {
+      align-items: center;
+      padding-block: 0;
+    }
+    .demo a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      margin-block: 0;
+      padding-block: 0;
+    }
   }
 </style>

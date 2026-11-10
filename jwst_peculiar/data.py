@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
     import numpy.typing as npt
 
-    from jwstdetector.backbones import Backbone
-    from jwstdetector.detection import Footprint
+    from jwst_peculiar.backbones import Backbone
+    from jwst_peculiar.detection import Footprint
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
@@ -120,11 +120,8 @@ def write_measurements_csv(
             ])
 
 
-MANIFEST_FIELDS = ["key", "mosaic", "x0", "y0", "size", "ra", "dec", "cutout"]
-
-
 def read_manifest(data_root: Path) -> dict[str, dict[str, Any]]:
-    """Read manifest.csv from `jwstdetector prep`.
+    """Read manifest.csv from `jwst-peculiar prep`.
 
     Returns:
         Each tile's row keyed by its path under query/, or {} without a manifest.
@@ -175,9 +172,8 @@ def tagged_dir(out_dir: Path, tag: str | None) -> Path:
 def prepare_out_dir(out_dir: Path, patterns: list[str], *, overwrite: bool) -> None:
     """Make out_dir, stopping if it holds results unless `overwrite` clears them.
 
-    Mixing a new run's args.yaml with an older run's scores is how a summary ends up
-    labelling old numbers with new settings, so a folder is either empty of results
-    or deliberately emptied.
+    A new run's args.yaml beside an older run's scores labels old numbers with new
+    settings, so a folder is either free of results or deliberately emptied.
 
     Raises:
         SystemExit: If there are results already and `overwrite` is off.
@@ -203,18 +199,18 @@ def load_footprints(
 ) -> dict[Path, Footprint]:
     """Read each tile's footprint from manifest.csv.
 
-    Without one, tiles that overlap can still vouch for each other, so it says so.
+    Without one, overlapping tiles can vouch for each other, so it warns.
 
     Returns:
         The footprints by tile path, or {} when the dataset has no manifest.
     """
-    from jwstdetector.detection import Footprint  # noqa: PLC0415 detection imports this module
+    from jwst_peculiar.detection import Footprint  # noqa: PLC0415 detection imports this module
 
     manifest = read_manifest(data_root)
     if not manifest:
         logging.getLogger(__name__).warning(
             "%s has no manifest.csv, so overlapping tiles can match each other's "
-            "pixels. Cutting the tiles again with `jwstdetector prep` writes one.",
+            "pixels. Cutting the tiles again with `jwst-peculiar prep` writes one.",
             data_root,
         )
         return {}
@@ -309,17 +305,30 @@ class _MosaicTiles:
         return keep
 
 
+# How far from a tile's centre its middle reaches, as a fraction of the tile.
+MIDDLE = 0.25
+
+
 def owned_patches(
-    footprints: Mapping[K, Footprint], grid: tuple[int, int]
+    footprints: Mapping[K, Footprint], grid: tuple[int, int], *, middle: bool = False
 ) -> dict[K, npt.NDArray[np.bool_]]:
     """Work out the patches each tile scores.
 
     An object cut off by a tile's edge looks odd to the backbone however ordinary it
-    is, and on SMACS 0723 the outermost ring of patches held the peak of 45% of the top
-    20 tiles against 14% by chance. So a patch only counts for the tile whose centre
-    it's nearest, by the larger of its x and y offsets, which hands every bit of sky
-    that tiles share to exactly one of them and drops none. `footprints` gives each
-    tile's mosaic, x0, y0 and size, in mosaic pixels.
+    is. On SMACS 0723 the outermost ring of patches held the peak of 45% of the top 20
+    tiles against 14% by chance. So a patch counts only for the tile whose centre is
+    nearest, by the larger of the x and y offsets, which drops no sky and gives each
+    bit of it to one tile wherever a third tile covers it too. Along the outside of a
+    mosaic two neighbours can be equally near with no third to take the patch, and
+    then both score it. `footprints` gives each tile's mosaic, x0, y0 and size, in
+    mosaic pixels.
+
+    A tile with a neighbour missing, beside a hole in the coverage or at the edge of a
+    mosaic, scores out to its own edge on that side. That gives it more patches than
+    the rest and puts cut-off objects back among them. `middle` keeps every tile to
+    the patches at least a quarter of a tile from its edge, which is all a tile with
+    every neighbour scores at half-tile overlap, and leaves the sky past that
+    unscored.
 
     Returns:
         A (rows, cols) bool array per key.
@@ -341,6 +350,9 @@ def owned_patches(
         tiles = _MosaicTiles(box, fx, fy)
         for i, k in enumerate(keys):
             out[k] = tiles.owned(i)
+    if middle:
+        inner = (abs(fy - 0.5) < MIDDLE)[:, None] & (abs(fx - 0.5) < MIDDLE)[None, :]
+        out = {k: mask & inner for k, mask in out.items()}
     return out
 
 

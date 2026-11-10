@@ -6,8 +6,8 @@ nircam sensors are presets for JWST archive and COSMOS-Web file layouts.
 
 Each mosaic stays memmapped while it is cut, so memory stays flat however big the
 mosaic is. The sky level, its noise and the stretch limits are measured once per
-mosaic, and every threshold is expressed against those, which means the same flag
-values work whatever units the mosaic is in and however deep the exposure went.
+mosaic, and every threshold is set against those, so the same flags work whatever
+the mosaic's units and however deep the exposure went.
 """
 
 from __future__ import annotations
@@ -35,14 +35,14 @@ from scipy.ndimage import binary_fill_holes
 from tqdm import tqdm
 from typing_extensions import override
 
-from jwstdetector.photometry import describe_plane
+from jwst_peculiar.photometry import describe_plane
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
     import numpy.typing as npt
 
-    from jwstdetector.utils import FitsHDUList, FitsHeader, SkyWcs
+    from jwst_peculiar.utils import FitsHDUList, FitsHeader, SkyWcs
 
     Array: TypeAlias = npt.NDArray[Any]
     Window: TypeAlias = tuple[slice, slice]
@@ -186,7 +186,7 @@ def read_levels(path: Path, filt: str) -> float:
 
 def levels_main(argv: list[str] | None = None) -> None:
     """Write one stretch range per filter, measured over datasets prep already cut."""
-    p = argparse.ArgumentParser(prog="jwstdetector levels")
+    p = argparse.ArgumentParser(prog="jwst-peculiar levels")
     p.add_argument("datasets", nargs="+", type=Path, help="Folders prep wrote.")
     p.add_argument("--out", type=Path, required=True, help="The levels file.")
     args = p.parse_args(argv)
@@ -201,9 +201,9 @@ def asinh_to_uint8(
 
     The limits are arguments on purpose. Stretching each tile between its own
     percentiles brings faint sky and a bright source up to the same range, which
-    hides the very difference the detector is looking for. NaN and zero fill both
-    become `fill`, the sky level, so holes don't turn into black shapes that the
-    detector then flags. Zero fill is how COSMOS-Web marks the same thing.
+    hides the very difference the detector is looking for. NaN, and the zero fill
+    COSMOS-Web uses for the same thing, become `fill`, the sky level, so holes don't
+    turn into black shapes the detector flags.
 
     Returns:
         The stretched image as uint8.
@@ -211,7 +211,7 @@ def asinh_to_uint8(
     img = np.asarray(img, dtype=np.float32)
     img = np.where(np.isfinite(img) & (img != 0), img, np.float32(fill))
     x = np.clip((img - lo) / (hi - lo + 1e-12), 0.0, 1.0)
-    # Rounding rather than truncating, which would put the upper limit itself at 254.
+    # Rounded, as truncating would put the upper limit itself at 254.
     stretched: Array = np.rint(255.0 * np.arcsinh(asinh_q * x) / np.arcsinh(asinh_q))
     return stretched.astype(np.uint8)
 
@@ -225,10 +225,10 @@ def has_signal(
 ) -> bool:
     """Check whether enough of the tile rises above the sky to be worth embedding.
 
-    It reads raw flux against the mosaic's noise, so the default works for MIRI and
-    NIRCam alike, as pure sky puts next to nothing above 5 sigma. The fraction is of
-    the whole tile rather than its finite pixels, because a sliver of coverage at a
-    mosaic edge would otherwise pass on a single noisy pixel.
+    It reads raw flux against the mosaic's noise. Pure sky puts next to nothing above
+    5 sigma, so the default works for MIRI and NIRCam alike. The fraction is of the
+    whole tile rather than its finite pixels, or a sliver of coverage at a mosaic edge
+    would pass on a single noisy pixel.
 
     Returns:
         True when the tile has signal.
@@ -293,10 +293,10 @@ def equalise(x: Array, sky: float, factor: Array | None) -> Array:
 def typical_weights(
     whts: Sequence[Plane], starts_y: list[int], starts_x: list[int], *, crop: int
 ) -> list[float]:
-    """Take the median weight of each map over up to 64 tile windows.
+    """Take the median weight of each map over at most 127 tile windows.
 
-    The windows are spread across the mosaic, and they're windows because a
-    reprojected plane can only be read a window at a time.
+    The windows are spread across the mosaic, as a reprojected plane can only be read
+    a window at a time.
 
     Returns:
         One typical weight per map, 1.0 for a map with no positive weight.
@@ -470,6 +470,12 @@ class _Cutter:
             and len(whts) == len(mosaic.planes or [mosaic.signal])
         ):
             cutter.typical = typical_weights(whts, *starts, crop=crop)
+        elif getattr(args, "noise_eq", False) and args.min_wht_frac <= 0:
+            logger.info(
+                "[%s] --min_wht_frac 0 reads no weight map, so the noise isn't "
+                "evened out",
+                mosaic.tile_id,
+            )
         return cutter
 
     def windows(self) -> Iterator[Window]:
@@ -959,6 +965,7 @@ class MiriSensor(Sensor):
             msg = f"Nothing in {args.indir} matches {args.pattern}"
             raise FileNotFoundError(msg)
 
+        seen: dict[str, str] = {}
         for sci_path in sci_paths:
             # JWST archive names carry no tile id, and the file stem at least says
             # which mosaic a tile came from.
@@ -967,6 +974,13 @@ class MiriSensor(Sensor):
                 or infer_tile_id_from_filename(sci_path, args.tile_regex)
                 or Path(sci_path).stem
             )
+            if tile_id in seen:
+                msg = (
+                    f"{seen[tile_id]} and {sci_path} would both be mosaic {tile_id}. "
+                    "Give a --tile_regex that tells them apart."
+                )
+                raise SystemExit(msg)
+            seen[tile_id] = sci_path
             wht_path = None
             if args.min_wht_frac > 0:
                 wht_path = self.sci_to_wht_path(sci_path)
@@ -1268,6 +1282,10 @@ class NircamSensor(Sensor):
                 # A grey mosaic's tiles take their stretch from _Cutter, not these.
                 msg = f"--levels is for colour mosaics, and {spec.tile_id} is grey"
                 raise SystemExit(msg)
+            if args.stretch_scope == "tile" and len(layers.planes) == _RGB_PLANES:
+                msg = "--stretch_scope tile is for grey mosaics, and "
+                msg += f"{spec.tile_id} is colour"
+                raise SystemExit(msg)
             mosaic = Mosaic(
                 spec.tile_id,
                 layers.signal,
@@ -1370,7 +1388,7 @@ def lupton(
 
 
 def _weight_path(path: str, pattern: str) -> Path:
-    return Path(path).with_name(pattern.format(stem=Path(path).name.split(".")[0]))
+    return Path(path).with_name(pattern.format(stem=Path(path).stem))
 
 
 def _fits_paths(args: argparse.Namespace) -> list[str]:
@@ -1609,15 +1627,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=2e-4,
         help="Drop tiles with less than this fraction of signal pixels.",
     )
-    # These measured the stretched PNG and are gone. They fail loudly in run() rather
-    # than being ignored.
-    p.add_argument(
-        "--mean_thresh", "--meanthresh", dest="mean_thresh", help=argparse.SUPPRESS
-    )
-    p.add_argument(
-        "--var_thresh", "--varthresh", dest="var_thresh", help=argparse.SUPPRESS
-    )
-
     p.add_argument(
         "--noise_eq",
         default=True,
@@ -1638,7 +1647,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Use one stretch range per filter for every mosaic, from a file "
-        "`jwstdetector levels` wrote, so all the visits of a survey look alike. "
+        "`jwst-peculiar levels` wrote, so all the visits of a survey look alike. "
         "Colour mosaics only.",
     )
     p.add_argument(
@@ -1715,29 +1724,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _check_args(args: argparse.Namespace) -> None:
-    if args.mean_thresh is not None or args.var_thresh is not None:
-        msg = (
-            "--mean_thresh and --var_thresh are gone. They measured the stretched "
-            "PNG, where a\nper-tile stretch had already brought blank sky up to full "
-            "brightness, so they kept\nempty tiles and threw out tiles holding a "
-            "bright source. Use --source_sigma and\n--min_source_frac, which read "
-            "raw flux."
-        )
+def _check_levels(args: argparse.Namespace) -> None:
+    if args.stretch_scope != "mosaic":
+        msg = "--levels replaces the stretch of each mosaic, so it needs "
+        msg += "--stretch_scope mosaic"
         raise SystemExit(msg)
+    if not args.levels.is_file():
+        msg = f"There is no levels file at {args.levels}"
+        raise SystemExit(msg)
+    if args.sensor == "miri":
+        msg = "--levels is for colour mosaics, and --sensor miri cuts grey ones"
+        raise SystemExit(msg)
+
+
+def _check_args(args: argparse.Namespace) -> None:
+    for flag in ("tile_size", "upscale", "stride"):
+        value = getattr(args, flag)
+        if value is not None and value < 1:
+            msg = f"--{flag} has to be at least 1, got {value}"
+            raise SystemExit(msg)
     if args.limit is not None and args.limit < 0:
         msg = f"--limit can't be negative, got {args.limit}"
         raise SystemExit(msg)
     if args.asinh_q <= 0:
         msg = f"--asinh_q has to be above 0, got {args.asinh_q}"
         raise SystemExit(msg)
-    if args.levels is not None and args.stretch_scope != "mosaic":
-        msg = "--levels replaces the stretch of each mosaic, so it needs "
-        msg += "--stretch_scope mosaic"
-        raise SystemExit(msg)
-    if args.levels is not None and not args.levels.is_file():
-        msg = f"There is no levels file at {args.levels}"
-        raise SystemExit(msg)
+    if args.levels is not None:
+        _check_levels(args)
     if args.sensor != "fits" and not args.indir:
         msg = f"--sensor {args.sensor} needs --indir"
         raise SystemExit(msg)
@@ -1761,12 +1774,14 @@ def run(argv: list[str] | None = None) -> None:
 
     out = Path(args.out)
     query_dir = out / "query"
+    sensor = SENSORS[args.sensor]
+    # Before any folder is made, so a mistyped --pattern doesn't leave an output the
+    # next run refuses to write over.
+    specs = list(sensor.iter_mosaic_specs(args))[: args.limit]
     if not args.dry_run:
         clear_previous_output(out, overwrite=args.overwrite)
         query_dir.mkdir(parents=True)
         (out / "mosaics").mkdir()
-    sensor = SENSORS[args.sensor]
-    specs = list(sensor.iter_mosaic_specs(args))[: args.limit]
 
     global_idx = 0
     records: list[dict[str, Any]] = []

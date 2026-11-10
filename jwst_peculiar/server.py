@@ -1,7 +1,7 @@
 """Opens a run in the web viewer, or exports it as a static site.
 
-    jwstdetector view results_miri datasets/miri
-    jwstdetector view results_miri datasets/miri --export site/
+    jwst-peculiar view results_miri datasets/miri
+    jwst-peculiar view results_miri datasets/miri --export site/
 
 The first serves the viewer on localhost and saves verdicts to verdicts.csv in the run
 folder. The second writes the viewer and the whole run to a folder that any static
@@ -24,11 +24,15 @@ import webbrowser
 
 from typing_extensions import override
 
-from jwstdetector.bundle import RunBundle, add_site_meta, export, save_verdict
+from jwst_peculiar.bundle import RunBundle, add_site_meta, export, save_verdict
 
 logger = logging.getLogger(__name__)
 
 APP_DIR = Path(__file__).resolve().parent / "viewer_static"
+
+# Windows takes these from the registry, where .js is sometimes text/plain, and a
+# browser won't run a module served as that.
+mimetypes.add_type("text/javascript", ".js")
 
 
 class _ViewerHandler(BaseHTTPRequestHandler):
@@ -52,30 +56,54 @@ class _ViewerHandler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send(status, json.dumps({"error": message}).encode(), "application/json")
 
-    def do_GET(self) -> None:
-        """Serve a run file under run/, or a file of the built viewer otherwise."""
-        path = unquote(urlsplit(self.path).path).lstrip("/") or "index.html"
-        if path.startswith("run/"):
-            try:
-                body, ctype = self.bundle.read(path[4:])
-            except (FileNotFoundError, OSError):
-                self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
-                return
-            static = not path.endswith(("index.json", "verdicts.json"))
-            self._send(HTTPStatus.OK, body, ctype, cache=static)
-            return
+    def _from_elsewhere(self) -> bool:
+        """Tell a request from the viewer's own page from one sent by another site.
 
+        A browser lets any page send requests to localhost, and a hostile one can
+        point its own domain here to read the answers. Neither can fake these headers.
+
+        Returns:
+            True when the Host or Origin isn't this server.
+        """
+        port = self.connection.getsockname()[1]
+        here = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        origin = self.headers.get("Origin")
+        return self.headers.get("Host") not in here or (
+            origin is not None and origin.removeprefix("http://") not in here
+        )
+
+    def _read(self, path: str) -> tuple[bytes, str, bool]:
+        # A backslash or a drive would let a Windows path climb out of the folders.
+        if "\\" in path or ":" in path:
+            raise FileNotFoundError(path)
+        if path.startswith("run/"):
+            # Run files are named by rank, so another run on this port reuses the
+            # names and a cached copy would show the wrong tile.
+            return (*self.bundle.read(path[4:]), False)
         target = (APP_DIR / path).resolve()
         if not target.is_relative_to(APP_DIR) or not target.is_file():
+            raise FileNotFoundError(path)
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        return target.read_bytes(), ctype, path != "index.html"
+
+    def do_GET(self) -> None:
+        """Serve a run file under run/, or a file of the built viewer otherwise."""
+        if self._from_elsewhere():
+            self._error(HTTPStatus.FORBIDDEN, "This viewer only answers its own page")
+            return
+        path = unquote(urlsplit(self.path).path).lstrip("/") or "index.html"
+        try:
+            body, ctype, cache = self._read(path)
+        except (OSError, ValueError):
             self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
             return
-        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        self._send(
-            HTTPStatus.OK, target.read_bytes(), ctype, cache=path != "index.html"
-        )
+        self._send(HTTPStatus.OK, body, ctype, cache=cache)
 
     def do_POST(self) -> None:
         """Save the verdict posted to run/api/verdict."""
+        if self._from_elsewhere():
+            self._error(HTTPStatus.FORBIDDEN, "This viewer only answers its own page")
+            return
         if urlsplit(self.path).path != "/run/api/verdict":
             self._error(HTTPStatus.NOT_FOUND, "Only run/api/verdict takes writes")
             return
@@ -84,13 +112,17 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError) as exc:
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        except OSError as exc:
+            # verdicts.csv open in a spreadsheet, for one. The viewer tries again.
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Couldn't save it: {exc}")
+            return
         self._send(
             HTTPStatus.OK, json.dumps({"saved": saved}).encode(), "application/json"
         )
 
     def _save_posted_verdict(self) -> str:
         length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(min(length, 1 << 20)))
+        body = json.loads(self.rfile.read(max(0, min(length, 1 << 20))))
         key = str(body["key"])
         if key not in {t.key for t in self.bundle.tiles}:
             msg = f"{key} isn't a tile in this run"
@@ -120,9 +152,9 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("run_dir", type=Path, help="A `jwstdetector run` output folder.")
+    ap.add_argument("run_dir", type=Path, help="A `jwst-peculiar run` output folder.")
     ap.add_argument(
-        "data_root", type=Path, help="The `jwstdetector prep` --out folder it scored."
+        "data_root", type=Path, help="The `jwst-peculiar prep` --out folder it scored."
     )
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument(
@@ -178,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
     bundle = RunBundle(args.run_dir, args.data_root, writable=args.export is None)
     if args.name:
         index: dict[str, Any] = bundle.index
+        # Browsers file their verdicts under the id, so a new name doesn't orphan them.
+        index["run"]["id"] = index["run"]["name"]
         index["run"]["name"] = args.name
 
     if args.export is not None:

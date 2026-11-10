@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from jwstdetector.significance import bh_q, conformal_p
+from jwst_peculiar.significance import bh_q, conformal_p
 
 
 def test_conformal_p_counts_ties_and_the_test_point() -> None:

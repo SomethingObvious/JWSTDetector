@@ -5,14 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0b1220" />
-    <title>JWSTDetector Viewer</title>
+    <title>jwst-peculiar Viewer</title>
     <meta
       name="description"
       content="Step through James Webb Space Telescope mosaic tiles ranked by an unsupervised anomaly detector, with the float FITS pixels, patch distances, RA and Dec, and verdicts side by side."
     />
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="JWSTDetector" />
-    <meta property="og:title" content="JWSTDetector Viewer" />
+    <meta property="og:site_name" content="jwst-peculiar" />
+    <meta property="og:title" content="jwst-peculiar Viewer" />
     <meta
       property="og:description"
       content="JWST mosaic tiles ranked by an unsupervised anomaly detector, with the real pixels, patch distances and sky coordinates side by side."
@@ -24,22 +24,22 @@
     />
     <script>
       try {
-        var t = JSON.parse(localStorage.getItem('jwstdetector:prefs') || '{}').theme;
+        var t = JSON.parse(localStorage.getItem('jwst-peculiar:prefs') || '{}').theme;
         if (t) document.documentElement.dataset.theme = t;
       } catch (e) {}
     </script>
-    <script type="module" crossorigin src="./assets/index-CoFXxMDT.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-BSwpfy1h.css">
+    <script type="module" crossorigin src="./assets/index-D9IW_21D.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BsQWv6xT.css">
   </head>
   <body>
     <div id="app"></div>
     <noscript>
       <p>
-        JWSTDetector ranks James Webb Space Telescope mosaic tiles by how unusual they
+        jwst-peculiar ranks James Webb Space Telescope mosaic tiles by how unusual they
         look to a DINOv3 backbone, with no labels. This viewer needs JavaScript and
         WebGL2 to draw the tiles. The code and a description are at
-        <a href="https://github.com/SomethingObvious/JWSTDetector"
-          >github.com/SomethingObvious/JWSTDetector</a
+        <a href="https://github.com/SomethingObvious/jwst-peculiar"
+          >github.com/SomethingObvious/jwst-peculiar</a
         >.
       </p>
     </noscript>

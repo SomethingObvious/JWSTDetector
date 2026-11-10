@@ -1,12 +1,14 @@
 # Benchmark
 
-There is no labelled set of JWST anomalies to score against, so there are two checks. `jwstdetector bench` plants sources of known brightness in real tiles and measures where they land in the ranking, and `jwstdetector recall` measures how a run ranks objects already known to be in the field. Everything here is from the 288 SMACS 0723 tiles of the demo.
+There is no labelled set of JWST anomalies to score against, so there are two checks. `jwst-peculiar bench` plants sources of known brightness in real tiles and measures where they land in the ranking, and `jwst-peculiar recall` measures how a run ranks objects already known to be in the field. Everything here is from the 288 SMACS 0723 tiles of the demo.
 
 ## What Is Planted
 
 Each run picks 12 tiles and adds one source to each, three points, three arcs, three rings and three streaks. The arcs, rings and streaks are half a pixel wide before the PSF, like a thin lensed arc or a satellite trail, and a ring or arc has a radius of 6 to 15% of the tile. A source gets a flat, red or blue spectrum ($f_\nu \propto \lambda^{\beta}$ with $\beta$ of 0, 2 or -2) and a total AB magnitude, which is its flux inside the tile at the filters' geometric mean wavelength. `--kinds clumps diffuse pair` plants three shapes no setting has been chosen on instead, a chain of 3 to 6 knots, one wide faint blob, and two points 2 to 5 pixels apart, in the same tiles and places a seed gives the other four.
 
 The source goes into the tile's float FITS cutout, in the mosaic's own units (MJy/sr here, from `BUNIT`), blurred by each filter's PSF. For JWST that's STPSF's model of the filter on its detector, distortion included, turned to the mosaic's position angle. Laid over stars in SMACS 0723 and Abell 370, the model's spikes line up with theirs. Other telescopes get a Gaussian of the diffraction-limited width, and `--psf gaussian` forces that. The tile is then rendered back to its PNG with the exact stretch and noise weighting prep used, which reproduces every unplanted tile bit for bit. A seed fixes the tiles, shapes, positions and colours for every magnitude, so the curves differ by brightness alone. There are 5 seeds, so each point below is 15 sources of a kind, with a 95% Wilson interval.
+
+A source is centred in the middle 40% of its tile, and a tile [scores only its middle half](method.md#which-patches-a-tile-scores), so part of a long one falls on patches its tile doesn't score. Over the 60 sources here, before the PSF, every point is whole, and an arc keeps 95% of its flux on scored patches on average, a ring 86% and a streak 51%, as a streak crosses the whole tile. So a streak's magnitude is about 0.7 brighter than what its tile gets to score.
 
 A source counts as found when its tile ranks in the top 5%, the top 14 of 288. Real anomalies in the field compete with the planted ones, which is why it isn't first place, and the dashed line is the 5% a tile would reach by chance.
 
@@ -17,17 +19,17 @@ A source counts as found when its tile ranks in the top 5%, the top 14 of 288. R
 | | kNN | Subspace | kNN on pixels | Isolation forest |
 |---|---|---|---|---|
 | Arc, magnitude found half the time | 27.2 | never | never | never |
-| Ring, magnitude found half the time | 26.2 | 24.9 | 26.2 | never |
-| Arcs found, all magnitudes | 40 of 105 | 12 of 105 | 25 of 105 | 21 of 105 |
-| All kinds found at AB 22 | 21 of 60 | 25 of 60 | 30 of 60 | 4 of 60 |
-| All kinds found at AB 26 | 24 of 60 | 8 of 60 | 20 of 60 | 4 of 60 |
-| All kinds found at AB 28 | 9 of 60 | 6 of 60 | 8 of 60 | 4 of 60 |
+| Ring, magnitude found half the time | 26.2 | 24.9 | never | never |
+| Arcs found, all magnitudes | 40 of 105 | 12 of 105 | 7 of 105 | 21 of 105 |
+| All kinds found at AB 22 | 21 of 60 | 25 of 60 | 5 of 60 | 4 of 60 |
+| All kinds found at AB 26 | 24 of 60 | 8 of 60 | 5 of 60 | 4 of 60 |
+| All kinds found at AB 28 | 9 of 60 | 6 of 60 | 5 of 60 | 4 of 60 |
 
-kNN on DINOv3 features finds the most arcs by far, and it keeps finding them to AB 27. On rings and streaks the same kNN search on raw 16 by 16 pixel patches does about as well or a bit better, so the backbone earns its place on extended, structured shapes rather than on everything. Over all kinds the two find 133 and 131 of 315 sources. The subspace detector finds bright rings and loses most things by AB 25. The isolation forest, on hand-built tile features the way Astronomaly scores images, stays at chance for every kind and magnitude.
+kNN on DINOv3 features finds the most arcs by far, and it keeps finding them to AB 27. The same kNN search on raw 16 by 16 pixel patches finds 14 of the 315 arcs, rings and streaks where DINOv3's features find 133, and not one ring at any magnitude. A planted ring barely moves its tile's rank on pixels (a median of 156th against 152nd without it), as a thin bright curve is about as close in raw pixel values to the edge of a bright galaxy as anything else in the bank. So it's the backbone that finds these shapes. The subspace detector finds bright rings and loses most things by AB 25. The isolation forest, on hand-built tile features the way Astronomaly scores images, doesn't respond to what is planted at all. Its count is the same at AB 22 as at AB 28 for every kind, and the 21 arcs it finds are four tiles that sit at about 14th place whatever goes into them.
 
 Nothing finds point sources, at any brightness. A planted point is a blurred dot like the hundreds of faint galaxies and stars in every tile, and its rate stays flat at whatever share of the chosen tiles was in the top 5% before anything was planted.
 
-With a Gaussian PSF in place of STPSF's, kNN finds half the arcs to AB 27.8 and half the rings to 26.6, so the real PSF costs about half a magnitude. The pixel baseline finds 152 of 315 with the Gaussian and kNN 161.
+With a Gaussian PSF in place of STPSF's, kNN finds half the arcs to AB 27.8 and half the rings to 26.6, so the real PSF costs about half a magnitude. With the Gaussian, kNN finds 161 of 315 and the pixel baseline 20.
 
 ## Why kNN Finds Faint Arcs More Often Than Bright Ones
 
@@ -37,7 +39,7 @@ A real field can hold several of a rare thing too, like the lensed images of one
 
 ## Real Lensed Images
 
-`jwstdetector recall` takes the 85 lensed images of 30 background galaxies that Mahler et al. (2023) list in SMACS 0723 and measures where the patch at each one ranks among every patch the run scored. Positions in a lens model's catalogue are a pixel or two off and an image spans a few patches, so each image takes the highest distance within one patch of it, and every patch it is compared with gets the same treatment. (One declination in the published table reads -73.46170.5, which is taken as -73.461705.)
+`jwst-peculiar recall` takes the 85 lensed images of 30 background galaxies that Mahler et al. (2023) list in SMACS 0723 and measures where the patch at each one ranks among every patch the run scored. Positions in a lens model's catalogue are a pixel or two off and an image spans a few patches, so each image takes the highest distance within one patch of it, and every patch it is compared with gets the same treatment. (One declination in the published table reads -73.46170.5, which is taken as -73.461705.)
 
 Lensed images crowd around the cluster core, which is unusual all over, so location alone does well on the usual figures. Ranking the tiles by nothing but their distance from the brightest cluster galaxy puts 31 of the images in the top 5% of tiles and gets an AUC of 0.91, better than any detector. So `--centre` compares each image only with patches at the same distance from the core, within 3 arcseconds, where 50 is chance. The interval comes from drawing whole lens systems, as the images of one galaxy aren't independent.
 
@@ -72,14 +74,14 @@ The satellite weights beat the web-photo ones at both sizes, and the 7B model is
 
 - Only the planted tile is changed. The overlapping tiles that also hold that bit of sky don't see the source, and part of a big ring can fall outside the area its tile scores.
 - The stretch is fixed per mosaic, so at AB 22 the core of a ring or arc saturates the rendered tile.
-- These are recalls for sources added to SMACS 0723. A field with a different depth, crowding or mix of real anomalies will give different curves, and `jwstdetector bench` on that field is the way to find out.
+- These are recalls for sources added to SMACS 0723. A field with a different depth, crowding or mix of real anomalies will give different curves, and `jwst-peculiar bench` on that field is the way to find out.
 
 ## Running It
 
 ```
-jwstdetector bench --data_root datasets/smacs_nircam --out_dir bench --mags 22 23 24 25 26 27 28 --seeds 5 \
+jwst-peculiar bench --data_root datasets/smacs_nircam --out_dir bench --mags 22 23 24 25 26 27 28 --seeds 5 \
   --detectors knn subspace pixels iforest
-jwstdetector recall results_smacs datasets/smacs_nircam --objects lensed.csv --centre 110.8270 -73.4541
+jwst-peculiar recall results_smacs datasets/smacs_nircam --objects lensed.csv --centre 110.8270 -73.4541
 ```
 
 The bench writes `injections.csv` with every planted source's rank, and its null rank among the tiles nothing was planted in, where 1 means it beat every ordinary tile, `summary.csv` with recall and its interval per detector, kind and magnitude and how many beat every ordinary tile, and `completeness.png`. The 140 runs here took 42 minutes on a laptop RTX 4070, as each embeds only the tiles that changed. STPSF comes with `pip install -e .[webb]` and needs its data files, which its documentation explains how to fetch.

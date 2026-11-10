@@ -22,7 +22,7 @@ so the loss also pulls apart what the sky's noise pattern does to a feature.
 With `--stretch J`, each view of a tile drawn from flux also gets each filter's range
 above the sky multiplied by its own factor, log-uniform between 1/J and J. One bright
 star pushed a COSMOS-Web visit's range 4 to 12 times above the others', and every tile
-in it scored like an outlier, so this asks the features to not care about the stretch.
+in it scored like an outlier, so this teaches the features to ignore the stretch.
 
 The export folds the LoRA into an fp32 copy of the original weights, saved as a folder
 that `--model_name <folder>` loads.
@@ -153,7 +153,7 @@ def noisy(cutout: Path, render: dict, scale: float, rng: np.random.Generator,
           stretch: float = 1.0) -> Image.Image:
     from astropy.io import fits
 
-    from jwstdetector.prep import equalise, render_cutout
+    from jwst_peculiar.prep import equalise, render_cutout
 
     with fits.open(cutout, memmap=False) as hdul:
         planes = np.asarray(hdul[0].data, dtype=np.float32).reshape(-1, *hdul[0].data.shape[-2:])

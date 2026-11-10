@@ -31,7 +31,6 @@
   color-scheme: dark;
   --ground: #0b1220;
   --ground-2: #0e1729;
-  --ground-3: #15213a;
   --ground-sunk: #070c16;
   --rule: rgb(255 179 71 / 0.22);
   --rule-strong: rgb(255 179 71 / 0.5);
@@ -68,19 +67,18 @@
   color-scheme: light;
   --ground: #e9e7e1;
   --ground-2: #e1ded6;
-  --ground-3: #d5d1c6;
   --ground-sunk: #f3f2ee;
   --rule: rgb(28 30 36 / 0.2);
   --rule-strong: rgb(28 30 36 / 0.5);
   --chalk: #17181c;
   --chalk-2: #45474e;
-  --chalk-3: #63656c;
+  --chalk-3: #5f6168;
   --anno: #1f3a6e;
   --anno-2: #2f4c82;
   --anno-wash: rgb(31 58 110 / 0.08);
   --anno-ink: #f3f2ee;
   --ring: #c8221a;
-  --cat: #00707a;
+  --cat: #006c76;
   --nan: #d3cfc4;
   --v-interesting: #1f3a6e;
   --v-artifact: #5b2f86;
@@ -105,13 +103,12 @@
   color-scheme: dark;
   --ground: #2a2c30;
   --ground-2: #313338;
-  --ground-3: #3c3f45;
   --ground-sunk: #1f2023;
   --rule: #474a51;
   --rule-strong: #63676f;
   --chalk: #e8e8e8;
   --chalk-2: #b4b7bc;
-  --chalk-3: #92959b;
+  --chalk-3: #999ca2;
   --anno: #8fd694;
   --anno-2: #74bb7a;
   --anno-wash: rgb(143 214 148 / 0.1);
@@ -235,8 +232,8 @@ select.ctl {
     linear-gradient(45deg, transparent 50%, var(--chalk-3) 50%),
     linear-gradient(135deg, var(--chalk-3) 50%, transparent 50%);
   background-position:
-    calc(100% - 11px) 10px,
-    calc(100% - 7px) 10px;
+    calc(100% - 11px) calc(50% - 2px),
+    calc(100% - 7px) calc(50% - 2px);
   background-size: 4px 4px;
   background-repeat: no-repeat;
 }
@@ -257,7 +254,7 @@ textarea::placeholder {
 input[type='range'] {
   appearance: none;
   background: transparent;
-  height: 18px;
+  height: 24px;
   margin: 0;
   cursor: pointer;
 }
@@ -288,6 +285,25 @@ input[type='range']::-moz-range-thumb {
   transform: rotate(45deg);
 }
 
+/* A fingertip needs 44 px, a mouse doesn't, so only touch screens get the bigger targets. */
+@media (pointer: coarse) {
+  .ctl {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  input[type='range'] {
+    height: 44px;
+  }
+}
+
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
 kbd {
   font-family: var(--font-num);
   font-variant-numeric: slashed-zero;
@@ -301,6 +317,10 @@ kbd {
   border-radius: 2px;
   color: var(--chalk-2);
   line-height: 1;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variation-settings: normal;
 }
 
 a {

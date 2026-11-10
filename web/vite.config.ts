@@ -63,7 +63,7 @@ export default defineConfig({
   base: './',
   plugins: [svelte(), devVerdicts()],
   build: {
-    outDir: '../jwstdetector/viewer_static',
+    outDir: '../jwst_peculiar/viewer_static',
     emptyOutDir: true,
     target: 'es2022',
     assetsInlineLimit: 0,

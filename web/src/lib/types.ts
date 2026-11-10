@@ -2,6 +2,8 @@ import type { WcsCards } from './wcs';
 
 export interface RunInfo {
   name: string;
+  /** What verdicts are filed under when `--name` gave the run a name for show. */
+  id?: string;
   model: string;
   detector: string;
   resolution: number;

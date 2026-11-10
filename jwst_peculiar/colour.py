@@ -1,6 +1,6 @@
 """Ranks sources by how unlike every well-measured source their spectrum is.
 
-    python -m jwstdetector.colour RAW STARS OUT MOSAIC [MOSAIC ...]
+    python -m jwst_peculiar.colour RAW STARS OUT MOSAIC [MOSAIC ...]
 
 Each band of each mosaic (RAW/MOSAIC/MOSAIC_nircam_*-BAND_i2d.fits) is smoothed to
 F460M's resolution and resampled onto the F460M grid, one 1,920 px block at a time.
@@ -33,15 +33,20 @@ from photutils.aperture import CircularAperture, aperture_photometry
 from photutils.background import Background2D
 from photutils.segmentation import SourceCatalog, deblend_sources, detect_sources
 from reproject import reproject_interp
-from scipy.ndimage import binary_dilation, gaussian_filter
+from scipy.ndimage import (
+    binary_dilation,
+    gaussian_filter,
+    maximum_filter,
+    uniform_filter,
+)
 
-from jwstdetector.survey import STAR_RADIUS_AT_19, read_stars
-from jwstdetector.vet import catalogue_note
+from jwst_peculiar.survey import STAR_RADIUS_AT_19, read_stars
+from jwst_peculiar.vet import catalogue_note
 
 if TYPE_CHECKING:
     import numpy.typing as npt
 
-    from jwstdetector.utils import FitsHDUList, SkyCoords, SkyWcs
+    from jwst_peculiar.utils import FitsHDUList, SkyCoords, SkyWcs
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +67,8 @@ BLOCK_PX = 1920
 COVERED = 0.999
 MIN_SKY_PIXELS = 500
 MARGIN_PX = 32
-# A star's halo reaches past the star rule and made whole regions into one
-# source, so each band loses a local sky in boxes about 6 arcsec across.
+# A star's halo reaches past the star rule and would merge whole regions into one
+# source, so each band has a local sky taken off in boxes about 6 arcsec across.
 SKY_BOX_PX = 96
 APERTURE_ARCSEC = 0.16
 # Point sources sit on a tight sequence of the flux ratio inside these two radii,
@@ -74,6 +79,17 @@ WIDE_ARCSEC = 0.24
 # pixel or cosmic ray in one band, so sources sharper than that are listed apart.
 SHARPEST = 0.45
 FLOOR = 0.05
+# Smoothing spreads a hot pixel into something star shaped, so they are found on the
+# native pixels first. 60 library stars put at most 0.28 of a 3 by 3 box in its
+# brightest pixel, and the hot pixels at the top of the first full list put 0.34
+# to 0.60.
+SPIKE_SIGMA = 8.0
+SPIKE_SHARE = 0.32
+# A cosmic ray across a few pixels is too spread out for that, but it lights one band
+# alone. [OIII] at a rest equivalent width of 4,000 A, about the most extreme known,
+# lifts a medium band to at most 12 times the rest (F250M at z of 4). In Sonora Bobcat
+# only F460M goes past that, to 2,500 times at 200 K, so it's never treated this way.
+LONE = 20.0
 DETECT_SIGMA = 3.0
 DETECT_PIXELS = 5
 KEEP_SN = 10.0
@@ -109,10 +125,12 @@ def chi2_to_library(
         One row per source, one column per library spectrum.
     """
     w = 1.0 / err**2
+    flux = np.where(np.isfinite(err), flux, 0.0)
     a = (flux * w) @ library.T
     b = w @ (library**2).T
     c = np.sum(flux**2 * w, axis=1)[:, None]
-    chi2 = np.maximum(c - a**2 / b, 0.0)
+    fit = np.divide(a**2, b, out=np.zeros_like(a), where=b > 0)
+    chi2 = np.maximum(c - fit, 0.0)
     if skip is not None:
         chi2[skip] = np.inf
     return chi2
@@ -145,6 +163,24 @@ def score(
     return out
 
 
+def lone(
+    flux: npt.NDArray[np.float64], sky_err: npt.NDArray[np.float64]
+) -> npt.NDArray[np.bool_]:
+    """Bands other than F460M holding LONE times every other band of their source.
+
+    A band without a detection counts at its 1 sigma.
+
+    Returns:
+        One row per source, one column per band.
+    """
+    floor = np.maximum(flux, sky_err)
+    out = np.zeros(flux.shape, dtype=bool)
+    for b in range(flux.shape[1] - 1):
+        others = np.delete(floor, b, axis=1).max(axis=1)
+        out[:, b] = flux[:, b] > LONE * others
+    return out
+
+
 def _band_file(raw: Path, mosaic: str, band: str) -> Path:
     found = sorted((raw / mosaic).glob(f"{mosaic}_nircam_*{band}_i2d.fits"))
     if len(found) != 1:
@@ -153,13 +189,34 @@ def _band_file(raw: Path, mosaic: str, band: str) -> Path:
     return found[0]
 
 
+def spikes(
+    sci: npt.NDArray[np.float64], good: npt.NDArray[np.bool_]
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Pixels far sharper than the PSF allows, on a band's native grid.
+
+    Returns:
+        Their rows and columns.
+    """
+    noise = _mad(sci[good]) if good.any() else 1.0
+    box = uniform_filter(np.clip(sci, 0.0, None), 3) * 9
+    share = np.divide(sci, box, out=np.zeros_like(sci), where=box > 0)
+    hit = (
+        good
+        & (sci > SPIKE_SIGMA * noise)
+        & (sci == maximum_filter(sci, 3))
+        & (share > SPIKE_SHARE)
+    )
+    ys, xs = np.nonzero(hit)
+    return ys.astype(np.int64), xs.astype(np.int64)
+
+
 def _resampled(  # noqa: PLR0914 one band, read, smoothed and resampled
     path: Path, target: SkyWcs, *, shape: tuple[int, int], fwhm: float
-) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_]]:
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_], npt.NDArray[np.float64]]:
     """One band smoothed to F460M and resampled onto the target block.
 
     Returns:
-        The image and where it has data.
+        The image, where it has data and its spikes as x, y on the target.
     """
     hdul: FitsHDUList = fits.open(path, memmap=True)
     with hdul as h:
@@ -175,12 +232,15 @@ def _resampled(  # noqa: PLR0914 one band, read, smoothed and resampled
         x0, x1 = max(int(xs.min()) - pad, 0), min(int(xs.max()) + pad, nx)
         y0, y1 = max(int(ys.min()) - pad, 0), min(int(ys.max()) + pad, ny)
         if x1 <= x0 or y1 <= y0:
-            return np.zeros(shape), np.zeros(shape, dtype=bool)
+            return np.zeros(shape), np.zeros(shape, dtype=bool), np.empty((0, 2))
         sci = np.array(h["SCI"].section[y0:y1, x0:x1], dtype=np.float64)
         wht = np.array(h["WHT"].section[y0:y1, x0:x1], dtype=np.float64)
     cut = wcs[y0:y1, x0:x1]
     good = np.isfinite(sci) & (wht > 0)
     sci[~good] = 0.0
+    sy, sx = spikes(sci, good)
+    at = target.world_to_pixel(cut.pixel_to_world(sx, sy))
+    spiked = np.column_stack([np.atleast_1d(at[0]), np.atleast_1d(at[1])])
     sigma_px = kernel_sigma_arcsec(fwhm) / float(
         proj_plane_pixel_scales(cut).mean() * 3600
     )
@@ -188,7 +248,7 @@ def _resampled(  # noqa: PLR0914 one band, read, smoothed and resampled
         sci = gaussian_filter(sci, sigma_px)
     img, _ = reproject_interp((sci, cut), target, shape_out=shape)
     cover, _ = reproject_interp((good.astype(np.float64), cut), target, shape_out=shape)
-    return np.nan_to_num(img), np.nan_to_num(cover) > COVERED
+    return np.nan_to_num(img), np.nan_to_num(cover) > COVERED, spiked
 
 
 @dataclass
@@ -219,20 +279,25 @@ def _sky_scatter(
 
 def _bands_on(
     raw: Path, mosaic: str, *, target: SkyWcs, shape: tuple[int, int]
-) -> tuple[list[npt.NDArray[np.float64]], npt.NDArray[np.bool_]]:
-    imgs, cover = [], np.ones(shape, dtype=bool)
+) -> tuple[
+    list[npt.NDArray[np.float64]],
+    npt.NDArray[np.bool_],
+    list[npt.NDArray[np.float64]],
+]:
+    imgs, cover, spiked = [], np.ones(shape, dtype=bool), []
     for band, _, fwhm in BANDS:
-        img, ok = _resampled(
+        img, ok, at = _resampled(
             _band_file(raw, mosaic, band), target, shape=shape, fwhm=fwhm
         )
         imgs.append(img)
+        spiked.append(at)
         cover &= ok
     if cover.sum() < 0.1 * cover.size:
-        return imgs, cover
+        return imgs, cover, spiked
     for i, img in enumerate(imgs):
         sky = Background2D(img, SKY_BOX_PX, filter_size=3, coverage_mask=~cover)
         imgs[i] = np.where(cover, img - sky.background, 0.0)
-    return imgs, cover
+    return imgs, cover, spiked
 
 
 def _mad(x: npt.NDArray[np.float64]) -> float:
@@ -258,7 +323,7 @@ def _detect(
     return xy, np.asarray(segm.data > 0)
 
 
-def measure_block(  # noqa: PLR0914 one block, in the order the module docstring gives
+def measure_block(  # noqa: PLR0914, PLR0915 one block, in the order the module docstring gives
     raw: Path,
     mosaic: str,
     *,
@@ -275,7 +340,7 @@ def measure_block(  # noqa: PLR0914 one block, in the order the module docstring
     shape = (size[0] + 2 * MARGIN_PX, size[1] + 2 * MARGIN_PX)
     target = ref.deepcopy()
     target.wcs.crpix = target.wcs.crpix - [bx - MARGIN_PX, by - MARGIN_PX]
-    imgs, cover = _bands_on(raw, mosaic, target=target, shape=shape)
+    imgs, cover, spiked = _bands_on(raw, mosaic, target=target, shape=shape)
     if cover.sum() < 0.1 * cover.size:
         return None
     det = np.where(cover, sum(img / _mad(img[cover]) for img in imgs), 0.0)
@@ -304,7 +369,12 @@ def measure_block(  # noqa: PLR0914 one block, in the order the module docstring
     flux = np.column_stack([
         np.asarray(aperture_photometry(img, ap)["aperture_sum"]) for img in imgs
     ])
-    sky_err = np.array([_sky_scatter(img, empty, radius) for img in imgs])
+    sky_err = np.tile([_sky_scatter(img, empty, radius) for img in imgs], (len(xy), 1))
+    # A band with a spike in the aperture counts as unmeasured, not as the source.
+    for band, at in enumerate(spiked):
+        if len(at):
+            near = np.hypot(*(xy[:, None, :] - at[None, :, :]).transpose(2, 0, 1))
+            sky_err[(near <= radius + 1).any(axis=1), band] = np.inf
     det_flux = np.asarray(
         aperture_photometry(det, ap)["aperture_sum"], dtype=np.float64
     )
@@ -323,7 +393,7 @@ def measure_block(  # noqa: PLR0914 one block, in the order the module docstring
         ra=np.asarray(sky.ra.deg)[keep],
         dec=np.asarray(sky.dec.deg)[keep],
         flux=flux[keep],
-        sky_err=np.tile(sky_err, (int(keep.sum()), 1)),
+        sky_err=sky_err[keep],
         det_sn=det_sn[keep],
         conc=(core / wide)[keep],
         block=[name] * int(keep.sum()),
@@ -360,8 +430,8 @@ def measure_mosaic(raw: Path, mosaic: str) -> list[Found]:
 def _near_star(coords: SkyCoords, stars_json: Path) -> npt.NDArray[np.bool_]:
     stars, g = read_stars(stars_json, coords)
     bright = g < STAR_G_MAX
-    # The survey adds a tile's half-diagonal to the halo, but a source is a point,
-    # and with the tile's reach the rule threw away 16% of o003.
+    # The survey adds a tile's half-diagonal to the halo, but a source is a point.
+    # With the tile's reach the rule throws away 16% of o003.
     reach = STAR_RADIUS_AT_19 * 10 ** (0.2 * (19 - g[bright]))
     idx_star, idx_src, sep, _ = coords.search_around_sky(
         stars[bright], float(np.max(reach)) * u.arcsec
@@ -409,6 +479,9 @@ def build(found: list[Found], stars_json: Path) -> Catalogue:  # noqa: PLR0914 t
 
     Returns:
         The catalogue.
+
+    Raises:
+        SystemExit: If too few sources are bright enough to form the library.
     """
     flux = np.concatenate([f.flux for f in found])
     sky_err = np.concatenate([f.sky_err for f in found])
@@ -425,8 +498,15 @@ def build(found: list[Found], stars_json: Path) -> Catalogue:  # noqa: PLR0914 t
     keep &= _unique(coords, np.argsort(-det_sn), 0.3)
     idx = np.nonzero(keep)[0]
     flux, sky_err, coords = flux[idx], sky_err[idx], coords[idx]
+    sky_err = np.where(lone(flux, sky_err), np.inf, sky_err)
     err = np.sqrt(sky_err**2 + (FLOOR * flux) ** 2)
     lib = np.nonzero(np.all(flux / sky_err >= LIBRARY_SN, axis=1))[0]
+    if len(lib) < NEIGHBOUR:
+        msg = (
+            f"Only {len(lib)} sources reach {LIBRARY_SN} sigma in every band, and "
+            f"the score needs a library of at least {NEIGHBOUR}."
+        )
+        raise SystemExit(msg)
     # astropy gives the library's index first, then the source's.
     by_lib, by_src, _, _ = coords.search_around_sky(
         coords[lib], APART_ARCSEC * u.arcsec
@@ -540,7 +620,7 @@ def _write_csv(cat: Catalogue, out: Path) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m jwstdetector.colour",
+        prog="python -m jwst_peculiar.colour",
         description=(__doc__ or "").split("\n\n", maxsplit=1)[0],
     )
     p.add_argument("raw", type=Path)

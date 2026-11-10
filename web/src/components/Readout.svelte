@@ -213,7 +213,6 @@
     return `Ran in ${r.dtype}${how}${r.fast_accumulate ? ' with fp16 sums' : ''}`;
   });
 
-  // Display block.
   const STRETCHES: { id: Stretch; label: string }[] = [
     { id: 'linear', label: 'Linear' },
     { id: 'sqrt', label: 'Sqrt' },
@@ -263,7 +262,8 @@
           bins[k] = (bins[k] ?? 0) + 1;
         }
       }
-      const top = Math.log1p(Math.max(...bins));
+      // Or 1, as a sample that's all NaN leaves every bin empty.
+      const top = Math.log1p(Math.max(...bins)) || 1;
       return bins
         .map(
           (c, k) =>
@@ -281,7 +281,6 @@
     return Math.abs(v) >= 1 ? v.toFixed(4) : v.toPrecision(4);
   };
 
-  // Header block.
   let headerQuery = $state('');
   const cards = $derived.by(() => {
     const q = headerQuery.trim().toLowerCase();
@@ -296,17 +295,22 @@
   // Note, saved after a pause in typing and whenever the tile changes.
   let draft = $state('');
   let draftKey = '';
+  // Whether the draft holds typing that isn't saved yet. Without it, a note that an
+  // import or another tab brought in would be overwritten by the stale draft.
+  let dirty = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   function commitNote() {
     if (timer) {
       clearTimeout(timer);
     }
     timer = null;
-    if (draftKey && (verdicts.map.get(draftKey)?.note ?? '') !== draft) {
+    if (dirty && draftKey) {
       verdicts.update(draftKey, { note: draft });
     }
+    dirty = false;
   }
   function typed() {
+    dirty = true;
     if (timer) {
       clearTimeout(timer);
     }
@@ -314,11 +318,22 @@
   }
   $effect(() => {
     const key = tile.key;
+    const stored = verdicts.map.get(key)?.note ?? '';
     if (key !== draftKey) {
       commitNote();
       draftKey = key;
-      draft = verdicts.map.get(key)?.note ?? '';
+      draft = stored;
+    } else if (!dirty) {
+      draft = stored;
     }
+  });
+  $effect(() => {
+    // A tab closed inside the pause would lose what was typed.
+    addEventListener('pagehide', commitNote);
+    return () => {
+      removeEventListener('pagehide', commitNote);
+      commitNote();
+    };
   });
 
   const save = $derived(verdicts.state);
@@ -369,7 +384,7 @@
     const blob = new Blob([verdicts.toCsv(bundle)], { type: 'text/csv' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `${bundle.run.name}-verdicts.csv`;
+    a.download = `${bundle.run.id ?? bundle.run.name}-verdicts.csv`;
     a.click();
     setTimeout(() => {
       URL.revokeObjectURL(a.href);
@@ -382,8 +397,9 @@
       return;
     }
     try {
-      const n = verdicts.importText(await f.text());
-      importMsg = `Took ${String(n)} verdicts from ${f.name}.`;
+      const { taken, skipped } = verdicts.importText(await f.text());
+      const left = skipped ? ` Left out ${String(skipped)} not in this run.` : '';
+      importMsg = `Took ${String(taken)} ${taken === 1 ? 'tile' : 'tiles'} from ${f.name}.${left}`;
     } catch (err) {
       importMsg = `Couldn't read ${f.name}. ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -478,7 +494,7 @@
       {#if tile.p !== undefined && tile.q !== undefined}
         <dt>Significance</dt>
         <dd class="num">
-          <b>p {fmtP(tile.p)}</b> <b>q {fmtP(tile.q)}</b><span class="sub"
+          <b>p {fmtP(tile.p)}</b> <b>q {fmtP(tile.q)}</b><span class="sub words"
             >Against {(bundle.run.n_calibration ?? 0).toLocaleString('en-CA')} tiles of {bundle
               .run.reference_fields?.length ?? 0} other fields, each scored against the rest,
             so p can't go below
@@ -498,8 +514,8 @@
       {/if}
       {#if learned}
         <dt>Learned</dt>
-        <dd class="num">
-          {#if learned.from}<b>{learned.value.toFixed(2)}</b>
+        <dd>
+          {#if learned.from}<b class="num">{learned.value.toFixed(2)}</b>
             <span class="dim"
               >from {learned.from}
               {learned.from === 1 ? 'verdict' : 'verdicts'}, 0.5 is neutral</span
@@ -525,9 +541,23 @@
         {arcsec.toFixed(2)}&Prime;
       </dd>
       <dt>Peak</dt>
-      <dd class="num">
-        r{tile.peak[0]} c{tile.peak[1]}
-        <span class="dim">of {grid[0]} &times; {grid[1]}</span>
+      <dd>
+        <span class="num"
+          ><svg
+            class="peakring"
+            width="14"
+            height="14"
+            viewBox="-7 -7 14 14"
+            aria-hidden="true"
+            ><circle r="3.5" /><path
+              d="M0 -6.5 V-5 M0 5 V6.5 M-6.5 0 H-5 M5 0 H6.5"
+            /></svg
+          >r{tile.peak[0]} c{tile.peak[1]}
+          <span class="dim">of {grid[0]} &times; {grid[1]}</span></span
+        >
+        <span class="dim small under"
+          >The patch furthest from the reference, ringed on the plate.</span
+        >
       </dd>
       {#if tile.owned}
         {@const [r0, r1, c0, c1] = tile.owned}
@@ -671,7 +701,8 @@
           /></label
         >
         <span class="dim small">
-          {#if save.kind === 'local'}{save.count} in this browser{/if}
+          {#if save.kind === 'local'}<span class="num">{save.count}</span>
+            {save.count === 1 ? 'verdict' : 'verdicts'} in this browser{/if}
           {#if !verdicts.storageOk}This browser is blocking storage, so export before
             you close the tab.{/if}
         </span>
@@ -724,7 +755,7 @@
     {#if data && !data.planes}
       <p class="quiet">
         This tile has no FITS cutout, so it shows the 8-bit PNG as it was cut. Stretch
-        and limits work on cutouts.
+        and limits need a cutout.
       </p>
     {/if}
     <div class="field">
@@ -792,6 +823,7 @@
           type="number"
           step="any"
           aria-label="{channelNames[c]} low"
+          disabled={!data?.planes}
           value={fmtLimit(lo)}
           onchange={(e) => {
             setManual(c, 'lo', e.currentTarget.value);
@@ -802,6 +834,7 @@
           type="number"
           step="any"
           aria-label="{channelNames[c]} high"
+          disabled={!data?.planes}
           value={fmtLimit(limits.hi[c] ?? NaN)}
           onchange={(e) => {
             setManual(c, 'hi', e.currentTarget.value);
@@ -901,6 +934,7 @@
     <input
       class="ctl hq"
       type="search"
+      aria-label="Search the FITS header"
       placeholder="Search keywords and values"
       bind:value={headerQuery}
       spellcheck="false"
@@ -923,7 +957,7 @@
       <dd class="name">{bundle.run.name}</dd>
       <dt>Model</dt>
       <dd class="num small">
-        {bundle.run.model}{#if ran}<span class="sub">{ran}</span>{/if}
+        {bundle.run.model}{#if ran}<span class="sub words">{ran}</span>{/if}
       </dd>
       <dt>Detector</dt>
       {#if bundle.run.reference_fields?.length}
@@ -1014,6 +1048,9 @@
     display: block;
     color: var(--chalk-3);
   }
+  dd .words {
+    font-family: var(--font-label);
+  }
   .nowrap {
     white-space: nowrap;
   }
@@ -1078,6 +1115,16 @@
     display: block;
     margin-top: 2px;
   }
+  .peakring {
+    vertical-align: -2px;
+    margin-right: 6px;
+  }
+  .peakring circle,
+  .peakring path {
+    fill: none;
+    stroke: var(--ring);
+    stroke-width: 1.5;
+  }
   .field {
     display: grid;
     grid-template-columns: 62px 1fr;
@@ -1141,7 +1188,7 @@
     min-width: 0;
     color: var(--anno);
     padding: 0 6px;
-    height: 22px;
+    height: 24px;
   }
   .limits .unit {
     font-size: 10.5px;
@@ -1272,8 +1319,10 @@
     gap: 8px;
     align-items: baseline;
   }
+  /* Centred on the first line, as a wrapped name makes the row several lines tall. */
   .matches svg {
-    align-self: center;
+    align-self: start;
+    margin-top: calc((1lh - 12px) / 2);
     overflow: visible;
   }
   .matches path {
@@ -1346,7 +1395,7 @@
     align-items: center;
     gap: 5px;
     text-decoration: none;
-    padding: 2px 0;
+    min-height: 24px;
   }
   .links a:hover {
     text-decoration: underline;
@@ -1375,5 +1424,16 @@
     color: var(--chalk);
     overflow-wrap: anywhere;
     font-size: 11px;
+  }
+  @media (pointer: coarse) {
+    .check,
+    .links a {
+      min-height: 44px;
+    }
+    .who a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+    }
   }
 </style>

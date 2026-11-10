@@ -18,9 +18,9 @@ jobs:
       # CUDA wheels are a couple of gigabytes.
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -e ".[dev]"
-      - run: ruff check jwstdetector tests
-      - run: ruff format --check jwstdetector tests
-      - run: mypy jwstdetector tests
+      - run: ruff check jwst_peculiar tests
+      - run: ruff format --check jwst_peculiar tests
+      - run: mypy jwst_peculiar tests
       - run: basedpyright
       - run: pytest -q
 

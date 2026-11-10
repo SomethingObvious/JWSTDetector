@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PIL import Image
 
-from jwstdetector import bootstrap
-from jwstdetector.data import read_measurements
+from jwst_peculiar import bootstrap
+from jwst_peculiar.data import read_measurements
 
 if TYPE_CHECKING:
     from pathlib import Path

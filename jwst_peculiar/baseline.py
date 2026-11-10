@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PIL import Image
 
-from jwstdetector.data import relative_key
+from jwst_peculiar.data import relative_key
 
 if TYPE_CHECKING:
     from pathlib import Path

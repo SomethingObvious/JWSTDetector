@@ -34,7 +34,6 @@
   const px = (t: TileInfo) => (t.x0 + t.size / 2) * scale;
   const py = (t: TileInfo) => (shape[0] - t.y0 - t.size / 2) * scale;
 
-  // Dots for the other candidates in the current list that sit on this mosaic.
   const dots = $derived.by(() => {
     const out: number[] = [];
     if (!tile) {

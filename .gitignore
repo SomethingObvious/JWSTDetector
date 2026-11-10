@@ -8,7 +8,6 @@ dist/
 
 # Virtual environments
 *venv/
-.venv/
 env/
 
 # Tooling caches
@@ -16,29 +15,15 @@ env/
 .ruff_cache/
 .pytest_cache/
 
-# Editors / OS
+# Editors and the OS
 .idea/
 .vscode/
 .DS_Store
-*:Zone.Identifier
 
-# Data, models, and run outputs (large / machine-specific)
-dev/
-data/*
-data_utils/*
+# Data, weights and run outputs, which are big and differ by machine
 datasets*/
-rawfits/*
 rawfits*/
-rawfits_miri*/
 models/
-results
 results*/
-paper_plots*/
-paper_tables*/
-viewer_renders*/
 bench_*/
 *.log
-
-# Notebooks kept out of the repo
-*personal.ipynb
-feature_extraction.ipynb

@@ -242,7 +242,6 @@ export class Renderer {
     if (d.planes && d.channels === 3) {
       const n = d.width * d.height;
       const rgb = new Float32Array(n * 3);
-      // Interleaves the bands one plane at a time.
       d.planes.forEach((plane, c) => {
         let o = c;
         for (const v of plane) {

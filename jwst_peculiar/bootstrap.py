@@ -24,9 +24,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import yaml
 
-from jwstdetector.backbones import get_backbone
-from jwstdetector.baseline import isolation_scores
-from jwstdetector.data import (
+from jwst_peculiar.backbones import get_backbone
+from jwst_peculiar.baseline import isolation_scores
+from jwst_peculiar.data import (
     list_images,
     load_footprints,
     prepare_out_dir,
@@ -36,15 +36,15 @@ from jwstdetector.data import (
     write_measurements_csv,
     write_ref_list,
 )
-from jwstdetector.detection import METRICS, run_anomaly_detection
-from jwstdetector.features import FeatureCache
-from jwstdetector.scoring import SCORE_MODES
-from jwstdetector.seeding import set_seed
-from jwstdetector.significance import write_significance
+from jwst_peculiar.detection import METRICS, run_anomaly_detection
+from jwst_peculiar.features import FeatureCache
+from jwst_peculiar.scoring import SCORE_MODES
+from jwst_peculiar.seeding import set_seed
+from jwst_peculiar.significance import write_significance
 
 if TYPE_CHECKING:
-    from jwstdetector.backbones import Backbone
-    from jwstdetector.detection import Footprint
+    from jwst_peculiar.backbones import Backbone
+    from jwst_peculiar.detection import Footprint
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ def _add_input_args(p: argparse.ArgumentParser) -> None:
         default=True,
         action=argparse.BooleanOptionalAction,
         help="With --reference_roots, score each field against the others for the "
-        "p-values. The benchmark turns it off, as it only needs the ranking.",
+        "p-values. --no-calibrate skips that when only the ranking is needed.",
     )
     p.add_argument(
         "--recursive_query", default=True, action=argparse.BooleanOptionalAction
@@ -166,10 +166,11 @@ def _add_detector_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--score_region",
         default="owned",
-        choices=("owned", "all"),
+        choices=("owned", "middle", "all"),
         help="Score each tile on the patches no overlapping tile is more central to, "
-        "which keeps objects cut off by a tile's edge from crowding the top, or on all "
-        "of them.",
+        "which keeps objects cut off by a tile's edge from crowding the top, on only "
+        "the ones of those in its middle half, so a tile with a neighbour missing "
+        "scores no more than the rest, or on all of them.",
     )
     p.add_argument("--k_neighbors", type=int, default=1)
     p.add_argument(
@@ -265,7 +266,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the options of `jwstdetector run`.
+    """Parse the options of `jwst-peculiar run`.
 
     Returns:
         The parsed arguments.
@@ -419,16 +420,39 @@ def _feature_cache(args: argparse.Namespace, backbone: Backbone) -> FeatureCache
     return cache
 
 
+def _check_ranges(args: argparse.Namespace) -> None:
+    # Each of these gave a ranking with no warning when it was out of range, like the
+    # whole tile's mean for a --score_top_frac of 5 meant as a percentage.
+    rules = {
+        "score_top_frac": (0 < args.score_top_frac <= 1, "above 0 and at most 1"),
+        "score_quantile": (0 <= args.score_quantile <= 1, "from 0 to 1"),
+        "subspace_variance": (0 < args.subspace_variance < 1, "between 0 and 1"),
+        "k_neighbors": (args.k_neighbors >= 1, "at least 1"),
+        "max_bank_patches": (args.max_bank_patches >= 1, "at least 1"),
+        "drop_directions": (args.drop_directions >= 0, "0 or more"),
+        "places": (args.places >= 1, "at least 1"),
+    }
+    for name, (ok, words) in rules.items():
+        if not ok:
+            msg = f"--{name} has to be {words}, got {getattr(args, name)}"
+            raise SystemExit(msg)
+    if args.detector == "iforest" and args.reference_roots:
+        msg = "--detector iforest scores a field on its own, without --reference_roots"
+        raise SystemExit(msg)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Run `jwstdetector run`.
+    """Run `jwst-peculiar run`.
 
     Returns:
         The exit code, which is always 0.
 
     Raises:
-        SystemExit: If there's no query folder under --data_root.
+        SystemExit: If there's no query folder under --data_root, or an option is
+            out of range.
     """
     args = parse_args(argv)
+    _check_ranges(args)
     _setup(args)
 
     query_dir = Path(args.data_root).resolve() / args.query_subdir
@@ -471,7 +495,7 @@ def _two_passes(scorer: _Scorer, out_dir: Path) -> int:
     logger.info("Pass 1 uses %d random tiles of %d as the reference", k1, n)
 
     if args.save_examples:
-        from jwstdetector.utils import plot_reference_masks  # noqa: PLC0415 matplotlib is slow to load
+        from jwst_peculiar.utils import plot_reference_masks  # noqa: PLC0415 matplotlib is slow to load
 
         plot_reference_masks(
             scorer.backbone, ref1, queries.root, out_dir / "reference_samples.png"
@@ -545,32 +569,61 @@ def _reference_fields(args: argparse.Namespace) -> list[_Field]:
     return fields
 
 
-def _check_mosaic_names(fields: list[_Field], target: dict[Path, Footprint]) -> None:
-    """Stop if two fields, or the target and a field, share a mosaic name.
+def _one_grid(a: list[Footprint], b: list[Footprint]) -> bool:
+    """True if two sets of tiles fit one map from mosaic pixels to sky, to 1 arcsec.
 
-    Footprints match tiles to each other by mosaic name, so a name two fields share
-    would make their tiles exclude each other.
+    Blocks cut from one mosaic share its name and its grid, which is what footprints
+    match on. Two different mosaics given one name by --tiles don't fit one map.
+
+    Returns:
+        Whether every tile of `b` lands within 1 arcsec of where `a`'s map puts it.
+    """
+    if len(a) < 3 or len(b) < 1:  # noqa: PLR2004 an affine map needs three points
+        return False
+    xy = np.array([[f.x0, f.y0, 1.0] for f in a])
+    sky = np.array([[f.ra, f.dec] for f in a])
+    fit, *_ = np.linalg.lstsq(xy, sky, rcond=None)
+    got = np.array([[f.x0, f.y0, 1.0] for f in b]) @ fit
+    want = np.array([[f.ra, f.dec] for f in b])
+    cosd = np.cos(np.radians(want[:, 1]))
+    off = np.hypot((got[:, 0] - want[:, 0]) * cosd, got[:, 1] - want[:, 1]) * 3600
+    return bool(np.all(off < 1.0))
+
+
+def _check_mosaic_names(fields: list[_Field], target: dict[Path, Footprint]) -> None:
+    """Stop if fields, or the target and a field, share a mosaic name but not its grid.
+
+    Footprints match tiles to each other by mosaic name and pixel box, so a name two
+    different mosaics share would make unrelated tiles exclude each other.
 
     Raises:
-        SystemExit: If a mosaic name is in more than one field.
+        SystemExit: If one mosaic name covers two different grids.
     """
-    seen: dict[str, str] = {}
-    for field in fields:
-        for f in field.footprints.values():
-            if seen.setdefault(f.mosaic, field.name) != field.name:
+    groups = [
+        (f"field {field.name}", list(field.footprints.values())) for field in fields
+    ]
+    groups.append(("the target", list(target.values())))
+    seen: dict[str, tuple[str, list[Footprint]]] = {}
+    for label, footprints in groups:
+        by_name: dict[str, list[Footprint]] = {}
+        for f in footprints:
+            by_name.setdefault(f.mosaic, []).append(f)
+        for name, mine in by_name.items():
+            if name not in seen:
+                seen[name] = (label, mine)
+                continue
+            first, theirs = seen[name]
+            if not (_one_grid(theirs, mine) or _one_grid(mine, theirs)):
                 msg = (
-                    f"Mosaic {f.mosaic} is in both {seen[f.mosaic]} and {field.name}. "
-                    "Cut one of them again with a different --tiles name."
+                    f"Mosaic {name} is in both {first} and {label} on different "
+                    "grids. Cut one of them again with a different --tiles name."
                 )
                 raise SystemExit(msg)
-    clash = {f.mosaic for f in target.values()} & seen.keys()
-    if clash:
-        msg = f"Mosaic {min(clash)} is in the target and a reference field."
-        raise SystemExit(msg)
+            seen[name] = (first, theirs + mine)
 
 
 def _cross_field(scorer: _Scorer, out_dir: Path) -> int:
-    """Scores the tiles against other fields, and each other field against the rest.
+    """Score the tiles against the other fields, and each field against the rest.
 
     Returns:
         The exit code, which is always 0.

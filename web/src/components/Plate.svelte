@@ -313,10 +313,9 @@
         onclick={() => (display.catalogues = !display.catalogues)}
         title={hasCatalogues
           ? 'Catalogued sources over the tile (c)'
-          : 'Run jwstdetector match to mark catalogued sources'}>Catalogues</button
+          : 'Run jwst-peculiar match to mark catalogued sources'}>Catalogues</button
       >
     </div>
-    <span class="sep"></span>
     <div class="group">
       <button
         class="ctl"
@@ -357,7 +356,6 @@
         >
       </div>
     </div>
-    <span class="sep"></span>
     <div class="group sliders">
       <label class="slider">
         <span class="label">Opacity</span>
@@ -451,12 +449,16 @@
             height={patchBox.h}
           />
         {/if}
+        <!-- Every halo goes under every outline, or a neighbour's halo cuts into it. -->
         {#each markers as m, i (i)}
-          <g class="src" transform="translate({m.x} {m.y})"
-            ><title>{m.cat} {m.name}</title>
-            <path class="halo" d={catShape(m.cat)} />
-            <path d={catShape(m.cat)} />
-          </g>
+          <path
+            class="src halo"
+            transform="translate({m.x} {m.y})"
+            d={catShape(m.cat)}
+          />
+        {/each}
+        {#each markers as m, i (i)}
+          <path class="src" transform="translate({m.x} {m.y})" d={catShape(m.cat)} />
         {/each}
         {#if ring}
           <g class="ring" transform="translate({ring.x} {ring.y})">
@@ -548,7 +550,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px 10px;
+    gap: 6px 14px;
     padding: 6px 12px;
     border-bottom: 1px solid var(--rule);
     min-height: 37px;
@@ -559,18 +561,10 @@
     align-items: center;
     gap: 6px;
   }
-  .sep {
-    width: 1px;
-    height: 16px;
-    background: var(--rule);
-  }
   .seg {
     display: flex;
   }
   @media (max-width: 820px) {
-    .sep {
-      display: none;
-    }
     .toolbar {
       gap: 6px;
     }
@@ -630,13 +624,6 @@
     inset: 0 auto 0 0;
     background: rgb(0 0 0 / 0.6);
     border-right: 1.5px solid var(--chalk);
-  }
-  .sr {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
   }
   .stage {
     position: relative;
@@ -700,12 +687,12 @@
     stroke-width: 1;
     opacity: 0.85;
   }
-  .src path {
+  .src {
     fill: none;
     stroke: var(--cat);
     stroke-width: 1.25;
   }
-  .src .halo {
+  .src.halo {
     stroke: var(--ground-sunk);
     stroke-width: 3.5;
     opacity: 0.7;

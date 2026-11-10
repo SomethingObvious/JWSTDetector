@@ -1,6 +1,6 @@
 <script lang="ts">
   import Glyph from './Glyph.svelte';
-  import { shortMosaic, type Bundle, type Filters } from '../lib/types';
+  import { VERDICTS, shortMosaic, type Bundle, type Filters } from '../lib/types';
   import { raHms, decDms } from '../lib/wcs';
   import { orList } from '../lib/catalogues';
   import type { Verdicts } from '../lib/verdicts.svelte';
@@ -27,7 +27,8 @@
     onselect: (index: number) => void;
   } = $props();
 
-  const ROW = 40;
+  // Rows are positioned in script, so the touch height can't live in CSS alone.
+  const ROW = matchMedia('(pointer: coarse)').matches ? 44 : 40;
   let scroller: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
   let height = $state(600);
@@ -268,6 +269,7 @@
           class="item"
           class:current={i === current}
           style:transform="translateY({k * ROW}px)"
+          style:height="{ROW}px"
           role="option"
           aria-selected={i === current}
           tabindex="-1"
@@ -276,9 +278,15 @@
           }}
         >
           <span class="rank num">{t.rank}</span>
-          <span class="mark"><Glyph verdict={v?.verdict ?? null} /></span>
           <span class="mark"
-            >{#if v?.star}<Glyph verdict="star" size={11} />{/if}</span
+            ><Glyph verdict={v?.verdict ?? null} />{#if v?.verdict}<span class="sr"
+                >{VERDICTS.find((d) => d.id === v.verdict)?.label}</span
+              >{/if}</span
+          >
+          <span class="mark"
+            >{#if v?.star}<Glyph verdict="star" size={11} /><span class="sr"
+                >Starred</span
+              >{/if}</span
           >
           <span class="bar" aria-hidden="true"
             ><i
@@ -333,13 +341,6 @@
     display: grid;
     gap: 6px;
     border-bottom: 1px solid var(--rule);
-  }
-  .sr {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
   }
   .search {
     position: relative;
@@ -432,12 +433,12 @@
     left: 0;
     right: 0;
     top: 0;
-    height: 40px;
     display: grid;
     grid-template-columns: 40px 14px 13px 1fr 50px;
     grid-template-rows: 18px 16px;
     column-gap: 6px;
     align-items: center;
+    align-content: center;
     padding: 3px 12px 3px 0;
     border: 0;
     border-bottom: 1px solid var(--rule);

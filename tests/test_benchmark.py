@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pytest
 
-from jwstdetector import benchmark
-from jwstdetector.benchmark import Optics, Source
+from jwst_peculiar import benchmark
+from jwst_peculiar.benchmark import Optics, Source
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -116,7 +116,7 @@ def test_ranks_put_nan_last() -> None:
 
 def test_null_ranks_ignore_other_planted_tiles() -> None:
     scores = {"a": 5.0, "b": 4.0, "p1": 3.0, "c": 2.0, "p2": 6.0, "p3": float("nan")}
-    # p2 sits above p1's way, but only the unplanted a and b beat p1.
+    # p2 outscores p1, but only the unplanted a and b count against p1.
     assert benchmark.null_ranks(scores, {"p1", "p2", "p3"}) == {
         "p1": 3,
         "p2": 1,

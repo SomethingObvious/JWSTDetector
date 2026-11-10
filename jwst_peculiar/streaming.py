@@ -67,9 +67,9 @@ class StreamedDinov3(torch.nn.Module):
     """A DINOv3 ViT whose layers live on disk and visit the GPU one at a time.
 
     The forward pass takes any number of tiles and runs them through each layer in
-    micro-batches, so callers should hand it chunks of tens of tiles. It returns the
-    same last_hidden_state as the transformers model, and with `layers` the mean of
-    those hidden states instead.
+    micro-batches, so hand it chunks of tens of tiles. It returns the same
+    last_hidden_state as the transformers model, or with `picked` the mean of those
+    layers' hidden states.
     """
 
     def __init__(

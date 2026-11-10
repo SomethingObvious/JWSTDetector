@@ -23,7 +23,7 @@ from PIL import Image
 import torch
 from torch.nn import functional as tnf
 
-from jwstdetector.streaming import StreamedDinov3, fits_on_gpu
+from jwst_peculiar.streaming import StreamedDinov3, fits_on_gpu
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -437,8 +437,8 @@ def _load_backbone(request: _Request, device: torch.device) -> Backbone:
     if compile_model:
         model.compile(dynamic=False)
     fast_accumulate = request.fast_accumulate and dtype == torch.float16
-    if fast_accumulate:
-        torch.backends.cuda.matmul.allow_fp16_accumulation = True
+    # Set either way, or a model loaded later in this process would inherit it.
+    torch.backends.cuda.matmul.allow_fp16_accumulation = fast_accumulate
 
     backbone = Backbone(
         name=request.model_name,
@@ -484,8 +484,8 @@ def _log_loaded(backbone: Backbone, repo: str) -> None:
 def _first_components(feats: torch.Tensor, q: int) -> torch.Tensor:
     """Project (B, N, D) patch embeddings onto their top `q` principal components.
 
-    It's an exact SVD. torch.pca_lowrank starts from a random matrix drawn from the
-    global generator, so a tile's mask used to depend on how many draws came before it.
+    It's an exact SVD, as torch.pca_lowrank draws from the global generator and would
+    make a tile's mask depend on how many draws came before it.
 
     Returns:
         The (B, N, q) projections.

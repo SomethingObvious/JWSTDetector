@@ -3,7 +3,7 @@
 astropy can read a .fits.gz directly, but it can't memmap one, so a big mosaic would
 have to fit in RAM.
 
-Usage: jwstdetector unzip [folder]
+Usage: jwst-peculiar unzip [folder]
 """
 
 from __future__ import annotations
@@ -28,8 +28,12 @@ def decompress_dir(base_dir: Path) -> int:
     gz_paths = sorted(base_dir.glob("*.gz"))
     for gz_path in tqdm(gz_paths, desc="Decompressing", unit="file"):
         out_path = gz_path.with_suffix("")
-        with gzip.open(gz_path, "rb") as f_in, out_path.open("wb") as f_out:
+        # Under another name until it's whole, so a broken archive or a Ctrl+C
+        # doesn't leave half a FITS file that prep would open.
+        part = out_path.with_name(out_path.name + ".part")
+        with gzip.open(gz_path, "rb") as f_in, part.open("wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
+        part.replace(out_path)
         gz_path.unlink()
     return len(gz_paths)
 

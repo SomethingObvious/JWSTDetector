@@ -83,23 +83,67 @@ function parseCsv(text: string): string[][] {
   return rows;
 }
 
+type Change = Partial<Pick<VerdictRecord, 'verdict' | 'star' | 'note'>>;
+
+/** Only the fields a record really has, so a file without a column leaves it alone. */
+function changeOf(r: Record<string, unknown>): Change {
+  const out: Change = {};
+  if (r['verdict'] === null || r['verdict'] === '') {
+    out.verdict = null;
+  } else if (isVerdict(r['verdict'])) {
+    out.verdict = r['verdict'];
+  }
+  const star = r['star'];
+  if (star !== undefined) {
+    // A spreadsheet saves true as TRUE.
+    out.star = star === true || (typeof star === 'string' && /^true$/iu.test(star));
+  }
+  if (typeof r['note'] === 'string') {
+    out.note = r['note'];
+  }
+  return out;
+}
+
 /** The rows of a CSV from Export, by key. */
-function csvRecords(text: string): [string, Incoming][] {
+function csvRecords(text: string): [string, Record<string, string>][] {
   const rows = parseCsv(text);
   const head = rows.shift() ?? [];
-  const col = (name: string) => head.indexOf(name);
-  const [k, v, s, n] = [col('key'), col('verdict'), col('star'), col('note')];
-  if (k < 0) {
-    throw new Error(`The file has no key column, its header is: ${head.join(', ')}`);
+  const k = head.indexOf('key');
+  const fields = ['verdict', 'star', 'note'].filter((f) => head.includes(f));
+  if (k < 0 || !fields.length) {
+    throw new Error(
+      `The file needs a key column and one of verdict, star and note. Its header is ${head.join(', ').slice(0, 80)}`,
+    );
   }
-  return rows.flatMap((r): [string, Incoming][] => {
+  return rows.flatMap((r): [string, Record<string, string>][] => {
     const key = r[k];
     if (!key) {
       return [];
     }
-    const note = n >= 0 ? (r[n] ?? '') : '';
-    return [[key, { verdict: r[v] ?? null, star: r[s] === 'true', note }]];
+    return [
+      [key, Object.fromEntries(fields.map((f) => [f, r[head.indexOf(f)] ?? '']))],
+    ];
   });
+}
+
+/**
+ * What a CSV from Export or a verdicts.json changes, for the tiles `known` holds.
+ * Records for any other tile are counted and left out.
+ */
+export function readImport(
+  text: string,
+  known: ReadonlySet<string>,
+): { changes: [string, Change][]; skipped: number } {
+  const trimmed = text.trim();
+  const records: [string, unknown][] = trimmed.startsWith('{')
+    ? Object.entries(JSON.parse(trimmed) as Record<string, unknown>)
+    : csvRecords(trimmed);
+  const changes = records.flatMap(([key, r]): [string, Change][] =>
+    known.has(key) && typeof r === 'object' && r !== null
+      ? [[key, changeOf(r as Record<string, unknown>)]]
+      : [],
+  );
+  return { changes, skipped: records.length - changes.length };
 }
 
 /**
@@ -116,6 +160,7 @@ export class Verdicts {
   private readonly base: string;
   private readonly localKey: string;
   private readonly pendingKey: string;
+  private readonly known: Set<string>;
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- only read on unload, never by the UI
   private queue = new Map<string, Pending>();
   private flushing = false;
@@ -126,8 +171,11 @@ export class Verdicts {
   constructor(bundle: Bundle, base: string) {
     this.writable = bundle.writable;
     this.base = base;
-    this.localKey = `jwstdetector:verdicts:${bundle.run.name}`;
-    this.pendingKey = `jwstdetector:pending:${bundle.run.name}`;
+    const id = bundle.run.id ?? bundle.run.name;
+    this.localKey = `jwst-peculiar:verdicts:${id}`;
+    this.pendingKey = `jwst-peculiar:pending:${id}`;
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- a run's tiles never change
+    this.known = new Set(bundle.tiles.map((t) => t.key));
   }
 
   async load(): Promise<void> {
@@ -168,7 +216,25 @@ export class Verdicts {
         this.map.set(k, v);
       }
       this.state = { kind: 'local', count: this.reviewedCount() };
+      addEventListener('storage', (e) => {
+        if (e.key === this.localKey) {
+          this.mergeLocal();
+        }
+      });
     }
+  }
+
+  // Each save writes every verdict this tab holds, so without taking in what another
+  // tab of the same run saved, the next save here would drop it.
+  private mergeLocal() {
+    const theirs =
+      (readJson(this.localKey) as Record<string, VerdictRecord> | null) ?? {};
+    for (const [k, v] of Object.entries(theirs)) {
+      if ((this.map.get(k)?.updated ?? '') < v.updated) {
+        this.map.set(k, v);
+      }
+    }
+    this.state = { kind: 'local', count: this.reviewedCount() };
   }
 
   get(key: string): VerdictRecord | undefined {
@@ -220,7 +286,7 @@ export class Verdicts {
   }
 
   hasUnsaved(): boolean {
-    return this.queue.size > 0;
+    return this.queue.size > 0 || (!this.writable && !this.storageOk);
   }
 
   private persistPending() {
@@ -330,16 +396,12 @@ export class Verdicts {
     return `${rows.join('\n')}\n`;
   }
 
-  /** Reads a CSV from Export or a verdicts.json, and returns how many records it took. */
-  importText(text: string): number {
-    const trimmed = text.trim();
-    const records = trimmed.startsWith('{')
-      ? Object.entries(JSON.parse(trimmed) as Record<string, Incoming>)
-      : csvRecords(trimmed);
-    for (const [key, r] of records) {
-      const verdict = isVerdict(r.verdict) ? r.verdict : null;
-      this.update(key, { verdict, star: Boolean(r.star), note: r.note ?? '' });
+  /** Reads a CSV from Export or a verdicts.json, and counts what it took and left out. */
+  importText(text: string): { taken: number; skipped: number } {
+    const { changes, skipped } = readImport(text, this.known);
+    for (const [key, change] of changes) {
+      this.update(key, change);
     }
-    return records.length;
+    return { taken: changes.length, skipped };
   }
 }

@@ -18,20 +18,22 @@ if TYPE_CHECKING:
     Headers = Sequence[Mapping[str, Any]]
 
 ARCSEC_PER_RAD = 206264.806
+# No imaging filter sits below 100 angstroms or above 100 microns.
+_MICRONS_BELOW = 100
 AB_ZERO_JY = 3631.0
 
 # Primary mirror diameters in metres, for space telescopes whose PSF is close to the
-# diffraction limit. A ground-based image needs --psf_fwhm instead.
+# diffraction limit. A ground-based image needs --psf_fwhm instead, and so do Spitzer
+# and WISE, whose pixels are too coarse to reach it.
 APERTURES = {
     "JWST": 6.5,
     "HST": 2.4,
     "EUCLID": 1.2,
     "ROMAN": 2.4,
-    "SPITZER": 0.85,
-    "WISE": 0.4,
 }
 
 FILTER_KEYS = ("FILTER", "FILTER1", "FILTER2", "FILTNAM1", "BAND", "FILTNAME", "FILT")
+_JWST_FILTER = re.compile(r"F(\d{3,4})[WMNC2]{1,2}")
 ZEROPOINT_KEYS = ("MAGZERO", "MAGZP", "ZEROPNT", "ZP", "MAGZPT", "PHOTZP", "ZP_AB")
 
 
@@ -59,6 +61,11 @@ def filter_name(headers: Headers, path: str | Path = "") -> str:
     Returns:
         The filter, upper case, or the file stem when no keyword names one.
     """
+    # NIRCam's narrow filters and F162M, and NIRISS's short ones, sit in the pupil
+    # wheel behind a wider filter, which is the one FILTER names.
+    pupil = str(_get(headers, "PUPIL") or "").strip().upper()
+    if _JWST_FILTER.fullmatch(pupil):
+        return pupil
     for key in FILTER_KEYS:
         value = str(_get(headers, key) or "").strip().upper()
         if value and not value.startswith(("CLEAR", "N/A")):
@@ -72,18 +79,14 @@ def wavelength_um(headers: Headers, filt: str) -> float | None:
     Returns:
         The wavelength in microns, or None when neither gives it.
     """
-    for key, scale in (
-        ("PHOTPLAM", 1e-4),
-        ("PIVOT", 1e-4),
-        ("WAVELEN", 1e-4),
-        ("WAVELENG", 1e-4),
-    ):
+    for key in ("PHOTPLAM", "PIVOT", "WAVELEN", "WAVELENG"):
         value = _get(headers, key)
         if value is not None:
-            return float(value) * scale
+            # Angstroms as a rule, though some headers give microns.
+            return float(value) * (1e-4 if float(value) > _MICRONS_BELOW else 1)
     # JWST names give the wavelength in hundredths of a micron, so F444W is 4.44 and
     # F1000W is 10.00. HST names don't follow one rule, but HST files carry PHOTPLAM.
-    m = re.fullmatch(r"F(\d{3,4})[WMNC2]{1,2}", filt.upper())
+    m = _JWST_FILTER.fullmatch(filt.upper())
     if m and telescope(headers) == "JWST":
         return int(m.group(1)) / 100
     return None

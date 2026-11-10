@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFits } from '../src/lib/fits';
 import { Tan, decDms, icrsToGalactic, raHms } from '../src/lib/wcs';
-import { computeLimits, type TileData } from '../src/lib/tiles';
+import { computeLimits, sampleOf, type TileData } from '../src/lib/tiles';
 import { TileFrame } from '../src/lib/frame';
 import type { MosaicInfo, TileInfo } from '../src/lib/types';
 
@@ -118,6 +118,25 @@ describe('Tan', () => {
     const [l, b] = icrsToGalactic(110.8375, -73.4547);
     expect(l).toBeCloseTo(284.9938224656199, 4);
     expect(b).toBeCloseTo(-23.69871978177526, 4);
+  });
+});
+
+describe('sampleOf', () => {
+  it('keeps the sample under 60,000 values on a 320 px tile', () => {
+    const plane = Float32Array.from({ length: 320 * 320 }, (_, i) => i);
+    plane[5] = NaN;
+    const s = sampleOf(plane, plane.length);
+    expect(s.sample.length).toBe(51200);
+    expect(s.min).toBe(0);
+    expect(s.max).toBe(102399);
+    expect(s.sample[1]).toBe(2);
+  });
+
+  it('reads one channel out of RGBA', () => {
+    const rgba = Uint8Array.from([1, 9, 9, 255, 3, 9, 9, 255, 2, 9, 9, 255]);
+    const s = sampleOf(rgba, 3, 4, 0);
+    expect([...s.sample]).toEqual([1, 2, 3]);
+    expect([s.min, s.max]).toEqual([1, 3]);
   });
 });
 

@@ -18,14 +18,14 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from jwstdetector.data import relative_key, tile_loader
+from jwst_peculiar.data import relative_key, tile_loader
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import numpy.typing as npt
 
-    from jwstdetector.backbones import Backbone
+    from jwst_peculiar.backbones import Backbone
 
 # float16 tops out at 65504, and a feature past that is stored as float32 instead.
 _HALF_MAX = 6e4
@@ -34,7 +34,7 @@ _HALF_MAX = 6e4
 class FeatureCache:
     """One .npy of (n_patches, dims) per tile under `root`.
 
-    That's about 1.6 MB a tile for ViT-L at 448 px.
+    About 1.6 MB a tile for ViT-L at 448 px.
     """
 
     def __init__(self, root: Path, backbone: Backbone) -> None:

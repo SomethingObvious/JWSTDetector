@@ -1,7 +1,7 @@
 """AnomalyDINO scoring with a train/ folder of tiles known to be normal and a test/ folder to score.
 
 Use this when you already know which tiles are normal. When you don't, which is the
-usual case for JWST, use `jwstdetector run`.
+usual case for JWST, use `jwst-peculiar run`.
 """  # noqa: E501 --help prints this, so the summary line stays whole
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import yaml
 
-from jwstdetector.backbones import get_backbone
-from jwstdetector.data import (
+from jwst_peculiar.backbones import get_backbone
+from jwst_peculiar.data import (
     list_images,
     prepare_out_dir,
     resolve_device,
@@ -24,12 +24,12 @@ from jwstdetector.data import (
     write_measurements_csv,
     write_ref_list,
 )
-from jwstdetector.detection import METRICS, run_anomaly_detection
-from jwstdetector.scoring import SCORE_MODES
-from jwstdetector.seeding import set_seed
+from jwst_peculiar.detection import METRICS, run_anomaly_detection
+from jwst_peculiar.scoring import SCORE_MODES
+from jwst_peculiar.seeding import set_seed
 
 if TYPE_CHECKING:
-    from jwstdetector.backbones import Backbone
+    from jwst_peculiar.backbones import Backbone
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the options of `jwstdetector score`.
+    """Parse the options of `jwst-peculiar score`.
 
     Returns:
         The parsed arguments.
@@ -215,7 +215,7 @@ class _Run:
         write_ref_list(run_dir / "ref_list.txt", self.train_dir, ref_paths)
 
         if args.save_examples:
-            from jwstdetector.utils import plot_reference_masks  # noqa: PLC0415 matplotlib is slow to load
+            from jwst_peculiar.utils import plot_reference_masks  # noqa: PLC0415 matplotlib is slow to load
 
             plot_reference_masks(
                 self.backbone,
@@ -259,7 +259,7 @@ class _Run:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run `jwstdetector score`.
+    """Run `jwst-peculiar score`.
 
     Returns:
         The exit code, which is always 0.

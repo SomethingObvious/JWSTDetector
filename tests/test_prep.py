@@ -18,8 +18,8 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from jwstdetector import photometry, prep
-from jwstdetector.prep import (
+from jwst_peculiar import photometry, prep
+from jwst_peculiar.prep import (
     MiriSensor,
     Mosaic,
     MosaicStats,
@@ -32,13 +32,13 @@ from jwstdetector.prep import (
     measure_mosaic,
     tile_starts,
 )
-from jwstdetector.scoring import SCORE_MODES, aggregate_score
-from jwstdetector.seeding import set_seed
+from jwst_peculiar.scoring import SCORE_MODES, aggregate_score
+from jwst_peculiar.seeding import set_seed
 
 if TYPE_CHECKING:
     import numpy.typing as npt
 
-    from jwstdetector.utils import FitsHDUList, FitsHeader
+    from jwst_peculiar.utils import FitsHDUList, FitsHeader
 
 SKY, NOISE = 0.0, 1.0
 
@@ -668,6 +668,31 @@ def test_fits_sensor_skips_weight_maps_and_clashing_names() -> None:
         with pytest.raises(SystemExit, match="would both be mosaic M51"):
             list(prep.SENSORS["fits"].iter_mosaic_specs(args))
 
+        # A version number's dot isn't where the name ends.
+        for name in ("x_v1.0_drz.fits", "x_v1.0_drz_wht.fits"):
+            (tmp / "v" / name).parent.mkdir(exist_ok=True)
+            (tmp / "v" / name).touch()
+        args.indir, args.tile_regex = str(tmp / "v"), None
+        specs = list(prep.SENSORS["fits"].iter_mosaic_specs(args))
+        assert [s.tile_id for s in specs] == ["x_v1.0_drz"]
+
+
+def test_a_mistyped_pattern_leaves_nothing_behind() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with pytest.raises(FileNotFoundError):
+            prep.run([
+                "--indir",
+                str(tmp),
+                "--pattern",
+                "*.fts",
+                "--out",
+                str(tmp / "o"),
+            ])
+        assert not (tmp / "o").exists()
+        with pytest.raises(SystemExit, match="--stride has to be at least 1"):
+            prep.run(["--indir", str(tmp), "--out", str(tmp / "o"), "--stride", "0"])
+
 
 def test_photometry_units() -> None:
     scale = 0.06
@@ -685,6 +710,12 @@ def test_photometry_units() -> None:
     assert (
         photometry.filter_name([{"FILTER1": "CLEAR1L", "FILTER2": "F606W"}]) == "F606W"
     )
+    # F162M sits in NIRCam's pupil wheel, behind the F150W2 that FILTER names.
+    assert photometry.filter_name([{"FILTER": "F150W2", "PUPIL": "F162M"}]) == "F162M"
+    assert photometry.filter_name([{"FILTER": "F444W", "PUPIL": "CLEAR"}]) == "F444W"
+    assert photometry.wavelength_um([{"PHOTPLAM": 8045.0}], "F814W") == 0.8045
+    assert photometry.wavelength_um([{"WAVELEN": 3.368}], "W1") == 3.368
+    assert photometry.diffraction_fwhm_arcsec(3.4, "WISE") is None
     assert photometry.wavelength_um([{"TELESCOP": "JWST"}], "F1000W") == 10.0
     assert photometry.wavelength_um([{"TELESCOP": "HST"}], "F814W") is None
     assert photometry.diffraction_fwhm_arcsec(2.0, "SUBARU") is None

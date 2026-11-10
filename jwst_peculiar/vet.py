@@ -1,6 +1,6 @@
 """Writes a vetting list of a survey's oddest sources, one sheet each.
 
-    python -m jwstdetector.vet SPLIT STARS DATA RESULTS OUT [--top 50]
+    python -m jwst_peculiar.vet SPLIT STARS DATA RESULTS OUT [--top 50]
 
 Every scored tile counts, calibration as well as search, since nothing here is a
 statistical claim. Tiles go through the survey's overlap and star rules and onto
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass, field
+from functools import cache
 import html
 import json
 from pathlib import Path
@@ -29,13 +30,15 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import uniform_filter
 
-from jwstdetector.catalogues import fetch, nearest
-from jwstdetector.survey import kept_tiles, parse_key, standardise
+from jwst_peculiar.catalogues import fetch, nearest
+from jwst_peculiar.data import owned_patches, read_manifest
+from jwst_peculiar.detection import Footprint
+from jwst_peculiar.survey import kept_tiles, standardise
 
 if TYPE_CHECKING:
     import numpy.typing as npt
 
-    from jwstdetector.utils import SkyCoords
+    from jwst_peculiar.utils import SkyCoords
 
 # The hot patch shows in no filter below SHOWS MADs. It shows in one filter only if
 # that filter is RATIO times the next and the next is under QUIET, since a peak over
@@ -63,9 +66,9 @@ def significance(
     """How far one filter stands off its tile at a patch, in MADs, bright or dark.
 
     `plane` is in FITS order (row 0 at the bottom) and `cell` is the patch's row and
-    column in the tile as scored, which is flipped top to bottom. Two measures count,
-    the patch's mean against the tile's other patch means (for anything spread out)
-    and the 3x3-smoothed peak against the smoothed tile (for anything compact).
+    column in the tile as scored, which is flipped top to bottom. It takes the patch
+    mean against the other patch means (for anything spread out) and the 3x3-smoothed
+    peak against the smoothed tile (for anything compact).
 
     Returns:
         The larger of the two.
@@ -95,8 +98,11 @@ def flag(sigs: list[float]) -> str:
         "one filter", "no filter" or "".
     """
     top, second = sorted(sigs, reverse=True)[:2]
-    if top < SHOWS:
+    # A filter with no data at the patch can't vouch for the source.
+    if not top >= SHOWS:
         return "no filter"
+    if np.isnan(second):
+        return "one filter"
     if second < QUIET and top >= RATIO * second:
         return "one filter"
     return ""
@@ -117,30 +123,65 @@ class Source:
     near: dict[str, str] = field(default_factory=dict)
 
 
-def _mosaic_record(data: Path, visit: str) -> dict[str, Any]:
-    record = next((data / visit / "mosaics").glob("*.json"))
+def _mosaic_record(data: Path, visit: str, mosaic: str) -> dict[str, Any]:
+    record = data / visit / "mosaics" / f"{mosaic}.json"
     meta: dict[str, Any] = json.loads(record.read_text(encoding="utf-8"))
     return meta
 
 
+@cache
+def _tiles(data: Path, visit: str) -> dict[str, dict[str, Any]]:
+    return read_manifest(data / visit)
+
+
+@cache
+def _owned(
+    data: Path, visit: str, grid: int, *, middle: bool
+) -> dict[str, npt.NDArray[np.bool_]]:
+    tiles = _tiles(data, visit)
+    return owned_patches(
+        {
+            k: Footprint(t["mosaic"], t["x0"], t["y0"], t["size"])
+            for k, t in tiles.items()
+        },
+        (grid, grid),
+        middle=middle,
+    )
+
+
+def hot_cell(
+    scores: npt.NDArray[np.floating[Any]], owned: npt.NDArray[np.bool_]
+) -> tuple[int, int]:
+    """Find the hottest patch among the ones the tile scores.
+
+    The map holds every patch, and an object cut off by the tile's edge can be hotter
+    there than anything the tile was ranked on.
+
+    Returns:
+        The patch's row and column.
+    """
+    masked = np.where(owned, np.nan_to_num(scores, nan=-np.inf), -np.inf)
+    gi, gj = np.unravel_index(np.argmax(masked), masked.shape)
+    return int(gi), int(gj)
+
+
 def _hot_spot(
-    results: Path, data: Path, *, visit: str, key: str
+    results: Path, data: Path, *, visit: str, key: str, middle: bool
 ) -> tuple[tuple[int, int], SkyCoords, int]:
     path = (
         results / visit / "cross" / "anomaly_maps" / "seed=0" / f"{Path(key).stem}.npy"
     )
     scores = np.load(path)
-    gi, gj = (int(i) for i in np.unravel_index(np.argmax(scores), scores.shape))
-    cx, cy, _, _ = parse_key(key)
-    meta = _mosaic_record(data, visit)
-    size = int(meta.get("tile_px", 320))
-    step = size / scores.shape[0]
+    grid = scores.shape[0]
+    gi, gj = hot_cell(scores, _owned(data, visit, grid, middle=middle)[key])
+    tile = _tiles(data, visit)[key]
+    step = tile["size"] / grid
     # The tile as scored is flipped top to bottom against the mosaic.
-    hot = WCS(meta["wcs"]).pixel_to_world(
-        cx - size / 2 + (gj + 0.5) * step - 0.5,
-        cy + size / 2 - (gi + 0.5) * step - 0.5,
+    hot = WCS(_mosaic_record(data, visit, tile["mosaic"])["wcs"]).pixel_to_world(
+        tile["x0"] + (gj + 0.5) * step - 0.5,
+        tile["y0"] + tile["size"] - (gi + 0.5) * step - 0.5,
     )
-    return (gi, gj), hot, scores.shape[0]
+    return (gi, gj), hot, grid
 
 
 def _cutouts(data: Path, visits: list[str]) -> dict[str, Path]:
@@ -235,7 +276,11 @@ def _sheet(
 def _rank(args: argparse.Namespace) -> tuple[list[Source], list[Source]]:
     split = json.loads(args.split.read_text(encoding="utf-8"))
     kept, _ = kept_tiles(
-        split, stars_json=args.stars, data=args.data, results=args.results
+        split,
+        stars_json=args.stars,
+        data=args.data,
+        results=args.results,
+        middle=args.middle,
     )
     z = standardise(kept)
     cutouts = _cutouts(args.data, list(z))
@@ -247,7 +292,9 @@ def _rank(args: argparse.Namespace) -> tuple[list[Source], list[Source]]:
     ):
         if len(clean) >= args.top:
             break
-        cell, hot, grid = _hot_spot(args.results, args.data, visit=visit, key=key)
+        cell, hot, grid = _hot_spot(
+            args.results, args.data, visit=visit, key=key, middle=args.middle
+        )
         if any(hot.separation(t).arcsec < SAME_SOURCE_ARCSEC for t in taken):
             continue
         taken.append(hot)
@@ -260,7 +307,9 @@ def _rank(args: argparse.Namespace) -> tuple[list[Source], list[Source]]:
 
 def _write(args: argparse.Namespace, sources: list[Source], n_clean: int) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
-    filters = list(_mosaic_record(args.data, sources[0].visit)["filters"])
+    first = sources[0]
+    mosaic = _tiles(args.data, first.visit)[first.key]["mosaic"]
+    filters = list(_mosaic_record(args.data, first.visit, mosaic)["filters"])
     cutouts = _cutouts(args.data, sorted({s.visit for s in sources}))
     rows = []
     for src in sources:
@@ -308,7 +357,7 @@ def _write(args: argparse.Namespace, sources: list[Source], n_clean: int) -> Non
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m jwstdetector.vet",
+        prog="python -m jwst_peculiar.vet",
         description=(__doc__ or "").split("\n\n", maxsplit=1)[0],
     )
     p.add_argument("split", type=Path)
@@ -318,6 +367,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("out", type=Path)
     p.add_argument("--top", type=int, default=50, help="unflagged sources (default 50)")
     p.add_argument("--no_catalogues", action="store_true", help="skip SIMBAD and NED")
+    p.add_argument(
+        "--middle",
+        action="store_true",
+        help="score each tile again on its middle, like survey --middle",
+    )
     return p
 
 

@@ -1,6 +1,6 @@
 """How a run ranks objects already known to be there, such as a cluster's lensed images.
 
-    jwstdetector recall results_smacs datasets/smacs_nircam --objects lensed.csv
+    jwst-peculiar recall results_smacs datasets/smacs_nircam --objects lensed.csv
 
 The objects come from a CSV with ra and dec columns in degrees, and an optional id
 column like 1.2, where the part before the dot names a group such as a lens system.
@@ -37,19 +37,19 @@ import numpy as np
 from scipy.ndimage import maximum_filter
 import yaml
 
-from jwstdetector.bundle import map_path, mosaic_wcs
-from jwstdetector.data import (
+from jwst_peculiar.bundle import map_path, mosaic_wcs
+from jwst_peculiar.data import (
     final_pass_dir,
     owned_patches,
     read_manifest,
     read_measurements,
 )
-from jwstdetector.detection import Footprint
+from jwst_peculiar.detection import Footprint
 
 if TYPE_CHECKING:
     import numpy.typing as npt
 
-    from jwstdetector.utils import SkyWcs
+    from jwst_peculiar.utils import SkyWcs
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ def read_objects(path: Path) -> list[dict[str, str]]:
         One row per object, with its CSV columns as strings.
 
     Raises:
-        SystemExit: The CSV has no rows, or no ra and dec columns.
+        SystemExit: If the CSV has no rows, or no ra and dec columns.
     """
     with path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
@@ -168,13 +168,13 @@ def _read_maps(
 def _owned(
     manifest: dict[str, dict[str, Any]], grid: tuple[int, ...], *, region: str
 ) -> dict[str, npt.NDArray[np.bool_]]:
-    if region != "owned":
+    if region == "all":
         return {k: np.ones(grid, dtype=bool) for k in manifest}
     footprints = {
         k: Footprint(m["mosaic"], m["x0"], m["y0"], m["size"])
         for k, m in manifest.items()
     }
-    return owned_patches(footprints, (grid[0], grid[1]))
+    return owned_patches(footprints, (grid[0], grid[1]), middle=region == "middle")
 
 
 def _field_radii(
@@ -282,7 +282,7 @@ def place(
     centre: tuple[float, float] | None = None,
     ring: float = 3.0,
 ) -> tuple[list[Placed], int, npt.NDArray[np.float64]]:
-    """Puts each object on the tile that owns its patch.
+    """Put each object on the tile that owns its patch.
 
     Returns:
         The placed objects, the number of tiles and the sorted distance of every
@@ -393,7 +393,7 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("run_dir", type=Path, help="A `jwstdetector run` output folder.")
+    ap.add_argument("run_dir", type=Path, help="A `jwst-peculiar run` output folder.")
     ap.add_argument("data_root", type=Path, help="The prep folder the run scored.")
     ap.add_argument(
         "--objects", type=Path, required=True, help="CSV with ra, dec and id."

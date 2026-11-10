@@ -18,7 +18,7 @@ export class Tan {
     const t1 = String(cards['CTYPE1'] ?? 'RA---TAN');
     const t2 = String(cards['CTYPE2'] ?? 'DEC--TAN');
     if (!t1.endsWith('-TAN') || !t2.endsWith('-TAN')) {
-      throw new Error(`WCS is ${t1} ${t2}, the viewer reads TAN only`);
+      throw new Error(`WCS is ${t1} ${t2}, but the viewer only reads TAN`);
     }
     this.crpix = [num('CRPIX1', 0), num('CRPIX2', 0)];
     this.crval = [num('CRVAL1', 0), num('CRVAL2', 0)];

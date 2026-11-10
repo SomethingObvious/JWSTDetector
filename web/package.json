@@ -1,5 +1,5 @@
 {
-  "name": "jwstdetector-viewer",
+  "name": "jwst-peculiar-viewer",
   "private": true,
   "version": "1.0.0",
   "type": "module",

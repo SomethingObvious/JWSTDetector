@@ -1,7 +1,7 @@
 """Cross-matches each tile's most anomalous patch with SIMBAD, NED, Gaia DR3 and local catalogues.
 
-    jwstdetector match results_smacs datasets/smacs_nircam
-    jwstdetector match results_smacs datasets/smacs_nircam --catalogue jades.fits --radius 1
+    jwst-peculiar match results_smacs datasets/smacs_nircam
+    jwst-peculiar match results_smacs datasets/smacs_nircam --catalogue jades.fits --radius 1
 
 Every catalogued source over each mosaic is fetched once, in cones a few arcminutes
 across, and kept in RUN/catalogues/ so later runs and the viewer work offline. Each
@@ -28,12 +28,12 @@ from astropy.table import Table
 import numpy as np
 import pyvo
 
-from jwstdetector.bundle import RunBundle, mosaic_wcs
+from jwst_peculiar.bundle import RunBundle, mosaic_wcs
 
 if TYPE_CHECKING:
     import numpy.typing as npt
 
-    from jwstdetector.utils import SkyCoords, TableCell
+    from jwst_peculiar.utils import SkyCoords, TableCell
 
 logger = logging.getLogger(__name__)
 
@@ -88,17 +88,15 @@ ID_NAMES = ("id", "name", "source_id", "number", "objid", "object")
 
 
 def _note(cat: str, value: TableCell) -> str:
-    if (
-        value is None
-        or np.ma.is_masked(value)
-        or (isinstance(value, float) and math.isnan(value))
-    ):
+    if value is None or np.ma.is_masked(value):
         return ""
-    if cat == "NED":
-        return f"z = {float(value):.4g}"
-    if cat == "Gaia DR3":
-        return f"G = {float(value):.2f}"
-    return str(value)
+    if cat not in {"NED", "Gaia DR3"}:
+        return str(value)
+    # Through float, as a numpy float32 isn't a float and a null comes back as NaN.
+    number = float(value)
+    if math.isnan(number):
+        return ""
+    return f"z = {number:.4g}" if cat == "NED" else f"G = {number:.2f}"
 
 
 def _text(value: TableCell) -> str:
@@ -139,6 +137,11 @@ def _query(
     for ra, dec in centres:
         cone = CONE.format(ra=ra, dec=dec, r=radius_arcmin / 60)
         result = service.run_sync(spec["adql"].format(cone=cone), maxrec=2_000_000)
+        if result.status[0] == "OVERFLOW":
+            # A cut-off answer would read as sky with nothing catalogued in it.
+            msg = f"{cat} cut its answer short at {len(result)} rows. "
+            msg += "Try a smaller --cone."
+            raise RuntimeError(msg)
         for row in result.to_table():
             name = _text(row[name_col])
             if cat == "Gaia DR3":
@@ -174,9 +177,7 @@ def fetch(
 
 
 def read_local(path: Path) -> dict[str, Any]:
-    """Read a catalogue file astropy can read, with RA and Dec in degrees.
-
-    The RA, Dec and ID columns can have any of the usual names.
+    """Read any catalogue astropy can, with RA and Dec in degrees under the usual names.
 
     Returns:
         The catalogue's rows, in the same form `fetch` returns them.
@@ -364,7 +365,8 @@ def crossmatch(  # noqa: PLR0913 the CLI and tests pass each option by name
             out_dir / f"{mosaic_id}.json", meta, mosaic_id=mosaic_id, plan=plan
         )
 
-        # The cache keeps whatever earlier runs fetched, but only this run's are used.
+        # The cache keeps what earlier runs fetched, but only the catalogues asked for
+        # here count.
         used = {
             c: cats[c] for c in [*plan.services, *(Path(p).stem for p in plan.local)]
         }
@@ -395,9 +397,9 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("run_dir", type=Path, help="A `jwstdetector run` output folder.")
+    ap.add_argument("run_dir", type=Path, help="A `jwst-peculiar run` output folder.")
     ap.add_argument(
-        "data_root", type=Path, help="The `jwstdetector prep` folder it scored."
+        "data_root", type=Path, help="The `jwst-peculiar prep` folder it scored."
     )
     ap.add_argument(
         "--radius",
@@ -441,11 +443,20 @@ def main(argv: list[str] | None = None) -> int:
 
     Returns:
         The exit code, which is always 0.
+
+    Raises:
+        SystemExit: If --radius is too wide for the cones to cover the mosaic.
     """
     args = _parser().parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
+    if args.radius >= args.cone * 30:
+        msg = (
+            f"A match radius of {args.radius} arcsec is too wide for cones of "
+            f"{args.cone} arcmin. Keep --radius under half of --cone."
+        )
+        raise SystemExit(msg)
 
     result = crossmatch(
         args.run_dir,

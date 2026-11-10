@@ -13,8 +13,8 @@ export const VERDICT_VALUE: Record<Verdict, number> = {
 
 /**
  * Kernel width in cosine distance. On SMACS 0723 a random pair of tiles sits near
- * cosine 0 and the median nearest neighbour at 0.64, which this weighs a tenth as
- * much as a twin while a random tile counts for almost nothing.
+ * cosine 0 and the median nearest neighbour at 0.64, so this weighs a typical
+ * neighbour about a tenth as much as a twin and a random tile at almost nothing.
  */
 export const TAU = 0.15;
 /** The weight of the 0.5 prior, so a single verdict can't drive a far-off tile to 0 or 1. */

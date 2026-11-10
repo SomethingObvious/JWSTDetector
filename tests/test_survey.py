@@ -8,10 +8,12 @@ from astropy.coordinates import SkyCoord
 import numpy as np
 import pytest
 
-from jwstdetector.survey import (
+from jwst_peculiar.survey import (
     Tiles,
+    can_name_one,
     check_owned,
     cut_blocks,
+    middle_scores,
     near_bright_star,
     overlaps_other_visit,
     parse_key,
@@ -23,7 +25,7 @@ from jwstdetector.survey import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from jwstdetector.utils import SkyCoords
+    from jwst_peculiar.utils import SkyCoords
 
 
 def test_parse_key_reads_a_southern_tile() -> None:
@@ -37,11 +39,29 @@ def test_parse_key_refuses_a_key_without_a_position() -> None:
 
 
 def test_a_run_that_scored_every_patch_is_refused(tmp_path: Path) -> None:
-    (tmp_path / "args.yaml").write_text("score_region: owned\nstride: 160\n")
-    check_owned(tmp_path)
+    for region in ("owned", "middle"):
+        (tmp_path / "args.yaml").write_text(f"score_region: {region}\nstride: 160\n")
+        check_owned(tmp_path)
     (tmp_path / "args.yaml").write_text("score_region: all\nstride: 160\n")
     with pytest.raises(ValueError, match="wasn't scored with --score_region owned"):
         check_owned(tmp_path)
+
+
+def test_a_lone_tile_is_rescored_on_its_middle(tmp_path: Path) -> None:
+    run, data = tmp_path / "run", tmp_path / "data"
+    maps = run / "cross" / "anomaly_maps" / "seed=0"
+    maps.mkdir(parents=True)
+    data.mkdir()
+    (run / "args.yaml").write_text("score_region: owned\nscore_mode: max\n")
+    (run / "measurements_final.csv").write_text("Sample,AnomalyScore\na.png,9.0\n")
+    (data / "manifest.csv").write_text(
+        "key,mosaic,x0,y0,size,ra,dec,cutout\na.png,M,0,0,320,150,2,\n"
+    )
+    # With no neighbour the tile scored its edge, where the hottest patch is.
+    dists = np.ones((28, 28), np.float32)
+    dists[0, 3], dists[10, 12] = 9, 5
+    np.save(maps / "a.npy", dists)
+    assert middle_scores(run, data) == {"a.png": 5.0}
 
 
 def _sky(*points: tuple[float, float]) -> SkyCoords:
@@ -197,3 +217,25 @@ def test_star_list_can_cover_two_fields(tmp_path: Path) -> None:
     assert g.tolist() == [12.0, 14.0]
     with pytest.raises(ValueError, match=r"at 34.4000 -6.0000 isn't"):
         read_stars(stars, _sky((150.0, 2.5), (34.4, -6.0)))
+
+
+def test_standardise_skips_a_visit_with_under_two_kept_tiles() -> None:
+    assert (
+        standardise({"v0": {}, "v1": {"a": 2.0}, "v2": {"a": 0.0, "b": 1.0, "c": 3.0}})[
+            "v1"
+        ]
+        == {}
+    )
+
+
+def test_too_few_calibration_tiles_can_name_nothing() -> None:
+    split = {"alpha": 0.1, "search": ["s"], "calibration": ["c"], "standardise": True}
+    tiles = {"s": {f"s{i}": 0.0 for i in range(514)}}
+    short = can_name_one(split, {**tiles, "c": {f"c{i}": 0.0 for i in range(3838)}})
+    assert short["smallest_p"] == 1 / 3839
+    assert not short["can_name_one"]
+    # Two tiles above every calibration tile would both pass, though one can't.
+    assert short["tiles_needed_together"] == 2
+    enough = can_name_one(split, {**tiles, "c": {f"c{i}": 0.0 for i in range(5140)}})
+    assert enough["can_name_one"]
+    assert enough["tiles_needed_together"] == 1

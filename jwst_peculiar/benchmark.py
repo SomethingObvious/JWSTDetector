@@ -1,7 +1,7 @@
 r"""Plants synthetic sources in the FITS cutouts and measures how many the detectors find.
 
-    jwstdetector bench --data_root datasets/smacs_nircam --out_dir bench_smacs
-    jwstdetector bench --data_root datasets/smacs_nircam --out_dir bench_smacs \
+    jwst-peculiar bench --data_root datasets/smacs_nircam --out_dir bench_smacs
+    jwst-peculiar bench --data_root datasets/smacs_nircam --out_dir bench_smacs \
         --mags 24 25 26 --seeds 3 --detectors knn pixels -- --k_neighbors 3
 
 A source is added to a tile's float cutout at a given AB magnitude, in whatever units
@@ -10,16 +10,16 @@ PNG with the exact stretch its mosaic was cut with. For JWST the PSF is STScI's 
 from STPSF, with its Airy rings and six spikes, turned to the mosaic by the telescope's
 roll. Anything else, or JWST without STPSF installed, gets a Gaussian as wide as the
 diffraction limit. Prep records the units and PSF widths from each file's headers, and
---jy_per_unit and --psf_fwhm cover data whose headers don't say, such as most
-ground-based images. Every magnitude of a seed gets
-the same tiles, shapes, positions and colours, so the curves differ by brightness
-alone. Real anomalies in the field compete with the planted ones, which is why found
-means ranked in the top 5% rather than first.
+--jy_per_unit and --psf_fwhm cover data whose headers don't say, like most
+ground-based images. Every magnitude of a seed gets the same tiles, shapes, positions
+and colours, so the curves differ by brightness alone. Real anomalies in the field
+compete with the planted ones, which is why found means ranked in the top 5% rather
+than first.
 
-It needs a dataset cut with --save_cutouts. Anything after `--` goes to
-every `jwstdetector run`. Writes injections.csv with each planted source's rank,
-and its null rank among the tiles nothing was planted in, summary.csv with recall
-and its 95% Wilson interval per detector, kind and magnitude, and completeness.png.
+It needs a dataset cut with --save_cutouts, and anything after `--` goes to every
+`jwst-peculiar run`. It writes injections.csv with each planted source's rank and its
+null rank among the tiles nothing was planted in, summary.csv with recall and its 95%
+Wilson interval per detector, kind and magnitude, and completeness.png.
 """  # noqa: E501 --help prints this, so the summary line stays whole
 
 from __future__ import annotations
@@ -45,16 +45,16 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter, rotate
 from scipy.signal import fftconvolve
 
-from jwstdetector import bootstrap
-from jwstdetector.bundle import mosaic_wcs
-from jwstdetector.data import read_manifest, read_measurements
-from jwstdetector.prep import render_cutout
+from jwst_peculiar import bootstrap
+from jwst_peculiar.bundle import mosaic_wcs
+from jwst_peculiar.data import read_manifest, read_measurements
+from jwst_peculiar.prep import render_cutout
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
     import numpy.typing as npt
 
-    from jwstdetector.utils import FitsHDUList
+    from jwst_peculiar.utils import FitsHDUList
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ KINDS = ("point", "arc", "ring", "streak")
 HELD_OUT = ("clumps", "diffuse", "pair")
 # f_nu goes as wavelength to this power, so red sources are brighter in F444W.
 SEDS = {"flat": 0.0, "red": 2.0, "blue": -2.0}
-# What each detector adds to every `jwstdetector run`. Pixels is the kNN search on raw
+# What each detector adds to every `jwst-peculiar run`. Pixels is the kNN search on raw
 # 16 px patches instead of features, which is what shows whether the backbone helps.
 DETECTORS = {
     "knn": ["--detector", "knn"],
@@ -429,28 +429,36 @@ def _plot_kind(
     kind: str,
     detectors: list[str],
 ) -> None:
+    from matplotlib.ticker import PercentFormatter  # noqa: PLC0415 matplotlib is slow to load
+
     ax.set_facecolor("#fcfcfb")
     ax.axhline(TOP_SHARE, color="#8a8986", lw=1, ls=(0, (3, 3)), label="Chance")
-    for det in detectors:
+    for i, det in enumerate(detectors):
         pts = sorted(
             (s["mag"], s["recall"], s["recall_lo"], s["recall_hi"])
             for s in summary
             if s["detector"] == det and s["kind"] == kind
         )
         mags, rec, lo, hi = (np.array(v) for v in zip(*pts, strict=True))
-        ax.fill_between(mags, lo, hi, color=COLOURS[det], alpha=0.12, lw=0)
+        # Four intervals overlap on most panels, so they stay faint enough to read.
+        ax.fill_between(mags, lo, hi, color=COLOURS[det], alpha=0.07, lw=0)
+        # Lines often coincide (two detectors at 0 on rings), so each is drawn thinner
+        # and with a smaller marker than the one under it, which leaves its edges out.
         ax.plot(
             mags,
             rec,
             color=COLOURS[det],
-            lw=2,
+            lw=2.6 - 0.35 * i,
             marker=MARKERS[det],
-            ms=4.5,
+            ms=7 - 0.7 * i,
+            mec="#fcfcfb",
+            mew=1.2,
             label=LABELS[det],
         )
     ax.set_title(kind.capitalize(), fontsize=10, color="#0b0b0b", loc="left")
     ax.set_xlabel("AB magnitude", fontsize=9, color="#52514e")
     ax.set_ylim(-0.02, 1.02)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
     ax.grid(axis="y", color="#e6e5e1", lw=0.8)
     ax.tick_params(colors="#52514e", labelsize=8, length=0)
     for side in ("top", "right", "left"):
@@ -565,7 +573,7 @@ def _read_mosaic_record(root: Path, mosaic: str) -> dict[str, Any]:
     if "planes" not in info or "pixel_scale_arcsec" not in info:
         msg = (
             f"{mosaic} has no WCS or no photometry record. Cut it again with "
-            "this version of `jwstdetector prep`."
+            "this version of `jwst-peculiar prep`."
         )
         raise SystemExit(msg)
     return info
@@ -639,7 +647,7 @@ def _parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument(
-        "--data_root", type=Path, required=True, help="A `jwstdetector prep` folder."
+        "--data_root", type=Path, required=True, help="A `jwst-peculiar prep` folder."
     )
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--mags", type=float, nargs="+", default=[23, 24, 25, 26, 27, 28])
@@ -720,7 +728,7 @@ def _load_bench(args: argparse.Namespace, runner_args: list[str]) -> _Bench:
     root = args.data_root.resolve()
     manifest = read_manifest(root)
     if not manifest:
-        msg = f"{root} has no manifest.csv. Cut it again with `jwstdetector prep`."
+        msg = f"{root} has no manifest.csv. Cut it again with `jwst-peculiar prep`."
         raise SystemExit(msg)
     mosaics = check_dataset(
         root, manifest, psf_fwhm=args.psf_fwhm, jy_per_unit=args.jy_per_unit
@@ -757,6 +765,9 @@ def _run_planted(
     run_dir = args.out_dir / f"seed{seed}_mag{mag:g}"
     data = run_dir / "data"
     link_tree(bench.root / "query", data / "query")
+    # The pixel scale is in here, and without it a run can't tell which tiles of
+    # another field share sky with one of these.
+    link_tree(bench.root / "mosaics", data / "mosaics")
     shutil.copyfile(bench.root / "manifest.csv", data / "manifest.csv")
     plant(data, bench.root, sources, mag=mag, mosaics=bench.mosaics)
     cache = str(args.feature_cache or bench.root / ".features")

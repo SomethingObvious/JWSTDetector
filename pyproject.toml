@@ -1,9 +1,11 @@
 [project]
-name = "jwstdetector"
+name = "jwst-peculiar"
 version = "0.5.0"
 description = "Unsupervised anomaly detection on JWST imagery with DINO patch embeddings"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE.md"]
 
 dependencies = [
   "numpy",
@@ -19,9 +21,9 @@ dependencies = [
   "PyYAML",
   "tqdm",
   "matplotlib",
-  "pyvo",  # SIMBAD, NED and Gaia over TAP for `jwstdetector match`
+  "pyvo",  # SIMBAD, NED and Gaia over TAP for `jwst-peculiar match`
   "photutils",  # finds and measures sources for the colour search
-  "scikit-learn",  # the isolation forest baseline in `jwstdetector bench`
+  "scikit-learn",  # the isolation forest baseline in `jwst-peculiar bench`
   "typing_extensions",  # @override on Python 3.11
 ]
 
@@ -38,22 +40,26 @@ dev = [
   "types-PyYAML",
   "types-tqdm",
 ]
-# STScI's Webb PSF model, which `jwstdetector bench` plants sources with when it's installed.
+# STScI's Webb PSF model, which `jwst-peculiar bench` plants sources with when it's installed.
 webb = ["stpsf"]
 
+[project.urls]
+Demo = "https://somethingobvious.github.io/jwst-peculiar/"
+Repository = "https://github.com/SomethingObvious/jwst-peculiar"
+
 [project.scripts]
-jwstdetector = "jwstdetector.cli:main"
+jwst-peculiar = "jwst_peculiar.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["jwstdetector"]
+packages = ["jwst_peculiar"]
 
 [tool.setuptools.package-data]
 # The built web viewer, from `npm run build` in web/.
-jwstdetector = ["viewer_static/**/*"]
+jwst_peculiar = ["viewer_static/**/*"]
 
 [tool.ruff]
 line-length = 88
@@ -147,7 +153,7 @@ ignore_missing_imports = true
 [tool.basedpyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
-include = ["jwstdetector", "tests"]
+include = ["jwst_peculiar", "tests"]
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownArgumentType = false
@@ -155,7 +161,7 @@ reportUnknownVariableType = false
 
 [tool.vulture]
 min_confidence = 60
-paths = ["jwstdetector", "tests"]
+paths = ["jwst_peculiar", "tests"]
 
 [tool.bandit]
 skips = ["B101"]

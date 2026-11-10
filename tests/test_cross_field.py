@@ -1,15 +1,15 @@
+# pyright: reportPrivateUsage=false
 from __future__ import annotations
 
 import csv
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import pytest
 
-from jwstdetector import bootstrap
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from jwst_peculiar import bootstrap
+from jwst_peculiar.detection import Footprint
 
 SIZE = 64
 
@@ -83,3 +83,50 @@ def test_no_calibrate_ranks_without_p_values(tmp_path: Path) -> None:
     assert max(rows, key=lambda r: float(r["AnomalyScore"]))["Sample"] == "t000.png"
     assert not (out / "significance.csv").exists()
     assert not (out / "calibration.csv").exists()
+
+
+def _grid(name: str, x0: int, y0: int, *, ra0: float = 34.3) -> dict[Path, Footprint]:
+    """Nine tiles of a mosaic whose pixels are 0.04 arcsec, from one corner.
+
+    Returns:
+        Their footprints by a made-up tile path.
+    """
+    scale = 0.04 / 3600
+    return {
+        Path(f"{name}_{x0}_{y0}_{i}.png"): Footprint(
+            name,
+            x0 + 320 * (i % 3),
+            y0 + 320 * (i // 3),
+            320,
+            ra=ra0 - (x0 + 320 * (i % 3)) * scale,
+            dec=-5.2 + (y0 + 320 * (i // 3)) * scale,
+        )
+        for i in range(9)
+    }
+
+
+def test_blocks_of_one_mosaic_can_share_its_name() -> None:
+    a = bootstrap._Field("b00", bootstrap._Tiles([], Path()), _grid("m", 0, 0))
+    b = bootstrap._Field("b01", bootstrap._Tiles([], Path()), _grid("m", 1920, 0))
+    bootstrap._check_mosaic_names([a, b], _grid("m", 0, 1920))
+
+
+def test_two_mosaics_with_one_name_still_stop() -> None:
+    a = bootstrap._Field("a", bootstrap._Tiles([], Path()), _grid("m", 0, 0))
+    b = bootstrap._Field("b", bootstrap._Tiles([], Path()), _grid("m", 0, 0, ra0=150.1))
+    with pytest.raises(SystemExit, match="different grids"):
+        bootstrap._check_mosaic_names([a, b], {})
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--score_top_frac", "5"],
+        ["--subspace_variance", "1"],
+        ["--drop_directions", "-1"],
+        ["--detector", "iforest", "--reference_roots", "a", "b"],
+    ],
+)
+def test_out_of_range_options_stop_the_run(flags: list[str]) -> None:
+    with pytest.raises(SystemExit, match=r"has to be|on its own"):
+        bootstrap.main(["--data_root", "nowhere", *flags])

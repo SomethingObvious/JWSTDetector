@@ -63,16 +63,20 @@ async function decodePng(
 // for undefined, since undefined is not finite either.
 const finite = (v: number | undefined): v is number => Number.isFinite(v);
 
-function sampleOf(
-  get: (i: number) => number | undefined,
+/** Every finite value's min and max, and a sorted sample of at most SAMPLE_MAX of them. */
+export function sampleOf(
+  src: ArrayLike<number>,
   n: number,
+  stride = 1,
+  offset = 0,
 ): { sample: Float32Array; min: number; max: number } {
-  const step = Math.max(1, Math.floor(n / SAMPLE_MAX));
-  const vals: number[] = [];
+  const step = Math.max(1, Math.ceil(n / SAMPLE_MAX));
+  const vals = new Float32Array(Math.ceil(n / step));
+  let k = 0;
   let min = Infinity;
   let max = -Infinity;
   for (let i = 0; i < n; i++) {
-    const v = get(i);
+    const v = src[i * stride + offset];
     if (!finite(v)) {
       continue;
     }
@@ -83,10 +87,10 @@ function sampleOf(
       max = v;
     }
     if (i % step === 0) {
-      vals.push(v);
+      vals[k++] = v;
     }
   }
-  const sample = Float32Array.from(vals).sort();
+  const sample = vals.slice(0, k).sort();
   if (!sample.length) {
     return { sample, min: 0, max: 1 };
   }
@@ -154,11 +158,10 @@ export async function loadTile(
   const stats = Array.from({ length: channels }, (_, c) => {
     const plane = planes?.[c];
     if (plane) {
-      return sampleOf((i) => plane[i], n);
+      return sampleOf(plane, n);
     }
     // Without planes the PNG branch above has filled rgba.
-    const px = rgba ?? new Uint8Array(0);
-    return sampleOf((i) => px[i * 4 + c], n);
+    return sampleOf(rgba ?? new Uint8Array(0), n, 4, c);
   });
 
   const map2 = await mapsP;

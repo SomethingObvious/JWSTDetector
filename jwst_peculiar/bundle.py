@@ -24,21 +24,21 @@ import numpy as np
 from PIL import Image
 import yaml
 
-from jwstdetector.data import (
+from jwst_peculiar.data import (
     final_pass_dir,
     owned_patches,
     read_manifest,
     read_measurements,
 )
-from jwstdetector.detection import Footprint
-from jwstdetector.significance import read_significance
+from jwst_peculiar.detection import Footprint
+from jwst_peculiar.significance import read_significance
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
     import numpy.typing as npt
 
-    from jwstdetector.utils import SkyWcs
+    from jwst_peculiar.utils import SkyWcs
 
     # Rows of cached catalogue sources over one mosaic, with their mosaic pixels.
     _Sources: TypeAlias = tuple[
@@ -112,8 +112,7 @@ def map_path(maps_dir: Path, key: str) -> Path:
     Returns:
         The .npy path under `maps_dir`.
     """
-    # Same rule as detection.score_queries, since tile stems are full of RA and Dec
-    # dots.
+    # Same rule as detection's _save_maps, as tile stems are full of RA and Dec dots.
     return maps_dir / f"{Path(key).with_suffix('')}.npy"
 
 
@@ -156,15 +155,23 @@ def _read_words(path: Path) -> set[str]:
 
 
 def _owned_masks(
-    manifest: dict[str, dict[str, Any]], scores: dict[str, float], first_map: Path
+    manifest: dict[str, dict[str, Any]],
+    scores: dict[str, float],
+    first_map: Path,
+    *,
+    region: str,
 ) -> dict[str, npt.NDArray[np.bool_]]:
+    # Runs from before --score_region scored every patch.
+    if region == "all":
+        return {}
     first = np.load(first_map)
     footprints = {
         k: Footprint(m["mosaic"], m["x0"], m["y0"], m["size"])
         for k, m in manifest.items()
         if k in scores
     }
-    return owned_patches(footprints, (first.shape[0], first.shape[1]))
+    grid = (first.shape[0], first.shape[1])
+    return owned_patches(footprints, grid, middle=region == "middle")
 
 
 def _peak(
@@ -237,7 +244,7 @@ def _xmatch_summary(xmatch: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 class RunBundle:
-    """Joins a `jwstdetector run` folder with the dataset `jwstdetector prep` wrote."""
+    """Joins a `jwst-peculiar run` folder with the dataset its prep wrote."""
 
     def __init__(self, run_dir: Path, data_root: Path, *, writable: bool) -> None:
         self.run_dir = Path(run_dir)
@@ -308,9 +315,13 @@ class RunBundle:
         maps2 = self.final_dir / f"anomaly_maps/seed={seed}"
         maps1 = self.run_dir / "pass1" / f"anomaly_maps/seed={seed}"
         owned: dict[str, npt.NDArray[np.bool_]] = {}
-        # Runs from before --score_region scored every patch.
-        if self.args.get("score_region", "all") == "owned" and ranked:
-            owned = _owned_masks(manifest, scores, map_path(maps2, ranked[0]))
+        if ranked:
+            owned = _owned_masks(
+                manifest,
+                scores,
+                map_path(maps2, ranked[0]),
+                region=self.args.get("score_region", "all"),
+            )
         return _RunScores(
             final, scores, pass1, refs, manifest, ranked, maps2, maps1, owned
         )
@@ -403,7 +414,7 @@ class RunBundle:
             return self._read_tile_file(path)
         if folder == "cats" and self.index["run"]["xmatch"]:
             return self._read_cats(path)
-        if folder == "mosaics" and name.endswith(".png") and "/" not in name:
+        if folder == "mosaics" and name.removesuffix(".png") in self.index["mosaics"]:
             return (self.data_root / "mosaics" / name).read_bytes(), "image/png"
         return self._read_run_file(path)
 
@@ -537,10 +548,10 @@ def save_verdict(  # noqa: PLR0917 the server passes all five positionally
     star: bool,  # noqa: FBT001 the server passes all five positionally
     note: str,
 ) -> str:
-    """Writes one verdict into verdicts.csv beside the run.
+    """Write one verdict into verdicts.csv beside the run.
 
-    The file is rewritten through a temporary file and a rename, so a crash mid-write
-    leaves the previous file intact rather than half of one.
+    It goes through a temporary file and a rename, so a crash mid-write leaves the
+    previous file whole.
 
     Returns:
         When the verdict was saved, as an ISO 8601 UTC timestamp.
@@ -582,7 +593,7 @@ def export(
     *,
     cutouts: int | None = None,
 ) -> int:
-    """Writes the bundle under out_dir/run/, with the viewer app beside it when given.
+    """Write the bundle under out_dir/run/, with the viewer app beside it when given.
 
     With `cutouts`, only the tiles ranked that high keep their FITS cutout, and the
     rest show their PNG.
@@ -616,7 +627,8 @@ def export(
 def _set_meta(page: str, attr: str, value: str) -> str:
     escaped = html.escape(value)
     return re.sub(
-        rf'(<meta {attr} content=")[^"]*(")',
+        # Across lines too, as the built page wraps its longer tags.
+        rf'(<meta\s+{attr}\s+content=")[^"]*(")',
         lambda m: m.group(1) + escaped + m.group(2),
         page,
         count=1,
@@ -624,6 +636,9 @@ def _set_meta(page: str, attr: str, value: str) -> str:
 
 
 def _head_tags(url: str, name: str, ld: dict[str, Any]) -> str:
+    url = html.escape(url)
+    # A name holding </script> would otherwise end the block early.
+    data = json.dumps(ld).replace("</", "<\\/")
     return "\n".join([
         f'    <link rel="canonical" href="{url}" />',
         f'    <meta property="og:url" content="{url}" />',
@@ -632,26 +647,26 @@ def _head_tags(url: str, name: str, ld: dict[str, Any]) -> str:
         '    <meta property="og:image:height" content="630" />',
         f'    <meta property="og:image:alt" content="{html.escape(name)}" />',
         f'    <meta name="twitter:image" content="{url}social.png" />',
-        f'    <script type="application/ld+json">{json.dumps(ld)}</script>',
+        f'    <script type="application/ld+json">{data}</script>',
         "  </head>",
     ])
 
 
 def add_site_meta(bundle: RunBundle, out_dir: Path, site_url: str) -> None:
-    """Makes an exported run findable once it's hosted at `site_url`.
+    """Make an exported run findable once it's hosted at `site_url`.
 
     It names the run in index.html's title and description for crawlers that don't
-    run scripts, adds the canonical URL, a social card cut from the mosaic around
-    the top tile, and JSON-LD, and writes a sitemap.xml to submit to search engines. A
-    robots.txt would do nothing below the domain's root, so there isn't one.
+    run scripts, adds the canonical URL, JSON-LD and a social card cut from the mosaic
+    around the top tile, and writes a sitemap.xml. There is no robots.txt, as one does
+    nothing below the domain's root.
     """
     out_dir = Path(out_dir)
     url = site_url.rstrip("/") + "/"
     run = bundle.index["run"]
     tiles = bundle.index["tiles"]
-    title = f"{run['name']} · JWSTDetector"
+    title = f"{run['name']} · jwst-peculiar"
     desc = (
-        f"{len(tiles)} tiles of {run['name']} ranked by JWSTDetector, unsupervised "
+        f"{len(tiles)} tiles of {run['name']} ranked by jwst-peculiar, unsupervised "
         "anomaly detection for James Webb Space Telescope images. Step through them "
         "with the float pixels, patch distances, RA and Dec."
     )

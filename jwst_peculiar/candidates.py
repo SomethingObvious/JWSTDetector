@@ -1,11 +1,11 @@
 """Writes a run's candidates as a table for TOPCAT or astropy, and a DS9 region file.
 
-    jwstdetector candidates results_smacs datasets/smacs_nircam -o candidates.fits
-    jwstdetector candidates results_smacs datasets/smacs_nircam -o new.vot --top 50 --uncatalogued
+    jwst-peculiar candidates results_smacs datasets/smacs_nircam -o candidates.fits
+    jwst-peculiar candidates results_smacs datasets/smacs_nircam -o new.vot --top 50 --uncatalogued
 
 The format follows the file name, so .fits, .vot, .csv and .ecsv all work. Each row
 is a tile, with the sky position of its most anomalous patch, its scores, the nearest
-source in every catalogue `jwstdetector match` checked, and your verdict and note.
+source in every catalogue `jwst-peculiar match` checked, and your verdict and note.
 A .reg file with a circle and the rank at every peak is written beside it.
 """  # noqa: E501 --help prints this, so the usage line stays whole
 
@@ -19,10 +19,10 @@ from typing import TYPE_CHECKING, Any
 from astropy.table import Table
 import numpy as np
 
-from jwstdetector.bundle import RunBundle, read_verdicts
+from jwst_peculiar.bundle import RunBundle, read_verdicts
 
 if TYPE_CHECKING:
-    from jwstdetector.utils import AstropyTable
+    from jwst_peculiar.utils import AstropyTable
 
 logger = logging.getLogger(__name__)
 
@@ -149,9 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("run_dir", type=Path, help="A `jwstdetector run` output folder.")
+    ap.add_argument("run_dir", type=Path, help="A `jwst-peculiar run` output folder.")
     ap.add_argument(
-        "data_root", type=Path, help="The `jwstdetector prep` folder it scored."
+        "data_root", type=Path, help="The `jwst-peculiar prep` folder it scored."
     )
     ap.add_argument(
         "-o", "--out", type=Path, default=None, help="RUN/candidates.fits by default."
@@ -160,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--uncatalogued",
         action="store_true",
-        help="Only tiles `jwstdetector match` found nothing near.",
+        help="Only tiles `jwst-peculiar match` found nothing near.",
     )
     args = ap.parse_args(argv)
     logging.basicConfig(
@@ -173,9 +173,16 @@ def main(argv: list[str] | None = None) -> int:
         msg = f"Can't tell the format of {out.name}. Use {', '.join(FORMATS)}."
         raise SystemExit(msg)
     bundle = RunBundle(args.run_dir, args.data_root, writable=False)
-    table = candidate_table(bundle, top=args.top, uncatalogued=args.uncatalogued)
-    table.write(out, format=fmt, overwrite=True)
     index: dict[str, Any] = bundle.index
+    if args.uncatalogued and not index["run"].get("xmatch"):
+        msg = "--uncatalogued needs `jwst-peculiar match` to have run on this folder."
+        raise SystemExit(msg)
+    table = candidate_table(bundle, top=args.top, uncatalogued=args.uncatalogued)
+    try:
+        table.write(out, format=fmt, overwrite=True)
+    except UnicodeEncodeError:
+        msg = "A note has a character FITS can't hold. Write a .vot or .ecsv instead."
+        raise SystemExit(msg) from None
     radius = (index["run"].get("xmatch") or {}).get("radius_arcsec", 1.5)
     write_regions(table, out.with_suffix(".reg"), radius)
     logger.info(

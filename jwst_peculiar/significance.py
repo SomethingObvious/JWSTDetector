@@ -3,10 +3,10 @@
 A tile's p-value is the share of calibration tiles that score at least as high, with
 the usual plus one on top and bottom (Bates et al. 2023). It is valid when the
 calibration tiles are exchangeable with the ordinary tiles being tested, which is
-why `jwstdetector run --reference_roots` scores each control field against the other
-control fields only. The target is scored against all of them, a bigger reference
-that only lowers its scores, so that and any real anomalies among the calibration
-tiles both push p-values up.
+why `jwst-peculiar run --reference_roots` scores each control field against the other
+control fields only. The target is scored against all of them, and while the kNN
+bank holds every patch, that bigger reference only lowers its scores. Real anomalies
+among the calibration tiles only raise theirs, so both push p-values up.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def bh_q(p: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
 def write_significance(
     path: Path, scores: dict[str, float], calibration: npt.NDArray[np.float64]
 ) -> int:
-    """Writes key, p and q for every tile.
+    """Write each tile's key, p and q.
 
     Returns:
         How many tiles have q at most 0.1.

@@ -38,7 +38,7 @@ export default defineConfig(
       'sort-keys': 'off',
       // Image and sky maths is full of plain constants that read better inline.
       'no-magic-numbers': 'off',
-      // x, y, i and friends are the clearest names in pixel loops.
+      // x, y and i are the clearest names in pixel loops.
       'id-length': 'off',
       // It asks for combined declarations, which fights one per line.
       'one-var': 'off',

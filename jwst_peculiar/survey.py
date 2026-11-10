@@ -1,6 +1,11 @@
 """The pre-registered COSMOS-Web search, from tile scores to the verdict.
 
-    python -m jwstdetector.survey SPLIT_JSON STARS_JSON DATA_ROOT RESULTS_DIR
+    python -m jwst_peculiar.survey SPLIT_JSON STARS_JSON DATA_ROOT RESULTS_DIR
+    python -m jwst_peculiar.survey --check SPLIT_JSON STARS_JSON DATA_ROOT
+
+The second form needs no scores. It applies the rules to every tile and says whether
+the search could name one tile alone, and how many would have to beat every
+calibration tile together otherwise, which is worth knowing before scoring anything.
 
 docs/search.md has the design and the reason for each rule.
 """
@@ -10,6 +15,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,18 +26,22 @@ from typing import TYPE_CHECKING, Any
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 import numpy as np
+import yaml
 
-from jwstdetector.significance import bh_q, conformal_p
+from jwst_peculiar.data import owned_patches, read_manifest
+from jwst_peculiar.detection import Footprint
+from jwst_peculiar.scoring import aggregate_score
+from jwst_peculiar.significance import bh_q, conformal_p
 
 if TYPE_CHECKING:
     import numpy.typing as npt
 
-    from jwstdetector.utils import SkyCoords
+    from jwst_peculiar.utils import SkyCoords
 
 _KEY = re.compile(r"_cx(\d+)_cy(\d+)_ra([\d.]+)_dec(m?)([\d.]+)_")
 
-# Stars brighter than this get a mask, of this many arcseconds at G = 19 and growing
-# by sqrt(flux), measured on PRIMER, which this search never touches.
+# Stars brighter than G = 16 get a mask of radius 1.5 arcsec at G = 19, growing as
+# sqrt(flux). Measured on PRIMER, which this search never touches.
 STAR_G_MAX = 16.0
 STAR_RADIUS_AT_19 = 1.5
 # The star list has to reach this far past every tile, which covers a G = 5 star.
@@ -39,8 +49,8 @@ STAR_MARGIN_DEG = 0.3
 
 REHEARSAL_DRAWS = 1000
 # The rehearsal fails, and the search names nothing, if more than this share of
-# draws of calibration visits alone gets any detection at all. BH at alpha keeps
-# that share at alpha when nothing is there.
+# calibration-only draws find anything. BH at alpha keeps that share at alpha when
+# nothing is there.
 REHEARSAL_LIMIT = 0.15
 
 
@@ -81,10 +91,10 @@ def check_owned(run_dir: Path) -> None:
     """Refuse a run that scored every patch, as its tiles would count shared sky twice.
 
     Raises:
-        ValueError: If the run's args.yaml doesn't say score_region: owned.
+        ValueError: If the run's args.yaml doesn't say score_region: owned or middle.
     """
     text = (run_dir / "args.yaml").read_text(encoding="utf-8")
-    if not re.search(r"^score_region: owned$", text, re.MULTILINE):
+    if not re.search(r"^score_region: (owned|middle)$", text, re.MULTILINE):
         msg = (
             f"{run_dir} wasn't scored with --score_region owned, so its overlapping "
             "tiles share sky and can't all count."
@@ -184,6 +194,39 @@ def _read_scores(path: Path) -> dict[str, float]:
         return {r["Sample"]: float(r["AnomalyScore"]) for r in csv.DictReader(f)}
 
 
+def middle_scores(run_dir: Path, data_dir: Path) -> dict[str, float]:
+    """Score a finished run again on the middle of each tile, from its saved maps.
+
+    The maps hold every patch's distance, so this is what `--score_region middle`
+    would have given the run, without embedding anything again.
+
+    Returns:
+        The score of every tile the run scored.
+    """
+    args = yaml.safe_load((run_dir / "args.yaml").read_text(encoding="utf-8"))
+    maps = run_dir / "cross" / "anomaly_maps" / f"seed={args.get('seed', 0)}"
+    scored = _read_scores(run_dir / "measurements_final.csv")
+    footprints = {
+        k: Footprint(m["mosaic"], m["x0"], m["y0"], m["size"])
+        for k, m in read_manifest(data_dir).items()
+    }
+    out: dict[str, float] = {}
+    mine: dict[str, npt.NDArray[np.bool_]] = {}
+    for key in scored:
+        dists = np.load(maps / f"{Path(key).stem}.npy")
+        if not mine:
+            mine = owned_patches(
+                footprints, (dists.shape[0], dists.shape[1]), middle=True
+            )
+        out[key] = aggregate_score(
+            dists[mine[key]],
+            mode=args.get("score_mode", "top1p"),
+            top_frac=args.get("score_top_frac", 0.01),
+            quantile=args.get("score_quantile", 0.9995),
+        )
+    return out
+
+
 def read_stars(
     path: Path, tiles: SkyCoords
 ) -> tuple[SkyCoords, npt.NDArray[np.float64]]:
@@ -275,10 +318,23 @@ def _filter_visit(
     return {k: scores[k] for k, ok in zip(keys, keep, strict=True) if ok}, counts
 
 
+def _manifest_keys(root: Path) -> dict[str, float]:
+    with (root / "manifest.csv").open(encoding="utf-8", newline="") as f:
+        return {r["key"]: 0.0 for r in csv.DictReader(f)}
+
+
 def kept_tiles(
-    split: dict[str, Any], *, stars_json: Path, data: Path, results: Path
+    split: dict[str, Any],
+    *,
+    stars_json: Path,
+    data: Path,
+    results: Path | None,
+    middle: bool = False,
 ) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
     """Apply the overlap and star rules to each search and calibration visit.
+
+    With no results every tile scores 0, which is enough to count what the rules keep.
+    With `middle`, each run's tiles are scored again on their middle first.
 
     Returns:
         The kept scores per visit, and how many tiles each rule dropped.
@@ -300,8 +356,15 @@ def kept_tiles(
     kept: dict[str, dict[str, float]] = {}
     dropped = {"overlap": 0, "star": 0}
     for v in [*split["search"], *split["calibration"]]:
-        check_owned(results / v)
-        scores = _read_scores(results / v / "measurements_final.csv")
+        if results is None:
+            scores = _manifest_keys(data / v)
+        else:
+            check_owned(results / v)
+            scores = (
+                middle_scores(results / v, data / v)
+                if middle
+                else _read_scores(results / v / "measurements_final.csv")
+            )
         kept[v], counts = _filter_visit(v, scores, rules)
         for rule, n in counts.items():
             dropped[rule] += n
@@ -364,6 +427,9 @@ def standardise(kept: dict[str, dict[str, float]]) -> dict[str, dict[str, float]
     """
     out: dict[str, dict[str, float]] = {}
     for v, scores in kept.items():
+        if len(scores) < 2:  # noqa: PLR2004 the rules left no spread to place it on
+            out[v] = {}
+            continue
         x = np.array(list(scores.values()))
         med = float(np.median(x))
         mad = 1.4826 * float(np.median(np.abs(x - med)))
@@ -372,6 +438,35 @@ def standardise(kept: dict[str, dict[str, float]]) -> dict[str, dict[str, float]
             raise ValueError(msg)
         out[v] = {k: (s - med) / mad for k, s in scores.items()}
     return out
+
+
+def can_name_one(
+    split: dict[str, Any], kept: dict[str, dict[str, float]]
+) -> dict[str, Any]:
+    """Whether the best possible conformal p can pass BH for a single tile.
+
+    BH passes k tiles at the smallest p once that p is at most k alpha over the
+    search tiles, so a search that can't name one tile can still name several that
+    each beat every calibration tile.
+
+    Returns:
+        The tile counts, the smallest p, what BH needs, the answer, and how many
+        tiles at the smallest p it takes for any to pass.
+    """
+    if split.get("standardise"):
+        kept = {v: s if len(s) >= 2 else {} for v, s in kept.items()}  # noqa: PLR2004 as standardise leaves them
+    n_search = sum(len(kept[v]) for v in split["search"])
+    n_cal = sum(len(kept[v]) for v in split["calibration"])
+    floor = 1 / (n_cal + 1)
+    needs = float(split["alpha"]) / n_search if n_search else 0.0
+    return {
+        "search_tiles": n_search,
+        "calibration_tiles": n_cal,
+        "smallest_p": floor,
+        "bh_needs_for_one": needs,
+        "can_name_one": bool(n_search) and floor <= needs,
+        "tiles_needed_together": math.ceil(floor / needs) if n_search else 0,
+    }
 
 
 def _write_pvalues(
@@ -390,20 +485,42 @@ def _write_pvalues(
             w.writerow([keys[i], f"{scores[i]:.6g}", f"{p[i]:.6g}", f"{q[i]:.6g}"])
 
 
+def _check(argv: list[str]) -> int:
+    split = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
+    kept, _ = kept_tiles(
+        split, stars_json=Path(argv[1]), data=Path(argv[2]), results=None
+    )
+    power = can_name_one(split, kept)
+    sys.stdout.write(json.dumps(power, indent=1) + "\n")
+    return 0 if power["can_name_one"] else 1
+
+
 def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/search.md gives
     """Write search_pvalues.csv and verdict.json, and print the verdict.
 
+    With --middle first, the tiles are scored again on their middle and the two files
+    get _middle in their names, so a search's own verdict stays beside the rescore.
+
     Returns:
-        0, also when nothing is found.
+        0, also when nothing is found. With --check, 1 if no tile could be named
+        alone.
 
     Raises:
         ValueError: If no search tile is left once the rules have run.
     """
+    if argv[0] == "--check":
+        return _check(argv[1:])
+    middle = argv[0] == "--middle"
+    argv = argv[middle:]
     split = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
     results = Path(argv[3])
     alpha = float(split["alpha"])
     kept, dropped = kept_tiles(
-        split, stars_json=Path(argv[1]), data=Path(argv[2]), results=results
+        split,
+        stars_json=Path(argv[1]),
+        data=Path(argv[2]),
+        results=results,
+        middle=middle,
     )
     if split.get("standardise"):
         kept = standardise(kept)
@@ -416,7 +533,6 @@ def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/s
         raise ValueError(msg)
     p = conformal_p(np.array([search[k] for k in keys]), cal)
     q = bh_q(p)
-    _write_pvalues(results / "search_pvalues.csv", search=search, p=p, q=q)
 
     found = rehearse(
         {v: np.array(list(kept[v].values())) for v in split["calibration"]},
@@ -439,7 +555,10 @@ def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/s
         ],
     }
     text = json.dumps(verdict, indent=1) + "\n"
-    (results / "verdict.json").write_text(text, encoding="utf-8")
+    # Both files go out together, once the rehearsal has run.
+    tag = "_middle" if middle else ""
+    _write_pvalues(results / f"search_pvalues{tag}.csv", search=search, p=p, q=q)
+    (results / f"verdict{tag}.json").write_text(text, encoding="utf-8")
     sys.stdout.write(text)
     return 0
 

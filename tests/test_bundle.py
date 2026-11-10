@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import threading
 from typing import TYPE_CHECKING, Any
 
 from astropy.table import Table
@@ -12,10 +15,11 @@ from PIL import Image
 import pytest
 import yaml
 
-from jwstdetector import bundle, candidates, catalogues
+from jwst_peculiar import bundle, candidates, catalogues, server
+from jwst_peculiar.server import make_handler
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 SCORES = {"a.png": 0.2, "b.png": float("nan"), "c.png": 0.9}
 WCS_META = {
@@ -82,7 +86,9 @@ def test_bundle_ranks_exports_and_saves_verdicts(
 
     site = tmp_path / "site"
     (site / "index.html").write_text(
-        '<html><head><title>x</title>\n<meta name="description" content="old" />\n'
+        # The built page wraps its longer tags over several lines.
+        '<html><head><title>x</title>\n<meta\n  name="description"\n'
+        '  content="old"\n/>\n'
         '<meta property="og:title" content="old" />\n  </head></html>',
         encoding="utf-8",
     )
@@ -241,3 +247,77 @@ def test_social_card_keeps_off_a_blank_gap() -> None:
     assert hi == 45
     # Too short a run to fit the card falls back to the whole axis.
     assert bundle.lit_span(lit, 20, 40) == (0, 45)
+
+
+@pytest.fixture
+def port(run: tuple[Path, Path]) -> Iterator[int]:
+    served = bundle.RunBundle(*run, writable=True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(served))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_port
+    server.shutdown()
+    server.server_close()
+
+
+def _ask(
+    port: int,
+    method: str,
+    path: str,
+    *,
+    body: dict[str, str] | None = None,
+    **headers: str,
+) -> tuple[int, bytes]:
+    conn = HTTPConnection("127.0.0.1", port, timeout=10)
+    data = json.dumps(body).encode() if body is not None else None
+    conn.request(method, path, body=data, headers=headers)
+    res = conn.getresponse()
+    out = res.status, res.read()
+    conn.close()
+    return out
+
+
+def test_its_own_page_reads_and_writes(port: int, run: tuple[Path, Path]) -> None:
+    status, body = _ask(port, "GET", "/run/index.json")
+    assert status == 200
+    assert len(json.loads(body)["tiles"]) == 3
+
+    here = f"http://127.0.0.1:{port}"
+    verdict = {"key": "c.png", "verdict": "artifact"}
+    status, _ = _ask(port, "POST", "/run/api/verdict", body=verdict, Origin=here)
+    assert status == 200
+    assert bundle.read_verdicts(run[0])["c.png"]["verdict"] == "artifact"
+
+
+def test_another_site_gets_nothing(port: int, run: tuple[Path, Path]) -> None:
+    # A page elsewhere posting to localhost, which a browser allows.
+    verdict = {"key": "c.png", "verdict": "artifact"}
+    status, _ = _ask(
+        port, "POST", "/run/api/verdict", body=verdict, Origin="https://example.org"
+    )
+    assert status == 403
+    assert bundle.read_verdicts(run[0]) == {}
+    # A domain pointed at 127.0.0.1 still names itself in Host.
+    status, _ = _ask(port, "GET", "/run/index.json", Host=f"example.org:{port}")
+    assert status == 403
+
+
+def test_paths_stay_inside_the_run(port: int, run: tuple[Path, Path]) -> None:
+    Image.new("RGB", (2, 2)).save(run[1].parent / "outside.png")
+    assert _ask(port, "GET", "/run/mosaics/m.png")[0] == 200
+    for path in (
+        "/run/mosaics/..%5C..%5Coutside.png",
+        "/run/mosaics/../../outside.png",
+        "/..%5C..%5Coutside.png",
+        "/run/mosaics/a%00.png",
+    ):
+        assert _ask(port, "GET", path)[0] == 404
+
+
+def test_renaming_a_run_keeps_its_saved_verdicts(
+    run: tuple[Path, Path], tmp_path: Path
+) -> None:
+    run_dir, data = run
+    site = tmp_path / "site"
+    server.main([str(run_dir), str(data), "--export", str(site), "--name", "A Field"])
+    info = json.loads((site / "run/index.json").read_text(encoding="utf-8"))["run"]
+    assert (info["name"], info["id"]) == ("A Field", run_dir.name)

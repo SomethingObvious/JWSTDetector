@@ -16,7 +16,7 @@ So when there's a weight map, prep scales each pixel's flux above the sky by
 
 in each filter, where $w$ is the pixel's weight and $\tilde w$ the mosaic's median weight. That is how a detection image is weighted. The sky noise comes out the same across the mosaic, and a source in shallow sky looks only as strong as its signal to noise. Pixels with no weight, like a saturated star's core, are left alone. The FITS cutouts keep the real flux, and the factors go in a `NOISEEQ` extension so the benchmark can render a planted source the same way.
 
-The 57 tiles that reach into sky under half the median weight are 20% of the field, and now they hold 2 of kNN's top 20 places and 6% of its top 50. That is fewer than their share, which seems right, as a faint source in shallow sky is less certain.
+With the noise evened out, the 57 tiles that reach into sky under half the median weight (20% of the field) hold 2 of kNN's top 20 places and 6% of its top 50. That is fewer than their share, which seems right, as a faint source in shallow sky is less certain.
 
 ## Patch Distance
 
@@ -42,7 +42,9 @@ A tile's score is the mean of the top 1% of the patch distances it scores (the n
 
 Tiles overlap by half, so most of the sky is in four of them. An object cut off by one tile's edge looks odd to the backbone however ordinary it is, and with every patch scored, the outermost ring of patches held the peak of 45% of kNN's top 20 tiles on SMACS 0723, against 14% by chance. Skipping a ring or two only moved the excess inward, since the patches next to a cut-off object are raised as well.
 
-So each patch only counts towards the tile whose centre it is nearest, measured as the larger of the x and y offsets. That splits every overlap into square cells, hands each bit of sky to exactly one tile and drops none, and works the same for tiles flush with the far edge of a mosaic. With half-tile overlap an interior tile scores its central 14 by 14 patches, while its map still shows all 28 by 28, and the viewer draws the scored part as a dashed outline. `--score_region all` scores every patch the old way.
+So each patch only counts towards the tile whose centre it is nearest, measured as the larger of the x and y offsets. That splits every overlap into square cells and drops no sky, and inside a mosaic it hands each bit of sky to exactly one tile. Along the outside, two neighbours can be equally near a patch with no third tile to take it, and then both score it. On SMACS 0723 that's 4,545 of the 66,248 scored patches (6.9%). With half-tile overlap an interior tile scores its central 14 by 14 patches, while its map still shows all 28 by 28, and the viewer draws the scored part as a dashed outline. `--score_region all` scores every patch instead.
+
+A tile with a neighbour missing scores out to its edge on that side, so it scores more patches than an interior tile and the extra ones are near the edge of what the backbone sees. That makes tiles hard to compare where many of them lack neighbours, as [the MINERVA blocks](minerva.md#a-rescore-after-the-result) did. `--score_region middle` scores the central 14 by 14 patches of every tile, which is the same for all of them but leaves the outside of a mosaic unscored.
 
 Scoring that way, 3 of kNN's top 20 tiles peak on the outer ring of the part they score, where chance would put 5, and over all 288 tiles it's 25% against 23%.
 
@@ -70,9 +72,9 @@ with $\mathcal{M}_N(p)$ the bank patches left once the closest matches from $N -
 p = \frac{1 + \left|\{ j : c_j \ge s \}\right|}{n + 1}
 ```
 
-over the $n$ calibration scores $c_j$ (Bates et al. 2023), and Benjamini-Hochberg turns those into q-values, so the tiles with $q \le 0.1$ are a set where about a tenth or fewer are expected to be ordinary. It is valid when the calibration tiles are exchangeable with the ordinary tiles of the target. The target is scored against every reference field and each calibration field against one fewer, which only lowers the target's scores, so the p-values err high.
+over the $n$ calibration scores $c_j$ (Bates et al. 2023), and Benjamini-Hochberg turns those into q-values, so the tiles with $q \le 0.1$ are a set where about a tenth or fewer are expected to be ordinary. It is valid when the calibration tiles are exchangeable with the ordinary tiles of the target, so the reference fields should share its filters and depth. The target is scored against every reference field and each calibration field against one fewer. While the bank holds every patch, that only lowers the target's scores, so the p-values err high. A bank cut down to `--max_bank_patches` is a random draw, and then it's only true on average.
 
-On SMACS 0723 against Abell 370, MACS J0416, CEERS and GLASS, no tile reaches $q \le 0.1$. The lowest p is 0.0085, as the arcs and bright stars of the other three clusters score as high as SMACS's do, and with 1,056 calibration tiles p can't go below 0.00095 anyway. The top tile in that ranking is kNN's first as well, a long horizontal diffraction spike from a bright star just outside it, 3 to 4 sigma above the sky along one row of patches and brightest in F444W. The p-values assume the ordinary tiles of the target look like the calibration tiles, so the reference fields should share the target's filters and depth, and the more of them there are the smaller p can get. [Searching a Survey](search.md) covers why a search over a whole survey can't single out one tile, and how the COSMOS-Web search is split so that it can.
+On SMACS 0723 against Abell 370, MACS J0416, CEERS and GLASS, no tile reaches $q \le 0.1$. The lowest p is 0.0085, as the arcs and bright stars of the other three clusters score as high as SMACS's do, and with 1,056 calibration tiles p can't go below 0.00095 anyway. More reference fields would lower that floor. The top tile in that ranking is kNN's first as well, a long horizontal diffraction spike from a bright star just outside it, 3 to 4 sigma above the sky along one row of patches and brightest in F444W. [Searching a Survey](search.md) covers why a search over a whole survey can't single out one tile, and how the COSMOS-Web search is split so that it can.
 
 ## Precision and Speed
 
@@ -96,7 +98,7 @@ The anomaly is usually one small thing in a 20 arcsecond tile, so the match uses
 x = x_0 + \frac{(c + \tfrac{1}{2})\,s}{G} - \tfrac{1}{2}, \qquad y = y_0 + s - \frac{(r + \tfrac{1}{2})\,s}{G} - \tfrac{1}{2}
 ```
 
-in zero-based FITS pixels, since PNG rows run down and FITS rows run up. The mosaic WCS turns that into RA and Dec, and astropy's `match_to_catalog_sky` finds the nearest SIMBAD, NED and Gaia DR3 source. A tile is uncatalogued when none of them lies within 1.5 arcseconds, about two patches.
+in zero-based FITS pixels, since PNG rows run down and FITS rows run up. The mosaic WCS turns that into RA and Dec, and astropy's `match_to_catalog_sky` finds the nearest SIMBAD, NED and Gaia DR3 source. A tile is uncatalogued when none of them lies within 1.5 arcseconds, about two patches. No proper motion is applied, and SIMBAD's positions are for 2000 and Gaia's for 2016, so a star that has moved more than that since can come out as uncatalogued.
 
 ## Learning From Verdicts
 
@@ -124,8 +126,8 @@ The score is relative to the reference, so an artifact shared by most tiles coun
 
 ## References
 
-- Damm, Laszkiewicz, Lederer, Fischer, Weiss. AnomalyDINO: Boosting Patch-based Few-shot Anomaly Detection with DINOv2. WACV 2025.
-- Lendering et al. SubspaceAD. arXiv:2602.23013, 2026.
+- Damm, Laszkiewicz, Lederer, Fischer. AnomalyDINO: Boosting Patch-based Few-shot Anomaly Detection with DINOv2. WACV 2025.
+- Lendering, Akdag, Bondarev. SubspaceAD: Training-Free Few-Shot Anomaly Detection via Subspace Modeling. arXiv:2602.23013, 2026.
 - Siméoni et al. DINOv3. arXiv:2508.10104, 2025.
 - Lochner, Bassett. Astronomaly: Personalised Active Anomaly Detection in Astronomical Data. Astronomy and Computing 36, 100481, 2021.
 - Lupton et al. Preparing Red-Green-Blue Images from CCD Data. PASP 116, 133, 2004.

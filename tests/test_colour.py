@@ -3,7 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from jwstdetector.colour import BANDS, chi2_to_library, kernel_sigma_arcsec, score
+from jwst_peculiar.colour import (
+    BANDS,
+    chi2_to_library,
+    kernel_sigma_arcsec,
+    lone,
+    score,
+    spikes,
+)
 
 
 def _library(n: int = 40) -> np.ndarray:
@@ -57,3 +64,39 @@ def test_self_matches_are_skipped() -> None:
     )
     without = score(alone, err, library, pairs=(np.array([0]), np.array([5])))
     assert with_itself[0] < without[0]
+
+
+def test_a_hot_pixel_is_a_spike_and_a_star_is_not() -> None:
+    rng = np.random.default_rng(0)
+    sci = rng.normal(0, 1.0, (64, 64))
+    y, x = np.mgrid[:64, :64]
+    # An F140M star on the 0.031 arcsec grid, FWHM 1.55 px.
+    sci += 400 * np.exp(-((x - 20.3) ** 2 + (y - 20.6) ** 2) / (2 * 0.66**2))
+    sci[44, 40] += 60
+    ys, xs = spikes(sci, np.ones_like(sci, dtype=bool))
+    assert list(zip(ys.tolist(), xs.tolist(), strict=True)) == [(44, 40)]
+
+
+def test_a_band_without_a_measurement_drops_out_of_the_fit() -> None:
+    lib = _library()
+    flux = 3 * lib[5:6].copy()
+    flux[0, 4] = 5000.0
+    err = np.ones((1, len(BANDS)))
+    err[0, 4] = np.inf
+    assert chi2_to_library(flux, err, lib)[0, 5] == pytest.approx(0.0, abs=1e-9)
+    assert np.all(chi2_to_library(flux, np.full_like(err, np.inf), lib) == 0)
+
+
+def test_a_cosmic_ray_is_lone_but_a_line_or_a_cold_dwarf_is_not() -> None:
+    sky = np.full((4, 8), 0.1)
+    ray = np.zeros(8)
+    ray[5] = 30.0
+    line = np.ones(8)
+    line[4] = 12.0
+    cold = np.zeros(8)
+    cold[7] = 30.0
+    faint = np.zeros(8)
+    faint[2] = 1.5
+    hit = lone(np.array([ray, line, cold, faint]), sky)
+    assert hit[0].tolist() == [False] * 5 + [True] + [False] * 2
+    assert not hit[1:].any()

@@ -1,6 +1,5 @@
 export interface Fits {
   header: Record<string, string | number | boolean>;
-  cards: string[];
   width: number;
   height: number;
   /** One Float32Array per plane (1 for one band, 3 for R, G, B), rows top to bottom as shown. */
@@ -30,7 +29,6 @@ function parseValue(raw: string): string | number | boolean {
 export function readFits(buf: ArrayBuffer): Fits {
   const bytes = new Uint8Array(buf);
   const header: Fits['header'] = {};
-  const cards: string[] = [];
   let offset = 0;
   let ended = false;
   while (!ended) {
@@ -49,7 +47,6 @@ export function readFits(buf: ArrayBuffer): Fits {
       if (!key) {
         continue;
       }
-      cards.push(card.trimEnd());
       if (card.slice(8, 10) !== '= ') {
         continue;
       }
@@ -64,10 +61,10 @@ export function readFits(buf: ArrayBuffer): Fits {
   const bitpix = header['BITPIX'];
   const naxis = header['NAXIS'];
   if (bitpix !== -32) {
-    throw new Error(`FITS BITPIX is ${String(bitpix)}, the viewer reads -32 only`);
+    throw new Error(`FITS BITPIX is ${String(bitpix)}, but the viewer only reads -32`);
   }
   if (naxis !== 2 && naxis !== 3) {
-    throw new Error(`FITS NAXIS is ${String(naxis)}, the viewer reads 2 or 3`);
+    throw new Error(`FITS NAXIS is ${String(naxis)}, but the viewer only reads 2 or 3`);
   }
   const width = Number(header['NAXIS1']);
   const height = Number(header['NAXIS2']);
@@ -76,7 +73,7 @@ export function readFits(buf: ArrayBuffer): Fits {
   if (offset + plane * nplanes * 4 > bytes.length) {
     const need = plane * nplanes * 4;
     throw new Error(
-      `FITS data is short: needs ${String(need)} bytes after the header, has ${String(bytes.length - offset)}`,
+      `FITS data is short, with ${String(bytes.length - offset)} bytes after the header where it needs ${String(need)}`,
     );
   }
 
@@ -95,5 +92,5 @@ export function readFits(buf: ArrayBuffer): Fits {
     }
     planes.push(out);
   }
-  return { header, cards, width, height, planes };
+  return { header, width, height, planes };
 }

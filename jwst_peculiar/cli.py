@@ -1,6 +1,6 @@
-"""The `jwstdetector` command, with one subcommand per step.
+"""The `jwst-peculiar` command, with one subcommand per step.
 
-Each subcommand's module is imported only when it runs, so `jwstdetector --help`
+Each subcommand's module is imported only when it runs, so `jwst-peculiar --help`
 doesn't wait for torch to load.
 """
 
@@ -11,52 +11,52 @@ import sys
 
 COMMANDS = {
     "prep": (
-        "jwstdetector.prep",
+        "jwst_peculiar.prep",
         "run",
         "Cut FITS mosaics into tiles and FITS cutouts.",
     ),
     "levels": (
-        "jwstdetector.prep",
+        "jwst_peculiar.prep",
         "levels_main",
         "Measure one stretch per filter over datasets already cut.",
     ),
     "run": (
-        "jwstdetector.bootstrap",
+        "jwst_peculiar.bootstrap",
         "main",
         "Rank every tile with no labels, in two passes.",
     ),
     "score": (
-        "jwstdetector.reference",
+        "jwst_peculiar.reference",
         "main",
         "Score tiles against tiles known to be normal.",
     ),
     "match": (
-        "jwstdetector.catalogues",
+        "jwst_peculiar.catalogues",
         "main",
         "Cross-match the candidates with catalogues.",
     ),
     "candidates": (
-        "jwstdetector.candidates",
+        "jwst_peculiar.candidates",
         "main",
         "Write the candidates as a table and regions.",
     ),
     "view": (
-        "jwstdetector.server",
+        "jwst_peculiar.server",
         "main",
         "Open a run in the viewer, or export it as a site.",
     ),
     "bench": (
-        "jwstdetector.benchmark",
+        "jwst_peculiar.benchmark",
         "main",
         "Plant sources and measure how many are found.",
     ),
     "recall": (
-        "jwstdetector.recall",
+        "jwst_peculiar.recall",
         "main",
         "Rank objects already known to be in the field.",
     ),
     "unzip": (
-        "jwstdetector.unzip",
+        "jwst_peculiar.unzip",
         "main",
         "Expand .gz mosaics so they can be memory-mapped.",
     ),
@@ -68,10 +68,10 @@ def usage() -> str:
     width = max(map(len, COMMANDS))
     lines = [f"  {name:<{width}}  {help_}" for name, (_, _, help_) in COMMANDS.items()]
     return (
-        "usage: jwstdetector COMMAND [options]\n\n"
+        "usage: jwst-peculiar COMMAND [options]\n\n"
         "Unsupervised anomaly detection for JWST images.\n\ncommands:\n"
         + "\n".join(lines)
-        + "\n\nRun `jwstdetector COMMAND -h` for a command's options."
+        + "\n\nRun `jwst-peculiar COMMAND -h` for a command's options."
     )
 
 
@@ -87,11 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if argv[0] not in COMMANDS:
         sys.stderr.write(
-            f"jwstdetector: there's no {argv[0]!r} command.\n\n{usage()}\n"
+            f"jwst-peculiar: there's no {argv[0]!r} command.\n\n{usage()}\n"
         )
         return 2
     module, func, _ = COMMANDS[argv[0]]
     # argparse names the program after argv[0], and this makes its usage line say
-    # `jwstdetector prep` rather than just `jwstdetector`.
-    sys.argv[0] = f"jwstdetector {argv[0]}"
+    # `jwst-peculiar prep` rather than just `jwst-peculiar`.
+    sys.argv[0] = f"jwst-peculiar {argv[0]}"
     return getattr(importlib.import_module(module), func)(argv[1:]) or 0
