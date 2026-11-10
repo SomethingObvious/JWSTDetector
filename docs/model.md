@@ -1,6 +1,6 @@
 # The Model
 
-The COSMOS-Web search scores tiles with a fine-tune of DINOv3 ViT-L SAT, called G in [selection.md](selection.md), which has every rule that led to it, each written before the benches it governs. This page has the results those rules were applied to, plus the checks that came after. The weights are 1.2 GB, so they aren't in git. [training/overlap_ft.py](../training/overlap_ft.py) is the script that made them, kept exactly as it ran, and `--model_name models/overlap-ft-noise` loads them once they're there.
+The COSMOS-Web search scores tiles with a fine-tune of DINOv3 ViT-L SAT, called G in [selection.md](selection.md), which has every rule that led to it, each written before the benches it governs. This page has the results those rules were applied to, plus the checks that came after. The weights are 1.2 GB, so they aren't in git. [training/overlap_ft.py](../training/overlap_ft.py) is the script that made them, kept exactly as it ran, and `--model_name models/overlap-ft-noise` loads them once they're there. The SHA-256 of their `model.safetensors` is `1d5d6f41b2e57b4ab05b7bd564013d4dd90ece6ba84b46b59b19e1e7961bdeed`.
 
 ## How It Was Trained
 
@@ -18,7 +18,7 @@ None of the search or calibration visits and none of PRIMER-UDS went into it. St
 
 ## The Confirmation
 
-Both fine-tunes, F without the noise and G with it, were benched against the default on the same 10 UDS visits, each one in bank mode against the other 12 UDS visits, with 5 seeds, AB 22 to 28 and the four original shapes (arcs, points, rings and streaks). None of those visits had been used for anything before. G found 1,475 of the 4,200 planted sources to the default's 1,359, which is 11.6 more a visit (sd 10.5), better on 8 visits and worse on 2. The exact one-sided sign-flip test over the visits gives p = 0.0078 against its share of alpha, 0.0125. F passed too, with 1,463 at p = 0.0078 against 0.025, and the rule takes the higher total of the ones that pass.
+Both fine-tunes, F without the noise and G with it, were benched against the default on the same 10 UDS visits, each one in bank mode against the other 12 UDS visits, with 5 seeds, AB 22 to 28 and the four original shapes (arcs, points, rings and streaks). None of those visits had been used for anything before. G found 1,475 of the 4,200 planted sources to the default's 1,359, which is 11.6 more a visit (sd 10.5), better on 8 visits and worse on 2. The exact one-sided sign-flip test over the visits gives p = 0.0078 against its share of alpha, 0.0125. F passed too, with 1,463 at p = 0.0078 against 0.025, and the rule takes the higher total of the ones that pass. `python -m jwst_peculiar.confirm` runs the test on the benches' folders.
 
 The gain is not even across shapes or magnitudes. These are found in the top 5% over all seeds, with m50 where recall crosses 50%, and in brackets where the 95% Wilson interval's two ends cross it ("none" means it never does).
 

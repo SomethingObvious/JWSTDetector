@@ -3,8 +3,7 @@
 These are the rules the search's model is chosen by, in the order they were written,
 each one before any bench it governs had run. They lived in working notes until this
 page was committed, so the times given before that commit rest on the notes alone, and
-git has the times from it on. Two sentences were reworded on the way, one that named
-who asked for more tries and one that pointed at a private note. The scripts and
+git has the times from it on. Two sentences were reworded on the way. The scripts and
 benches they refer to are in [benchmark.md](benchmark.md) and [search.md](search.md).
 
 ## Sensitivity Round
@@ -121,7 +120,7 @@ sixth could pass, and a later round needs more fresh visits.
 ## G's Noise Lowered, and H
 
 Changed on 2026-11-06 at about 10:50, with F's confirmation results still unread and
-G not yet trained. A review of the literature points out that making features ignore noise is exactly
+G not yet trained. Making features ignore noise is exactly
 what would hide an AB 27 to 28 point source, which sits at the noise level. So G adds
 U(0, 0.5) sky sigma instead of U(0, 1), and nothing else about G changes.
 

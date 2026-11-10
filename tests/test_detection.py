@@ -540,6 +540,20 @@ def test_subset_size() -> None:
     assert subset_size(60, 0.1, minimum=500, maximum=5000) == 30
 
 
+def test_a_checkpoint_exported_again_misses_the_cache(tmp_path: Path) -> None:
+    folder = tmp_path / "step500"
+    folder.mkdir()
+    tile = tmp_path / "tile.png"
+    tile.write_bytes(b"a tile")
+    backbone = _stub_backbone()
+    backbone.name = str(folder)
+    (folder / "model.safetensors").write_bytes(b"first weights")
+    first = FeatureCache(tmp_path / "cache", backbone).path(tile)
+    assert FeatureCache(tmp_path / "cache", backbone).path(tile) == first
+    (folder / "model.safetensors").write_bytes(b"the other weights")
+    assert FeatureCache(tmp_path / "cache", backbone).path(tile) != first
+
+
 def _cached_detector(
     tmp: Path,
 ) -> tuple[Callable[[Path], dict[str, float]], list[int], list[Path]]:

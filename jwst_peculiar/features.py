@@ -10,6 +10,7 @@ reuses every tile it didn't plant a source in.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,31 @@ if TYPE_CHECKING:
 _HALF_MAX = 6e4
 
 
+def _local_weights(model_name: str) -> list[str]:
+    """Hash the weights of a checkpoint folder, as its name doesn't say what's in it.
+
+    A fine-tune exported again to the same folder would otherwise find the features
+    its old weights made. A Hub name gives nothing, so its cached tiles keep their
+    names.
+
+    Returns:
+        One digest per safetensors file in the folder, in name order.
+    """
+    out: list[str] = []
+    for path in sorted(Path(model_name).glob("*.safetensors")):
+        stat = path.stat()
+        out.append(_digest(path, stat.st_size, stat.st_mtime_ns))
+    return out
+
+
+@functools.cache
+def _digest(path: Path, _size: int, _mtime_ns: int) -> str:
+    # A bench opens the cache once a run, and 1.2 GB takes a couple of seconds to
+    # hash, so a file that hasn't changed is hashed once a process.
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "blake2b").hexdigest()
+
+
 class FeatureCache:
     """One .npy of (n_patches, dims) per tile under `root`.
 
@@ -50,6 +76,7 @@ class FeatureCache:
                 backbone.fast_accumulate,
                 tuple(backbone.mean),
                 tuple(backbone.std),
+                *_local_weights(backbone.name),
             )
         ).encode()
 
