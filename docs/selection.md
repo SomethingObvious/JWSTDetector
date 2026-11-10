@@ -138,7 +138,7 @@ the higher total is adopted, and ties go to F, then G, then H.
 
 ## Faster Benches, Same Ranks
 
-From c_o025_t029_dinov3 on, every bench runs on cd62826, which keeps the bank and
+From c_o025_t029_dinov3 on, every bench runs on aedfebc, which keeps the bank and
 the distances of tiles it has already scored between the runs of a bench. Nothing
 about what is scored changes. Benched on o008 with the default model, it gave the
 same rank for all 420 planted sources as the bench the old code made, in 7 to 8
