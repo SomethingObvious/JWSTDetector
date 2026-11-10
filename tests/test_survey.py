@@ -94,6 +94,23 @@ def test_overlap_counts_other_visits_only() -> None:
     assert moved.tolist() == [True]
 
 
+def test_keeping_the_first_copy_drops_only_the_later_visit() -> None:
+    rows = [
+        (150.0, 2.0, "a", "A", 0, 0),
+        (150.0, 2.0 + 5 / 3600, "b", "B", 0, 0),
+        (150.2, 2.0, "b", "B", 0, 640),
+        (150.2, 2.0 + 5 / 3600, "bank", "C", 0, 0),
+    ]
+    every, tiles = _tiles(rows), _tiles(rows[:3])
+    both = overlaps_other_visit(tiles, every, size_arcsec=20.0, size_px=320)
+    assert both.tolist() == [True, True, True]
+    # The bank isn't scored, so sky shared with it still drops b's second tile.
+    first = overlaps_other_visit(
+        tiles, every, size_arcsec=20.0, size_px=320, scored=frozenset({"a", "b"})
+    )
+    assert first.tolist() == [False, True, True]
+
+
 def test_blocks_of_one_mosaic_overlap_only_where_their_boxes_do() -> None:
     # 1 px is 1/16 arcsecond, so 320 px is 20 arcseconds and inside the diagonal.
     every = _tiles([

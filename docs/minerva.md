@@ -56,6 +56,8 @@ It could never have named one tile alone, though. The smallest p any tile can ge
 
 So the survey now checks this first. `python -m jwst_peculiar.survey --check SPLIT STARS DATA` runs the overlap and star rules on the tile list alone, with no scores, exits with 1 if the best possible p couldn't name a tile alone, and says how many tiles would have to reach it together. On this split it gives the same 514 and 3,838 the verdict did. A second search of these four mosaics wouldn't count, though, since every block's scores and the lists above have been looked at. The next one needs sky nobody has scored yet, and a split that passes the check before anything is scored.
 
+Where two mosaics share sky, the overlap rule drops both copies of a tile, and one copy would have been enough to keep an object from being its own twin. A split with `"keep_first_copy": true` drops only the tile of the block whose name sorts later, which depends on the names alone and so treats search and calibration blocks alike. On this split it would have left 4,555 calibration tiles to 519 search tiles, which still couldn't name one tile alone.
+
 The four lowest p's are neighbouring tiles in o003 around 150.083 +2.203. On the vetting list that spot is a faint galaxy at the edge of a tile split by a seam where the background changes, so it's most likely the seam that scored. The top of the vetting list is SL2S J021737-051329, a strong lens already known from CFHT, with its arc clear in all three filters, and most of the rest near the top are the insides of bright nearby galaxies.
 
 ## A Rescore After the Result

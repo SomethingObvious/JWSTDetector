@@ -113,7 +113,12 @@ class Tiles:
 
 
 def overlaps_other_visit(
-    tiles: Tiles, every: Tiles, *, size_arcsec: float, size_px: int
+    tiles: Tiles,
+    every: Tiles,
+    *,
+    size_arcsec: float,
+    size_px: int,
+    scored: frozenset[str] | None = None,
 ) -> npt.NDArray[np.bool_]:
     """True for tiles that may share sky with a tile of another visit.
 
@@ -122,12 +127,21 @@ def overlaps_other_visit(
     mosaic share its grid, so they overlap only if their boxes do, which lets blocks
     of one mosaic sit side by side.
 
+    `scored` names the search and calibration visits of a split that keeps the first
+    copy. Where two of those share sky, only the tile of the visit whose name sorts
+    later goes, as one copy can't be its own twin. That depends on the names alone,
+    so it treats search and calibration visits alike. Sky shared with anything else,
+    the bank or the training tiles, still drops the tile.
+
     Returns:
         One flag per tile in `tiles`.
     """
     reach = size_arcsec * np.sqrt(2) * u.arcsec
     near_idx, self_idx, _, _ = tiles.coords.search_around_sky(every.coords, reach)
     other = every.visit[near_idx] != tiles.visit[self_idx]
+    if scored is not None:
+        later = every.visit[near_idx] > tiles.visit[self_idx]
+        other &= ~(later & np.isin(every.visit[near_idx], sorted(scored)))
     same_mosaic = every.mosaic[near_idx] == tiles.mosaic[self_idx]
     apart = (
         np.abs(every.centre[near_idx] - tiles.centre[self_idx]).max(axis=1) >= size_px
@@ -295,6 +309,7 @@ class _Rules:
     stars: SkyCoords
     star_g: npt.NDArray[np.float64]
     star_g_max: float
+    scored: frozenset[str] | None
 
 
 def _filter_visit(
@@ -303,7 +318,11 @@ def _filter_visit(
     keys = sorted(scores)
     tiles = tiles_of(keys, [visit] * len(keys))
     overlap = overlaps_other_visit(
-        tiles, rules.every, size_arcsec=rules.size_arcsec, size_px=rules.size_px
+        tiles,
+        rules.every,
+        size_arcsec=rules.size_arcsec,
+        size_px=rules.size_px,
+        scored=rules.scored,
     )
     c = tiles.coords
     star = near_bright_star(
@@ -352,6 +371,9 @@ def kept_tiles(
         stars=stars,
         star_g=star_g,
         star_g_max=float(split.get("star_g_max", STAR_G_MAX)),
+        scored=frozenset([*split["search"], *split["calibration"]])
+        if split.get("keep_first_copy")
+        else None,
     )
     kept: dict[str, dict[str, float]] = {}
     dropped = {"overlap": 0, "star": 0}
