@@ -5,7 +5,8 @@
   import Readout from './components/Readout.svelte';
   import { TileFrame } from './lib/frame';
   import type { Renderer } from './lib/gl';
-  import { TileCache, computeLimits, type Limits, type TileData } from './lib/tiles';
+  import { TileCache } from './lib/cache';
+  import { computeLimits, type Limits, type TileData } from './lib/tiles';
   import { VERDICT_VALUE, learnedValue, priority, similar, valueAt } from './lib/learn';
   import {
     VERDICTS,
@@ -99,7 +100,14 @@
   let cursor = $state<{ ix: number; iy: number } | null>(null);
   let lastPos = 0;
 
-  let plate: { fit: () => void; oneToOne: () => void } | undefined = $state();
+  let plate:
+    | {
+        fit: () => void;
+        oneToOne: () => void;
+        zoomBy: (f: number) => void;
+        panBy: (dx: number, dy: number) => void;
+      }
+    | undefined = $state();
   let filterInput: HTMLInputElement | undefined = $state();
   let noteEl: HTMLTextAreaElement | undefined = $state();
   let sheet: HTMLDialogElement | undefined = $state();
@@ -410,7 +418,9 @@
           }
         },
         (err: unknown) => {
-          if (current === i) {
+          // Only a load that was left behind gets stopped, and coming back starts another.
+          const stopped = err instanceof DOMException && err.name === 'AbortError';
+          if (current === i && !stopped) {
             tileError = `Couldn't load tile ${String(i)}. ${err instanceof Error ? err.message : String(err)}`;
           }
         },
@@ -638,6 +648,28 @@
     return true;
   }
 
+  const PAN: Record<string, [number, number]> = {
+    ArrowLeft: [-0.2, 0],
+    ArrowRight: [0.2, 0],
+    ArrowUp: [0, -0.2],
+    ArrowDown: [0, 0.2],
+  };
+
+  // Keys that move the plate. Plain arrows step through the list, so panning takes Shift.
+  function viewKey(e: KeyboardEvent): boolean {
+    const pan = e.shiftKey ? PAN[e.key] : undefined;
+    if (pan) {
+      plate?.panBy(...pan);
+    } else if (e.key === '+' || e.key === '=') {
+      plate?.zoomBy(1.25);
+    } else if (e.key === '-' || e.key === '_') {
+      plate?.zoomBy(0.8);
+    } else {
+      return false;
+    }
+    return true;
+  }
+
   function focusKind(el: HTMLElement): { typing: boolean; widget: boolean } {
     const type = el instanceof HTMLInputElement ? el.type : '';
     // Sliders and checkboxes keep their own arrow keys but let every other key through.
@@ -672,7 +704,7 @@
       return;
     }
     // A held key steps through the list, but it mustn't mark every tile it passes.
-    if (moveKey(e.key) || (!e.repeat && actKey(e.key))) {
+    if (viewKey(e) || moveKey(e.key) || (!e.repeat && actKey(e.key))) {
       e.preventDefault();
     }
   }
@@ -960,6 +992,10 @@
         <dd>Fit the tile</dd>
         <dt><kbd>0</kbd></dt>
         <dd>One image pixel per screen pixel</dd>
+        <dt><kbd>+</kbd> <kbd>-</kbd></dt>
+        <dd>Zoom in or out</dd>
+        <dt><kbd>Shift</kbd> <kbd>Arrows</kbd></dt>
+        <dd>Pan the tile</dd>
         <dt><kbd>o</kbd></dt>
         <dd>Overlay on or off</dd>
         <dt><kbd>c</kbd></dt>
@@ -969,7 +1005,7 @@
       </dl>
       <p class="dim">
         A verdict moves to the next tile unless you turn that off in the Verdict block.
-        Drag the plate to pan, scroll to zoom and double-click to fit.
+        Drag the plate to pan, scroll or pinch to zoom and double-click to fit.
       </p>
     </dialog>
   </div>

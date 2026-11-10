@@ -26,8 +26,8 @@ export interface TileData {
 
 const SAMPLE_MAX = 60000;
 
-async function fetchBytes(url: string): Promise<ArrayBuffer> {
-  const res = await fetch(url);
+async function fetchBytes(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  const res = await fetch(url, { signal: signal ?? null });
   if (!res.ok) {
     throw new Error(`${url} returned ${String(res.status)}`);
   }
@@ -36,8 +36,9 @@ async function fetchBytes(url: string): Promise<ArrayBuffer> {
 
 async function decodePng(
   url: string,
+  signal?: AbortSignal,
 ): Promise<{ width: number; height: number; rgba: Uint8Array }> {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: signal ?? null });
   if (!res.ok) {
     throw new Error(`${url} returned ${String(res.status)}`);
   }
@@ -101,6 +102,7 @@ export async function loadTile(
   base: string,
   bundle: Bundle,
   index: number,
+  signal?: AbortSignal,
 ): Promise<TileData> {
   const t = bundle.tiles[index];
   if (!t) {
@@ -110,10 +112,14 @@ export async function loadTile(
   const mosaic = bundle.mosaics[t.mosaic];
   const wantsColour = (mosaic?.filters.length ?? 1) >= 3;
 
-  const mapsP = fetchBytes(`${base}maps/${id}.f32`).then((b) => new Float32Array(b));
+  const mapsP = fetchBytes(`${base}maps/${id}.f32`, signal).then(
+    (b) => new Float32Array(b),
+  );
+  // It's awaited last, and a load stopped before then would leave its failure unhandled.
+  mapsP.catch(() => undefined);
   const maps1P =
     bundle.run.passes >= 2
-      ? fetchBytes(`${base}maps1/${id}.f32`).then(
+      ? fetchBytes(`${base}maps1/${id}.f32`, signal).then(
           (b) => new Float32Array(b),
           () => null,
         )
@@ -129,7 +135,7 @@ export async function loadTile(
 
   if (t.has_cutout) {
     try {
-      const f = readFits(await fetchBytes(`${base}cutouts/${id}.fits`));
+      const f = readFits(await fetchBytes(`${base}cutouts/${id}.fits`, signal));
       const first = f.planes[0];
       if (!first) {
         throw new Error('The cutout has no image planes');
@@ -147,7 +153,7 @@ export async function loadTile(
     }
   }
   if (!planes) {
-    const p = await decodePng(`${base}tiles/${id}.png`);
+    const p = await decodePng(`${base}tiles/${id}.png`, signal);
     rgba = p.rgba;
     width = p.width;
     height = p.height;
@@ -347,98 +353,4 @@ export function equaliser(d: TileData, limits: Limits): Float32Array {
     }
   });
   return out;
-}
-
-/**
- * Keeps decoded tiles around the current one. A load that is already running is
- * shared, so stepping onto a tile being prefetched just waits for that fetch.
- */
-export class TileCache {
-  private done = new Map<number, TileData>();
-  private running = new Map<number, Promise<TileData>>();
-  private readonly base: string;
-  private readonly bundle: Bundle;
-  private readonly onReady: (d: TileData) => void;
-  private readonly onEvict: (index: number) => void;
-  private readonly capacity: number;
-
-  constructor(
-    base: string,
-    bundle: Bundle,
-    onReady: (d: TileData) => void,
-    onEvict: (index: number) => void,
-    capacity = 14,
-  ) {
-    this.base = base;
-    this.bundle = bundle;
-    this.onReady = onReady;
-    this.onEvict = onEvict;
-    this.capacity = capacity;
-  }
-
-  peek(index: number): TileData | undefined {
-    const d = this.done.get(index);
-    if (d) {
-      // Map keeps insertion order, so re-inserting marks it as recently used.
-      this.done.delete(index);
-      this.done.set(index, d);
-    }
-    return d;
-  }
-
-  get(index: number): Promise<TileData> {
-    const d = this.peek(index);
-    if (d) {
-      return Promise.resolve(d);
-    }
-    let p = this.running.get(index);
-    if (!p) {
-      p = loadTile(this.base, this.bundle, index).then(
-        (data) => {
-          this.running.delete(index);
-          this.done.set(index, data);
-          this.onReady(data);
-          this.trim(index);
-          return data;
-        },
-        (err: unknown) => {
-          this.running.delete(index);
-          throw err;
-        },
-      );
-      this.running.set(index, p);
-    }
-    return p;
-  }
-
-  /** Loads these in order, one after another, so the next tile is never queued behind a far one. */
-  async prefetch(indices: number[], keep: number[]): Promise<void> {
-    this.keep = new Set(keep);
-    for (const i of indices) {
-      if (this.done.has(i)) {
-        continue;
-      }
-      try {
-        // eslint-disable-next-line no-await-in-loop -- one at a time is the point
-        await this.get(i);
-      } catch {
-        // The plate shows the error if this tile is ever opened.
-      }
-    }
-  }
-
-  private keep = new Set<number>();
-
-  private trim(justLoaded: number) {
-    for (const k of this.done.keys()) {
-      if (this.done.size <= this.capacity) {
-        break;
-      }
-      if (k === justLoaded || this.keep.has(k)) {
-        continue;
-      }
-      this.done.delete(k);
-      this.onEvict(k);
-    }
-  }
 }

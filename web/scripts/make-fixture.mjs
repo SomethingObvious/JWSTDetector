@@ -99,7 +99,8 @@ function writePreview(m, img, stretch) {
   const prev = Buffer.alloc(pw * ph * m.channels);
   for (let y = 0; y < ph; y++) {
     for (let x = 0; x < pw; x++) {
-      const i = 2 * y * m.cols + 2 * x;
+      // Top row first, so the preview is the right way up like the tiles.
+      const i = (m.rows - 2 - 2 * y) * m.cols + 2 * x;
       for (let c = 0; c < m.channels; c++) {
         const p = img[c];
         prev[(y * pw + x) * m.channels + c] = stretch(
@@ -129,7 +130,8 @@ function cellStats(m, sky, x0, y0, r, c) {
   let o = 0;
   let empty = 0;
   let count = 0;
-  for (let y = Math.floor(y0 + r * cell); y < y0 + (r + 1) * cell; y++) {
+  // Map row 0 is the top of the tile, which is its highest mosaic row.
+  for (let y = Math.floor(y0 + CROP - (r + 1) * cell); y < y0 + CROP - r * cell; y++) {
     for (let x = Math.floor(x0 + c * cell); x < x0 + (c + 1) * cell; x++) {
       const i = y * m.cols + x;
       o += sky.odd[i];
@@ -211,7 +213,8 @@ function tilePixels(t) {
   for (let v = 0; v < TILE_PX; v++) {
     for (let u = 0; u < TILE_PX; u++) {
       const x = t.x0 + ((u + 0.5) * CROP) / TILE_PX - 0.5;
-      const y = t.y0 + ((v + 0.5) * CROP) / TILE_PX - 0.5;
+      // FITS counts rows from the bottom, so the PNG's top row is the tile's highest.
+      const y = t.y0 + CROP - 1 - (((v + 0.5) * CROP) / TILE_PX - 0.5);
       for (let c = 0; c < m.channels; c++) {
         pix[(v * TILE_PX + u) * m.channels + c] = t.stretch(
           c,
@@ -228,14 +231,12 @@ function writeCutout(t, id, w) {
   const planes = t.img.map((p) => {
     const a = new Float32Array(CROP * CROP);
     for (let y = 0; y < CROP; y++) {
-      a.set(
-        p.subarray((t.y0 + y) * m.cols + t.x0, (t.y0 + y) * m.cols + t.x0 + CROP),
-        y * CROP,
-      );
+      const row = (t.y0 + CROP - 1 - y) * m.cols + t.x0;
+      a.set(p.subarray(row, row + CROP), y * CROP);
     }
     return a;
   });
-  // Once the rows are flipped, cutout FITS pixel `(i, j)` is mosaic pixel `(x0 + i, y0 + CROP - j)`.
+  // `fits` writes the last row first, so cutout FITS pixel `(i, j)` is mosaic pixel `(x0 + i, y0 + j)`.
   const cards = [
     fitsCard('SIMPLE', true),
     fitsCard('BITPIX', -32),
@@ -248,13 +249,13 @@ function writeCutout(t, id, w) {
     fitsCard('CTYPE1', 'RA---TAN'),
     fitsCard('CTYPE2', 'DEC--TAN'),
     fitsCard('CRPIX1', w.CRPIX1 - t.x0),
-    fitsCard('CRPIX2', t.y0 + CROP + 1 - w.CRPIX2),
+    fitsCard('CRPIX2', w.CRPIX2 - t.y0),
     fitsCard('CRVAL1', w.CRVAL1),
     fitsCard('CRVAL2', w.CRVAL2),
     fitsCard('CD1_1', w.CD1_1),
-    fitsCard('CD1_2', -w.CD1_2),
+    fitsCard('CD1_2', w.CD1_2),
     fitsCard('CD2_1', w.CD2_1),
-    fitsCard('CD2_2', -w.CD2_2),
+    fitsCard('CD2_2', w.CD2_2),
     fitsCard('FILTERS', m.filters.join(',')),
     fitsCard('MOSAIC', m.name.slice(0, 68)),
     fitsCard('X0', t.x0, 'crop origin in mosaic px'),

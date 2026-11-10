@@ -9,7 +9,7 @@ license-files = ["LICENSE.md"]
 
 dependencies = [
   "numpy",
-  "torch",
+  "torch>=2.8",  # the first release where torch.mm takes out_dtype
   "transformers>=4.56",  # the first release with DINOv3
   "huggingface_hub",
   "astropy",

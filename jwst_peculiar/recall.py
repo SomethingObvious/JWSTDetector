@@ -292,16 +292,24 @@ def place(
     by_mosaic: dict[str, list[str]] = {}
     for k, m in run.manifest.items():
         by_mosaic.setdefault(m["mosaic"], []).append(k)
-    placed: list[Placed] = []
-    for mosaic, keys in by_mosaic.items():
+    spots: dict[str, Any] = {}
+    for mosaic in by_mosaic:
         meta = json.loads((data_root / "mosaics" / f"{mosaic}.json").read_text("utf-8"))
-        xs, ys = mosaic_wcs(meta).world_to_pixel_values(
-            [float(o["ra"]) for o in objects], [float(o["dec"]) for o in objects]
+        spots[mosaic] = np.column_stack(
+            mosaic_wcs(meta).world_to_pixel_values(
+                [float(o["ra"]) for o in objects], [float(o["dec"]) for o in objects]
+            )
         )
-        for o, x, y in zip(objects, xs, ys, strict=True):
-            p = _place_on(run, o, keys, xy=(x, y))
+    placed: list[Placed] = []
+    for i, o in enumerate(objects):
+        # Mosaics can share sky, and an object in two of them still counts once, on
+        # the first that scores it.
+        for mosaic, keys in by_mosaic.items():
+            x, y = spots[mosaic][i]
+            p = _place_on(run, o, keys, xy=(float(x), float(y)))
             if p is not None:
                 placed.append(p)
+                break
     return placed, run.n_tiles, run.field
 
 

@@ -82,18 +82,37 @@
     rel = 1 / fitZoom;
   }
 
-  onMount(() => {
+  function start() {
     try {
       if (!canvas) {
         throw new Error('The plate has no canvas to draw on');
       }
       renderer = new Renderer(canvas);
+      glError = null;
       onrenderer(renderer);
     } catch (err) {
+      renderer = null;
       glError = err instanceof Error ? err.message : String(err);
       onrenderer(null, glError);
     }
+  }
+
+  onMount(() => {
+    start();
+    // A driver reset or a long sleep takes the context and every texture with it.
+    const lost = (e: Event) => {
+      // Without this the browser never hands the context back.
+      e.preventDefault();
+      renderer = null;
+      glError =
+        "The graphics card dropped this page's drawing. Reload if it doesn't come back.";
+      onrenderer(null, glError);
+    };
+    canvas?.addEventListener('webglcontextlost', lost);
+    canvas?.addEventListener('webglcontextrestored', start);
     return () => {
+      canvas?.removeEventListener('webglcontextlost', lost);
+      canvas?.removeEventListener('webglcontextrestored', start);
       onrenderer(null);
     };
   });
@@ -225,13 +244,35 @@
       : [],
   );
 
-  // Pointer: drag pans, the wheel zooms about the pointer.
+  // Pointer: one drags to pan, two pinch, and the wheel zooms about the pointer.
   let drag: { x: number; y: number; cfx: number; cfy: number } | null = null;
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- nothing on screen reads it
+  const down = new Map<number, [number, number]>();
 
-  function local(e: PointerEvent | WheelEvent): [number, number] {
+  function local(e: { clientX: number; clientY: number }): [number, number] {
     // Only the canvas sends these events, so it is bound by then.
     const r = canvas?.getBoundingClientRect() ?? new DOMRect();
     return [e.clientX - r.left, e.clientY - r.top];
+  }
+
+  /** Zooms by `f`, keeping the image point under viewport point (sx, sy) where it is. */
+  function zoomAbout(sx: number, sy: number, f: number) {
+    const [ix, iy] = toImage(sx, sy);
+    const next = Math.min(64 / fitZoom, Math.max(0.25, rel * f));
+    const z = fitZoom * next;
+    rel = next;
+    cfx = (ix - (sx - cw / 2) / z) / W;
+    cfy = (iy - (sy - ch / 2) / z) / H;
+  }
+
+  export function zoomBy(f: number) {
+    zoomAbout(cw / 2, ch / 2, f);
+  }
+
+  /** Moves the view by a share of the viewport, so (1, 0) shows what was one screen to the right. */
+  export function panBy(dx: number, dy: number) {
+    cfx += (dx * cw) / zoom / W;
+    cfy += (dy * ch) / zoom / H;
   }
 
   function onpointerdown(e: PointerEvent) {
@@ -239,11 +280,38 @@
       return;
     }
     canvas?.setPointerCapture(e.pointerId);
-    drag = { x: e.clientX, y: e.clientY, cfx, cfy };
+    down.set(e.pointerId, [e.clientX, e.clientY]);
+    // A second finger turns the drag into a pinch.
+    drag = down.size === 1 ? { x: e.clientX, y: e.clientY, cfx, cfy } : null;
+  }
+
+  function pinch(e: PointerEvent, was: [number, number]) {
+    const other = [...down].find(([id]) => id !== e.pointerId)?.[1];
+    if (!other) {
+      return;
+    }
+    // The midpoint moves half as far as the finger that moved.
+    cfx -= (e.clientX - was[0]) / 2 / zoom / W;
+    cfy -= (e.clientY - was[1]) / 2 / zoom / H;
+    const before = Math.hypot(was[0] - other[0], was[1] - other[1]);
+    const after = Math.hypot(e.clientX - other[0], e.clientY - other[1]);
+    if (before > 0 && after > 0) {
+      const mid = {
+        clientX: (e.clientX + other[0]) / 2,
+        clientY: (e.clientY + other[1]) / 2,
+      };
+      zoomAbout(...local(mid), after / before);
+    }
   }
 
   function onpointermove(e: PointerEvent) {
-    if (drag) {
+    const was = down.get(e.pointerId);
+    if (was) {
+      down.set(e.pointerId, [e.clientX, e.clientY]);
+    }
+    if (was && down.size === 2) {
+      pinch(e, was);
+    } else if (drag) {
       cfx = drag.cfx - (e.clientX - drag.x) / zoom / W;
       cfy = drag.cfy - (e.clientY - drag.y) / zoom / H;
     }
@@ -255,7 +323,10 @@
   }
 
   function onpointerup(e: PointerEvent) {
-    drag = null;
+    down.delete(e.pointerId);
+    // The finger still down after a pinch carries on as a drag from where it is.
+    const [rest] = down.values();
+    drag = rest && down.size === 1 ? { x: rest[0], y: rest[1], cfx, cfy } : null;
     if (canvas?.hasPointerCapture(e.pointerId)) {
       canvas.releasePointerCapture(e.pointerId);
     }
@@ -263,14 +334,7 @@
 
   function onwheel(e: WheelEvent) {
     e.preventDefault();
-    const [sx, sy] = local(e);
-    const [ix, iy] = toImage(sx, sy);
-    const f = Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0018));
-    const next = Math.min(64 / fitZoom, Math.max(0.25, rel * f));
-    const z = fitZoom * next;
-    rel = next;
-    cfx = (ix - (sx - cw / 2) / z) / W;
-    cfy = (iy - (sy - ch / 2) / z) / H;
+    zoomAbout(...local(e), Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0018)));
   }
 
   const pct = (v: number) => `${String(Math.round(v * 100))}%`;

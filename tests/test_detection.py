@@ -667,3 +667,30 @@ def test_dropping_directions_lets_a_small_difference_count() -> None:
     dropped.drop_directions(1)
     assert plain.distances(odd, 1).item() < 1e-3
     assert dropped.distances(odd, 1).item() > 0.5
+
+
+def test_a_kept_bank_searches_again_for_more_neighbours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The distances a kept bank holds are to the nearest patch, and they can't answer
+    # for the mean of the nearest two.
+    monkeypatch.setattr(detection, "_REUSED", {})
+    with tempfile.TemporaryDirectory() as td:
+        query_dir = Path(td) / "query"
+        names = _write_tiles(query_dir)
+        backbone = _stub_backbone()
+        one, two = (
+            run_anomaly_detection(
+                backbone,
+                [query_dir / n for n in names if n != ANOMALOUS],
+                query_dir,
+                query_paths=sorted(query_dir.glob("*.png")),
+                query_root=query_dir,
+                out_dir=Path(td) / "out",
+                num_workers=0,
+                batch_size=4,
+                k_neighbors=k,
+            )[0]
+            for k in (1, 2)
+        )
+    assert two[ANOMALOUS] > one[ANOMALOUS]

@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFits } from '../src/lib/fits';
 import { Tan, decDms, icrsToGalactic, raHms } from '../src/lib/wcs';
+import { TileCache } from '../src/lib/cache';
 import { computeLimits, sampleOf, type TileData } from '../src/lib/tiles';
 import { TileFrame } from '../src/lib/frame';
-import type { MosaicInfo, TileInfo } from '../src/lib/types';
+import type { Bundle, MosaicInfo, TileInfo } from '../src/lib/types';
 
 function fitsBytes(cards: string[], data: number[]): ArrayBuffer {
   const head = [...cards, 'END'].map((c) => c.padEnd(80, ' ')).join('');
@@ -188,5 +189,49 @@ describe('TileFrame', () => {
 
   it('round-trips mosaic pixels', () => {
     expect(f.fromMosaic(...f.toMosaic(3.25, 7.75))).toEqual([3.25, 7.75]);
+  });
+});
+
+describe('TileCache', () => {
+  it('stops the loads a step leaves behind and keeps the rest', async () => {
+    const asked: [string, AbortSignal][] = [];
+    vi.stubGlobal('fetch', (url: string, init: { signal: AbortSignal }) => {
+      asked.push([url, init.signal]);
+      // Never answers, like a slow server, and fails the way fetch does when stopped.
+      return new Promise((_resolve, reject) => {
+        const stop = () => {
+          reject(new DOMException('stopped', 'AbortError'));
+        };
+        if (init.signal.aborted) {
+          stop();
+        }
+        init.signal.addEventListener('abort', stop);
+      });
+    });
+    const tile = { mosaic: 'm', has_cutout: true };
+    const bundle = {
+      tiles: [tile, tile, tile],
+      mosaics: {},
+      run: { passes: 1 },
+    } as unknown as Bundle;
+    const cache = new TileCache(
+      '',
+      bundle,
+      () => undefined,
+      () => undefined,
+    );
+    const left = cache.get(0);
+    const wanted = cache.get(1);
+    void cache.prefetch([2], [1, 2]);
+    await expect(left).rejects.toThrow('stopped');
+    const stopped = (id: string) =>
+      asked.filter(([url]) => url.includes(id)).map(([, signal]) => signal.aborted);
+    expect(stopped('000000')).not.toContain(false);
+    expect(stopped('000001')).toEqual([false, false]);
+    expect(stopped('000002')).toEqual([false, false]);
+    // Coming back asks again instead of handing over the stopped load.
+    expect(cache.get(0)).not.toBe(left);
+    expect(cache.get(1)).toBe(wanted);
+    vi.unstubAllGlobals();
   });
 });
