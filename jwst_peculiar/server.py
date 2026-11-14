@@ -38,6 +38,9 @@ mimetypes.add_type("text/javascript", ".js")
 class _ViewerHandler(BaseHTTPRequestHandler):
     bundle: ClassVar[RunBundle]
     lock: ClassVar[threading.Lock]
+    # Seconds a request may stall, so a body shorter than its Content-Length can't
+    # hold a thread forever.
+    timeout: ClassVar[float | None] = 10
 
     @override
     def log_message(self, format: str, *args: Any) -> None:
@@ -63,13 +66,17 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         point its own domain here to read the answers. Neither can fake these headers.
 
         Returns:
-            True when the Host or Origin isn't this server.
+            True when the Host or Origin isn't this server, or the browser says the
+            request came from another site.
         """
         port = self.connection.getsockname()[1]
         here = {f"127.0.0.1:{port}", f"localhost:{port}"}
         origin = self.headers.get("Origin")
-        return self.headers.get("Host") not in here or (
-            origin is not None and origin.removeprefix("http://") not in here
+        return (
+            self.headers.get("Host") not in here
+            or (origin is not None and origin.removeprefix("http://") not in here)
+            # A cross-site GET carries no Origin, but a current browser marks it here.
+            or self.headers.get("Sec-Fetch-Site") == "cross-site"
         )
 
     def _read(self, path: str) -> tuple[bytes, str, bool]:
@@ -97,6 +104,15 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             self._error(HTTPStatus.NOT_FOUND, f"There is nothing at {path}")
             return
+        except Exception as exc:
+            # A hand-edited verdicts.csv, for one. The page shows this instead of a
+            # dropped connection.
+            logger.exception("Couldn't read %s", path)
+            self._error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"Couldn't read {path}: {type(exc).__name__}: {exc}",
+            )
+            return
         self._send(HTTPStatus.OK, body, ctype, cache=cache)
 
     def do_POST(self) -> None:
@@ -109,7 +125,8 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             return
         try:
             saved = self._save_posted_verdict()
-        except (ValueError, KeyError, TypeError) as exc:
+        except (TimeoutError, ValueError, KeyError, TypeError) as exc:
+            # A timeout is a body that stopped short of its Content-Length.
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
         except OSError as exc:
@@ -127,12 +144,16 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         if key not in {t.key for t in self.bundle.tiles}:
             msg = f"{key} isn't a tile in this run"
             raise KeyError(msg)
+        star = body.get("star", False)
+        if not isinstance(star, bool):
+            msg = f"star has to be true or false, not {star!r}"
+            raise TypeError(msg)
         with self.lock:
             return save_verdict(
                 self.bundle.run_dir,
                 key,
                 body.get("verdict"),
-                bool(body.get("star")),
+                star,
                 str(body.get("note") or ""),
             )
 

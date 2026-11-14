@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { SvelteSet } from 'svelte/reactivity';
   import { track } from '../lib/track';
   import type { Bundle, Theme, TileInfo } from '../lib/types';
 
@@ -21,7 +22,8 @@
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- a cache, the loaded counter drives redraws
   const images = new Map<string, HTMLImageElement>();
   let loaded = $state(0);
-  let failed = $state<string | null>(null);
+  // By mosaic, so moving to another mosaic doesn't carry the message along.
+  const failed = new SvelteSet<string>();
   let canvas: HTMLCanvasElement | undefined = $state();
   let width = $state(316);
 
@@ -57,7 +59,7 @@
       img = new Image();
       img.decoding = 'async';
       img.onload = () => loaded++;
-      img.onerror = () => (failed = `Couldn't load ${m.preview}.`);
+      img.onerror = () => failed.add(name);
       img.src = base + m.preview;
       images.set(name, img);
     }
@@ -145,7 +147,9 @@
     <span><i class="foot"></i>This tile</span>
     <span><i class="dot"></i>{dots.length} more in the list</span>
   </div>
-  {#if failed}<p class="err">{failed}</p>{/if}
+  {#if mosaic && tile && failed.has(tile.mosaic)}<p class="err">
+      Couldn't load {mosaic.preview}.
+    </p>{/if}
 </div>
 
 <style>

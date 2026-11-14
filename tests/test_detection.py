@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import numpy as np
 from PIL import Image
+import pytest
 import torch
 from typing_extensions import Unpack
 
@@ -31,8 +32,6 @@ from jwst_peculiar.features import EmbedOptions, FeatureCache
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import pytest
 
 PATCH, RESOLUTION, DIM = 16, 128, 32
 GRID = RESOLUTION // PATCH
@@ -522,12 +521,39 @@ def test_parse_layers() -> None:
     assert parse_layers("mid", 24) == [13, 14, 15, 16, 17]
     assert parse_layers("14-16", 24) == [14, 15, 16]
     assert parse_layers("3,5", 24) == [3, 5]
-    for bad in ("0-3", "20-30", "x"):
+    for bad in ("0-3", "20-30", "x", "20,20"):
         try:
             parse_layers(bad, 24)
         except ValueError:
             continue
         raise AssertionError(bad)
+
+
+def test_a_model_that_overflows_fp16_without_bf16_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A GPU without bf16 gets fp16 for it, which would overflow again on every retry.
+    from jwst_peculiar import backbones
+
+    def ident(x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def returning(value: object) -> Callable[..., object]:
+        def stub(*_: object, **__: object) -> object:
+            return value
+
+        return stub
+
+    monkeypatch.setattr(backbones, "_loaded", {})
+    monkeypatch.setattr(backbones, "_precision_dtype", returning(torch.float16))
+    monkeypatch.setattr(
+        backbones, "_load_model", returning((torch.nn.Identity(), False))
+    )
+    monkeypatch.setattr(backbones, "_normalisation", returning(((0.5,) * 3,) * 2))
+    monkeypatch.setattr(backbones, "_patch_reader", returning((ident, PATCH)))
+    monkeypatch.setattr(backbones, "_overflows_fp16", returning(True))
+    with pytest.raises(RuntimeError, match=r"^someone/lvd overflows fp16, and cpu has"):
+        backbones.get_backbone("someone/lvd", "cpu")
 
 
 def test_subset_size() -> None:
@@ -552,6 +578,11 @@ def test_a_checkpoint_exported_again_misses_the_cache(tmp_path: Path) -> None:
     assert FeatureCache(tmp_path / "cache", backbone).path(tile) == first
     (folder / "model.safetensors").write_bytes(b"the other weights")
     assert FeatureCache(tmp_path / "cache", backbone).path(tile) != first
+    (folder / "model.safetensors").unlink()
+    (folder / "pytorch_model.bin").write_bytes(b"first weights")
+    second = FeatureCache(tmp_path / "cache", backbone).path(tile)
+    (folder / "pytorch_model.bin").write_bytes(b"the other weights")
+    assert FeatureCache(tmp_path / "cache", backbone).path(tile) != second
 
 
 def _cached_detector(
@@ -708,3 +739,83 @@ def test_a_kept_bank_searches_again_for_more_neighbours(
             for k in (1, 2)
         )
     assert two[ANOMALOUS] > one[ANOMALOUS]
+
+
+def test_kept_distances_answer_only_for_the_same_exclusions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Footprints that put every tile on the same pixels leave each one nothing to
+    # match, which distances kept from a run without them can't know.
+    monkeypatch.setattr(detection, "_REUSED", {})
+    with tempfile.TemporaryDirectory() as td:
+        query_dir = Path(td) / "query"
+        _write_tiles(query_dir)
+        paths = sorted(query_dir.glob("*.png"))
+        backbone = _stub_backbone()
+        alone, stacked = (
+            run_anomaly_detection(
+                backbone,
+                paths,
+                query_dir,
+                query_paths=paths,
+                query_root=query_dir,
+                out_dir=Path(td) / "out",
+                num_workers=0,
+                batch_size=4,
+                footprints=footprints,
+            )[0]
+            for footprints in (None, dict.fromkeys(paths, Footprint("m", 0, 0, 128)))
+        )
+    assert all(np.isfinite(v) for v in alone.values()), alone
+    assert all(np.isnan(v) for v in stacked.values()), stacked
+
+
+def _prep_folder(root: Path, rows: list[str], mosaic: str | None) -> list[Path]:
+    """Write two query tiles, a manifest of `rows` and, if given, a mosaic record.
+
+    Returns:
+        The two tiles' paths.
+    """
+    (root / "query").mkdir(parents=True)
+    paths = [root / "query" / name for name in ("a.png", "b.png")]
+    for p in paths:
+        p.write_bytes(b"png")
+    (root / "manifest.csv").write_text(
+        "key,mosaic,x0,y0,size,ra,dec,cutout\n" + "".join(f"{r}\n" for r in rows),
+        encoding="utf-8",
+    )
+    if mosaic is not None:
+        (root / "mosaics").mkdir()
+        (root / "mosaics" / "M.json").write_text(mosaic, encoding="utf-8")
+    return paths
+
+
+def test_footprints_put_each_tile_on_the_sky(tmp_path: Path) -> None:
+    from jwst_peculiar.data import load_footprints
+
+    rows = ["a.png,M,0,0,320,150,2,", "b.png,M,160,0,320,,,"]
+    paths = _prep_folder(tmp_path, rows, '{"pixel_scale_arcsec": 0.06}')
+    got = load_footprints(tmp_path, tmp_path / "query", paths)
+    assert got[paths[0]] == Footprint(
+        "M", 0, 0, 320, ra=150.0, dec=2.0, radius_deg=320 * 0.06 / 3600 / 2**0.5
+    )
+    assert np.isnan(got[paths[1]].radius_deg)
+
+
+def test_footprints_refuse_a_tile_the_manifest_lacks(tmp_path: Path) -> None:
+    from jwst_peculiar.data import load_footprints
+
+    paths = _prep_folder(tmp_path, ["a.png,M,0,0,320,,,"], None)
+    with pytest.raises(ValueError, match=r"manifest.csv has no row for b.png, so"):
+        load_footprints(tmp_path, tmp_path / "query", paths)
+
+
+def test_footprints_need_a_pixel_scale_for_a_sky_position(
+    tmp_path: Path,
+) -> None:
+    from jwst_peculiar.data import load_footprints
+
+    rows = ["a.png,M,0,0,320,150,2,", "b.png,M,160,0,320,150,2,"]
+    paths = _prep_folder(tmp_path, rows, '{"shape": [10, 10]}')
+    with pytest.raises(ValueError, match=r"^a.png has a sky position but .* for M,"):
+        load_footprints(tmp_path, tmp_path / "query", paths)

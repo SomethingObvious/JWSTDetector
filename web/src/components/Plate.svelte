@@ -78,8 +78,20 @@
     cfy = 0.5;
   }
 
+  // Zoom stays between a quarter of fit and 64 screen pixels per image pixel.
+  const clampRel = (r: number) => Math.min(64 / fitZoom, Math.max(0.25, r));
+
+  // The view centre stays on the image, so some of it is always in view.
+  function centreAt(fx: number, fy: number) {
+    cfx = Math.min(1, Math.max(0, fx));
+    cfy = Math.min(1, Math.max(0, fy));
+  }
+
   export function oneToOne() {
-    rel = 1 / fitZoom;
+    // A hidden plate has no size to measure 1:1 against.
+    if (cw > 0 && ch > 0 && data) {
+      rel = clampRel(1 / fitZoom);
+    }
   }
 
   function start() {
@@ -177,8 +189,12 @@
       : { l: 0, t: 0, w: cw, h: ch };
   });
   const ticks = $derived(
-    frame && data && cw > 0
-      ? edgeTicks(vis.w, vis.h, (x, y) => frame.toSky(...toImage(vis.l + x, vis.t + y)))
+    frame?.wcs && data && cw > 0
+      ? edgeTicks(
+          vis.w,
+          vis.h,
+          (x, y) => frame.toSky(...toImage(vis.l + x, vis.t + y)) ?? [NaN, NaN],
+        )
       : [],
   );
   const compass = $derived(frame?.compass() ?? null);
@@ -258,11 +274,10 @@
   /** Zooms by `f`, keeping the image point under viewport point (sx, sy) where it is. */
   function zoomAbout(sx: number, sy: number, f: number) {
     const [ix, iy] = toImage(sx, sy);
-    const next = Math.min(64 / fitZoom, Math.max(0.25, rel * f));
+    const next = clampRel(rel * f);
     const z = fitZoom * next;
     rel = next;
-    cfx = (ix - (sx - cw / 2) / z) / W;
-    cfy = (iy - (sy - ch / 2) / z) / H;
+    centreAt((ix - (sx - cw / 2) / z) / W, (iy - (sy - ch / 2) / z) / H);
   }
 
   export function zoomBy(f: number) {
@@ -271,8 +286,7 @@
 
   /** Moves the view by a share of the viewport, so (1, 0) shows what was one screen to the right. */
   export function panBy(dx: number, dy: number) {
-    cfx += (dx * cw) / zoom / W;
-    cfy += (dy * ch) / zoom / H;
+    centreAt(cfx + (dx * cw) / zoom / W, cfy + (dy * ch) / zoom / H);
   }
 
   function onpointerdown(e: PointerEvent) {
@@ -291,8 +305,10 @@
       return;
     }
     // The midpoint moves half as far as the finger that moved.
-    cfx -= (e.clientX - was[0]) / 2 / zoom / W;
-    cfy -= (e.clientY - was[1]) / 2 / zoom / H;
+    centreAt(
+      cfx - (e.clientX - was[0]) / 2 / zoom / W,
+      cfy - (e.clientY - was[1]) / 2 / zoom / H,
+    );
     const before = Math.hypot(was[0] - other[0], was[1] - other[1]);
     const after = Math.hypot(e.clientX - other[0], e.clientY - other[1]);
     if (before > 0 && after > 0) {
@@ -312,8 +328,10 @@
     if (was && down.size === 2) {
       pinch(e, was);
     } else if (drag) {
-      cfx = drag.cfx - (e.clientX - drag.x) / zoom / W;
-      cfy = drag.cfy - (e.clientY - drag.y) / zoom / H;
+      centreAt(
+        drag.cfx - (e.clientX - drag.x) / zoom / W,
+        drag.cfy - (e.clientY - drag.y) / zoom / H,
+      );
     }
     if (!data) {
       return;
@@ -631,6 +649,10 @@
   @media (max-width: 820px) {
     .toolbar {
       gap: 6px;
+    }
+    /* On a phone every control flows in one wrap, so a group's last row isn't left half empty. */
+    .group {
+      display: contents;
     }
   }
   .seg .ctl + .ctl {

@@ -203,6 +203,10 @@ def load_footprints(
 
     Returns:
         The footprints by tile path, or {} when the dataset has no manifest.
+
+    Raises:
+        ValueError: If the manifest has no row for one of the tiles, or a tile with a
+            sky position comes from a mosaic with no pixel scale on record.
     """
     from jwst_peculiar.detection import Footprint  # noqa: PLC0415 detection imports this module
 
@@ -217,17 +221,30 @@ def load_footprints(
     scales: dict[str, float] = {}
     out: dict[Path, Footprint] = {}
     for p in paths:
-        meta = manifest.get(relative_key(p, query_dir))
+        key = relative_key(p, query_dir)
+        meta = manifest.get(key)
         if meta is None:
-            continue
+            # A tile with no footprint would score every patch and exclude nothing.
+            msg = (
+                f"{Path(data_root) / 'manifest.csv'} has no row for {key}, so its "
+                "tiles and the ones under the query folder don't match."
+            )
+            raise ValueError(msg)
         mosaic = meta["mosaic"]
         if mosaic not in scales:
             scales[mosaic] = _pixel_scale_arcsec(data_root, mosaic)
         ra: float | None = meta["ra"]
         dec: float | None = meta["dec"]
         nan = float("nan")
-        if ra is None or dec is None or not np.isfinite(scales[mosaic]):
+        if ra is None or dec is None:
             ra, dec, radius = nan, nan, nan
+        elif not np.isfinite(scales[mosaic]):
+            msg = (
+                f"{key} has a sky position but {Path(data_root) / 'mosaics'} has no "
+                f"pixel_scale_arcsec for {mosaic}, which other mosaics' tiles need to "
+                "be kept from it."
+            )
+            raise ValueError(msg)
         else:
             radius = meta["size"] * scales[mosaic] / 3600 / np.sqrt(2)
         out[p] = Footprint(

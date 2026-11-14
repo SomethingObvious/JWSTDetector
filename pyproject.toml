@@ -166,6 +166,10 @@ paths = ["jwst_peculiar", "tests"]
 [tool.bandit]
 skips = ["B101"]
 
+[tool.typos.default]
+# Short commit hashes the docs cite.
+extend-ignore-re = ["\\b[0-9a-f]{7}\\b"]
+
 [tool.typos.default.extend-words]
 # The FITS weight extension and its file suffix, a row index, the NASA/IPAC
 # Extragalactic Database, Canadian spelling, parts of PNGs and 255ths, and the

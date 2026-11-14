@@ -3,7 +3,9 @@
 These are the rules the search's model is chosen by, in the order they were written,
 each one before any bench it governs had run. They lived in working notes until this
 page was committed, so the times given before that commit rest on the notes alone, and
-git has the times from it on. Two sentences were reworded on the way. The scripts and
+git has the times from it on. Two sentences were reworded on the way, and on 2026-11-10,
+after both searches, the rule for G's noise lost the words "A review of the literature
+points out that" from its start. None of that changes a rule. The scripts and
 benches they refer to are in [benchmark.md](benchmark.md) and [search.md](search.md).
 
 ## Sensitivity Round
@@ -29,6 +31,10 @@ baseline in total and on at least 4 of the 5 seeds, and then also finds more in 
 on jw01837-o024_t028, which no bench has used. Among the winners the one with the
 higher o008 total is adopted, and a tie goes to the simpler one (B, then A, then C).
 With no winner the search stays as it is.
+
+None won. On o008 the baseline found 148, B 145, A 105 and C 107, and none of them
+beat it on any of the 5 seeds. Raw pixels drag A and C down because in bank mode each
+visit's own noise is unlike the bank's, which swamps a kNN on pixels.
 
 ## The Fine-Tune
 
@@ -135,9 +141,13 @@ the default's 431, H stops and spends no alpha. Otherwise it is benched on the s
 10 fresh visits and passes the same way at 0.00625. Among the candidates that pass,
 the higher total is adopted, and ties go to F, then G, then H.
 
+H found 374 on o008, o024 and o031 against the default's 431, so it stopped there and
+spent no alpha. F and G both passed, and G was adopted with the higher total
+([model.md](model.md) has the numbers).
+
 ## Faster Benches, Same Ranks
 
-From c_o025_t029_dinov3 on, every bench runs on aedfebc, which keeps the bank and
+From c_o025_t029_dinov3 on, every bench runs on 79d000d, which keeps the bank and
 the distances of tiles it has already scored between the runs of a bench. Nothing
 about what is scored changes. Benched on o008 with the default model, it gave the
 same rank for all 420 planted sources as the bench the old code made, in 7 to 8
@@ -210,7 +220,9 @@ part of it too. And nothing here is a real, labelled class of rare object.
 
 ## After the COSMOS-Web Search
 
-Written 2026-11-07, before any of the runs below. MINERVA's search has its own plan in
+Written 2026-11-07, before any of the runs below, and committed in 1227732 at 01:09 on
+2026-11-08. S had started training the evening before, but every bench that judged S, M
+or the AEGIS confirmation ran after that commit, the first at 03:13. MINERVA's search has its own plan in
 [minerva.md](minerva.md), and the AEGIS confirmation here picks the model it uses.
 
 ## S, G With Stretch Jitter

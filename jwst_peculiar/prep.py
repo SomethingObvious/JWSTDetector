@@ -396,7 +396,8 @@ def make_output_name(
     parts = [tile_id, f"cx{round(cx):06d}", f"cy{round(cy):06d}"]
     if wcs_ra_dec is not None:
         ra, dec = wcs_ra_dec
-        parts += [f"ra{_safe_float_tag(ra)}", f"dec{_safe_float_tag(dec)}"]
+        # A WCS can give an RA just below 0, and survey keys only sign the Dec.
+        parts += [f"ra{_safe_float_tag(ra % 360)}", f"dec{_safe_float_tag(dec)}"]
     parts.append(f"i{global_idx:08d}")
     return "_".join(parts) + ".png"
 

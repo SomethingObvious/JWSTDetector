@@ -28,7 +28,8 @@ from astropy.coordinates import SkyCoord
 import numpy as np
 import yaml
 
-from jwst_peculiar.data import owned_patches, read_manifest
+from jwst_peculiar.bundle import map_path
+from jwst_peculiar.data import final_pass_dir, owned_patches, read_manifest
 from jwst_peculiar.detection import Footprint
 from jwst_peculiar.scoring import aggregate_score
 from jwst_peculiar.significance import bh_q, conformal_p
@@ -46,6 +47,12 @@ STAR_G_MAX = 16.0
 STAR_RADIUS_AT_19 = 1.5
 # The star list has to reach this far past every tile, which covers a G = 5 star.
 STAR_MARGIN_DEG = 0.3
+
+_USAGE = (
+    "usage: python -m jwst_peculiar.survey [--middle] SPLIT_JSON STARS_JSON "
+    "DATA_ROOT RESULTS_DIR\n"
+    "       python -m jwst_peculiar.survey --check SPLIT_JSON STARS_JSON DATA_ROOT\n"
+)
 
 REHEARSAL_DRAWS = 1000
 # The rehearsal fails, and the search names nothing, if more than this share of
@@ -96,8 +103,8 @@ def check_owned(run_dir: Path) -> None:
     text = (run_dir / "args.yaml").read_text(encoding="utf-8")
     if not re.search(r"^score_region: (owned|middle)$", text, re.MULTILINE):
         msg = (
-            f"{run_dir} wasn't scored with --score_region owned, so its overlapping "
-            "tiles share sky and can't all count."
+            f"{run_dir} wasn't scored with --score_region owned or middle, so its "
+            "overlapping tiles share sky and can't all count."
         )
         raise ValueError(msg)
 
@@ -130,8 +137,9 @@ def overlaps_other_visit(
     `scored` names the search and calibration visits of a split that keeps the first
     copy. Where two of those share sky, only the tile of the visit whose name sorts
     later goes, as one copy can't be its own twin. That depends on the names alone,
-    so it treats search and calibration visits alike. Sky shared with anything else,
-    the bank or the training tiles, still drops the tile.
+    so it treats search and calibration visits alike, which is only fair when the
+    names don't track the split. MINERVA's shuffled blocks don't. Sky shared with
+    anything else, the bank or the training tiles, still drops the tile.
 
     Returns:
         One flag per tile in `tiles`.
@@ -218,7 +226,7 @@ def middle_scores(run_dir: Path, data_dir: Path) -> dict[str, float]:
         The score of every tile the run scored.
     """
     args = yaml.safe_load((run_dir / "args.yaml").read_text(encoding="utf-8"))
-    maps = run_dir / "cross" / "anomaly_maps" / f"seed={args.get('seed', 0)}"
+    maps = final_pass_dir(run_dir) / "anomaly_maps" / f"seed={args.get('seed', 0)}"
     scored = _read_scores(run_dir / "measurements_final.csv")
     footprints = {
         k: Footprint(m["mosaic"], m["x0"], m["y0"], m["size"])
@@ -227,13 +235,17 @@ def middle_scores(run_dir: Path, data_dir: Path) -> dict[str, float]:
     out: dict[str, float] = {}
     mine: dict[str, npt.NDArray[np.bool_]] = {}
     for key in scored:
-        dists = np.load(maps / f"{Path(key).stem}.npy")
+        dists = np.load(map_path(maps, key))
         if not mine:
             mine = owned_patches(
                 footprints, (dists.shape[0], dists.shape[1]), middle=True
             )
+        keep = mine[key]
+        if args.get("masking"):
+            # The maps hold a masked-out patch as 0, which the live scorer leaves out.
+            keep = keep & (dists != 0)
         out[key] = aggregate_score(
-            dists[mine[key]],
+            dists[keep],
             mode=args.get("score_mode", "top1p"),
             top_frac=args.get("score_top_frac", 0.01),
             quantile=args.get("score_quantile", 0.9995),
@@ -287,7 +299,9 @@ def tiles_of(keys: list[str], visits: list[str]) -> Tiles:
     )
 
 
-def _every_tile(data: Path, visits: list[str], training: list[Path]) -> Tiles:
+def _every_tile(
+    data: Path, visits: list[str], training: list[Path], *, tile_px: int
+) -> Tiles:
     # A training tile counts as another visit to every tile, so a tile on sky the
     # model was trained on is dropped like one seen twice.
     keys: list[str] = []
@@ -296,9 +310,40 @@ def _every_tile(data: Path, visits: list[str], training: list[Path]) -> Tiles:
     for root, name in roots:
         with (root / "manifest.csv").open(encoding="utf-8", newline="") as f:
             for r in csv.DictReader(f):
+                if int(r["size"]) != tile_px:
+                    msg = (
+                        f"{root / 'manifest.csv'} has {r['key']} at {r['size']} px "
+                        f"across, and the overlap rule needs every tile at the "
+                        f"split's tile_px of {tile_px}."
+                    )
+                    raise ValueError(msg)
                 keys.append(r["key"])
                 names.append(name)
     return tiles_of(keys, names)
+
+
+# Mosaics of one survey can differ in pixel scale by rounding in their WCS.
+_SCALE_TOLERANCE = 1e-3
+
+
+def _pixel_scale(roots: list[Path]) -> float:
+    # The largest, so the overlap reach errs wide.
+    scales = {
+        p: float(json.loads(p.read_text(encoding="utf-8"))["pixel_scale_arcsec"])
+        for r in roots
+        for p in sorted((r / "mosaics").glob("*.json"))
+    }
+    if not scales:
+        msg = f"There are no mosaics/*.json under {roots[0]} or the other visits."
+        raise ValueError(msg)
+    lo, hi = min(scales, key=scales.__getitem__), max(scales, key=scales.__getitem__)
+    if scales[hi] > scales[lo] * (1 + _SCALE_TOLERANCE):
+        msg = (
+            f"{lo} is {scales[lo]} arcsec a pixel and {hi} is {scales[hi]}, and the "
+            "overlap rule takes one scale for every tile."
+        )
+        raise ValueError(msg)
+    return scales[hi]
 
 
 @dataclass(frozen=True)
@@ -342,6 +387,28 @@ def _manifest_keys(root: Path) -> dict[str, float]:
         return {r["key"]: 0.0 for r in csv.DictReader(f)}
 
 
+def _run_scores(run_dir: Path, data_dir: Path, *, middle: bool) -> dict[str, float]:
+    """Read a visit's tile scores, scored again on their middle with `middle`.
+
+    Returns:
+        The score of every tile the run scored.
+
+    Raises:
+        ValueError: If the run scored every patch, or a tile scored NaN.
+    """
+    check_owned(run_dir)
+    scores = (
+        middle_scores(run_dir, data_dir)
+        if middle
+        else _read_scores(run_dir / "measurements_final.csv")
+    )
+    unscored = next((k for k, s in scores.items() if math.isnan(s)), None)
+    if unscored is not None:
+        msg = f"{run_dir.name}'s tile {unscored} scored NaN, so it can't be ranked."
+        raise ValueError(msg)
+    return scores
+
+
 def kept_tiles(
     split: dict[str, Any],
     *,
@@ -359,14 +426,14 @@ def kept_tiles(
         The kept scores per visit, and how many tiles each rule dropped.
     """
     every_visit = [*split["search"], *split["bank"], *split["calibration"]]
-    mosaic = next((data / every_visit[0] / "mosaics").glob("*.json"))
-    scale = float(json.loads(mosaic.read_text(encoding="utf-8"))["pixel_scale_arcsec"])
     training = [Path(t) for t in split.get("training_data", [])]
-    every = _every_tile(data, every_visit, training)
+    scale = _pixel_scale([data / v for v in every_visit] + training)
+    tile_px = int(split["tile_px"])
+    every = _every_tile(data, every_visit, training, tile_px=tile_px)
     stars, star_g = read_stars(stars_json, every.coords)
     rules = _Rules(
-        size_arcsec=int(split["tile_px"]) * scale,
-        size_px=int(split["tile_px"]),
+        size_arcsec=tile_px * scale,
+        size_px=tile_px,
         every=every,
         stars=stars,
         star_g=star_g,
@@ -381,12 +448,7 @@ def kept_tiles(
         if results is None:
             scores = _manifest_keys(data / v)
         else:
-            check_owned(results / v)
-            scores = (
-                middle_scores(results / v, data / v)
-                if middle
-                else _read_scores(results / v / "measurements_final.csv")
-            )
+            scores = _run_scores(results / v, data / v, middle=middle)
         kept[v], counts = _filter_visit(v, scores, rules)
         for rule, n in counts.items():
             dropped[rule] += n
@@ -507,6 +569,44 @@ def _write_pvalues(
             w.writerow([keys[i], f"{scores[i]:.6g}", f"{p[i]:.6g}", f"{q[i]:.6g}"])
 
 
+def _usage(argv: list[str]) -> int | None:
+    """Print the usage for --help or arguments that fit no form, as argparse does.
+
+    Returns:
+        The exit code, or None when the arguments fit a form.
+    """
+    if argv[:1] in (["-h"], ["--help"]):
+        sys.stdout.write(_USAGE)
+        return 0
+    flag = argv[0] if argv and argv[0].startswith("-") else ""
+    want = 3 if flag == "--check" else 4
+    if flag not in ("", "--check", "--middle") or len(argv) - bool(flag) != want:
+        sys.stderr.write(f"{_USAGE}survey: error: expected {want} paths, got {argv}\n")
+        return 2
+    return None
+
+
+def _rehearsable_split(path: Path) -> dict[str, Any]:
+    """Read a split, checking up front that the rehearsal can run on it.
+
+    Returns:
+        The split.
+
+    Raises:
+        ValueError: If there aren't more calibration visits than search visits.
+    """
+    split: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    n_search, n_cal = len(split["search"]), len(split["calibration"])
+    if n_cal <= n_search:
+        msg = (
+            f"The rehearsal draws {n_search} calibration visits to stand in for the "
+            f"search and needs one left over, so it takes more than {n_search} "
+            f"calibration visits, not {n_cal}."
+        )
+        raise ValueError(msg)
+    return split
+
+
 def _check(argv: list[str]) -> int:
     split = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
     kept, _ = kept_tiles(
@@ -525,16 +625,21 @@ def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/s
 
     Returns:
         0, also when nothing is found. With --check, 1 if no tile could be named
-        alone.
+        alone. 2 when the arguments don't fit any of the forms, as argparse gives.
 
     Raises:
-        ValueError: If no search tile is left once the rules have run.
+        ValueError: If there are too few calibration visits to rehearse, or no search
+            tile is left once the rules have run.
     """
+    usage = _usage(argv)
+    if usage is not None:
+        return usage
     if argv[0] == "--check":
         return _check(argv[1:])
     middle = argv[0] == "--middle"
     argv = argv[middle:]
-    split = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
+    split = _rehearsable_split(Path(argv[0]))
+    n_search = len(split["search"])
     results = Path(argv[3])
     alpha = float(split["alpha"])
     kept, dropped = kept_tiles(
@@ -558,7 +663,7 @@ def main(argv: list[str]) -> int:  # noqa: PLR0914 one pass, in the order docs/s
 
     found = rehearse(
         {v: np.array(list(kept[v].values())) for v in split["calibration"]},
-        len(split["search"]),
+        n_search,
         alpha,
         draws=REHEARSAL_DRAWS,
     )

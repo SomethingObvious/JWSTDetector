@@ -523,15 +523,17 @@ def read_verdicts(run_dir: Path) -> dict[str, dict[str, Any]]:
     """Read the verdicts saved beside a run.
 
     Returns:
-        Each judged tile's verdict, star, note and when it was saved, or {} without a
-        verdicts.csv.
+        Each judged tile's verdict, star, note and when it was saved, along with any
+        columns of your own, or {} without a verdicts.csv.
     """
     path = Path(run_dir) / "verdicts.csv"
     if not path.is_file():
         return {}
-    with path.open(newline="", encoding="utf-8") as f:
+    # A spreadsheet saving CSV as UTF-8 puts a byte order mark before the header.
+    with path.open(newline="", encoding="utf-8-sig") as f:
         return {
             row["key"]: {
+                **{k: v for k, v in row.items() if k not in _VERDICT_FIELDS and k},
                 "verdict": row["verdict"] or None,
                 "star": row["star"] == "1",
                 "note": row["note"],
@@ -565,14 +567,24 @@ def save_verdict(  # noqa: PLR0917 the server passes all five positionally
     run_dir = Path(run_dir)
     rows = read_verdicts(run_dir)
     updated = datetime.now(UTC).isoformat(timespec="seconds")
-    if verdict is None and not star and not note:
+    mine = {k: v for k, v in rows.get(key, {}).items() if k not in _VERDICT_FIELDS}
+    if verdict is None and not star and not note and not any(mine.values()):
         rows.pop(key, None)
     else:
-        rows[key] = {"verdict": verdict, "star": star, "note": note, "updated": updated}
+        rows[key] = {
+            **mine,
+            "verdict": verdict,
+            "star": star,
+            "note": note,
+            "updated": updated,
+        }
+    extra = dict.fromkeys(
+        k for r in rows.values() for k in r if k not in _VERDICT_FIELDS
+    )
 
     tmp = run_dir / "verdicts.csv.tmp"
     with tmp.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=_VERDICT_FIELDS)
+        w = csv.DictWriter(f, fieldnames=[*_VERDICT_FIELDS, *extra])
         w.writeheader()
         for k in sorted(rows):
             r = rows[k]
@@ -600,9 +612,22 @@ def export(
 
     Returns:
         How many files were written.
+
+    Raises:
+        SystemExit: If out_dir holds anything but an earlier export.
     """
     out_dir = Path(out_dir)
     run_out = out_dir / "run"
+    if (
+        out_dir.is_dir()
+        and any(out_dir.iterdir())
+        and not (run_out / "index.json").is_file()
+    ):
+        msg = (
+            f"{out_dir} isn't empty and isn't an earlier export, so nothing was "
+            "written. Pick a new folder."
+        )
+        raise SystemExit(msg)
     if run_out.exists():
         shutil.rmtree(run_out)
     if app_dir is not None:
@@ -674,7 +699,10 @@ def add_site_meta(bundle: RunBundle, out_dir: Path, site_url: str) -> None:
 
     page = (out_dir / "index.html").read_text(encoding="utf-8")
     page = re.sub(
-        r"<title>.*?</title>", f"<title>{html.escape(title)}</title>", page, count=1
+        r"<title>.*?</title>",
+        lambda _: f"<title>{html.escape(title)}</title>",
+        page,
+        count=1,
     )
     for attr, value in (
         ('name="description"', desc),
@@ -699,7 +727,8 @@ def add_site_meta(bundle: RunBundle, out_dir: Path, site_url: str) -> None:
     (out_dir / "sitemap.xml").write_text(
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-        f"  <url><loc>{url}</loc><lastmod>{run['created'][:10]}</lastmod></url>\n"
+        f"  <url><loc>{html.escape(url)}</loc>"
+        f"<lastmod>{run['created'][:10]}</lastmod></url>\n"
         "</urlset>\n",
         encoding="utf-8",
     )

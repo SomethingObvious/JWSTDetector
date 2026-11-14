@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { readFits } from '../src/lib/fits';
 import { Tan, decDms, icrsToGalactic, raHms } from '../src/lib/wcs';
 import { TileCache } from '../src/lib/cache';
-import { computeLimits, sampleOf, type TileData } from '../src/lib/tiles';
+import { computeLimits, loadTile, sampleOf, type TileData } from '../src/lib/tiles';
 import { TileFrame } from '../src/lib/frame';
 import type { Bundle, MosaicInfo, TileInfo } from '../src/lib/types';
 
@@ -232,6 +232,64 @@ describe('TileCache', () => {
     // Coming back asks again instead of handing over the stopped load.
     expect(cache.get(0)).not.toBe(left);
     expect(cache.get(1)).toBe(wanted);
+    vi.unstubAllGlobals();
+  });
+});
+
+describe('a tile whose map fails', () => {
+  const cutout = fitsBytes(
+    [
+      card('SIMPLE', 'T'),
+      card('BITPIX', '-32'),
+      card('NAXIS', '2'),
+      card('NAXIS1', '2'),
+      card('NAXIS2', '1'),
+    ],
+    [1, 2],
+  );
+  const bundle = {
+    tiles: [{ mosaic: 'm', has_cutout: true }],
+    mosaics: {},
+    run: { passes: 2 },
+  } as unknown as Bundle;
+
+  function serve(status: Record<string, number>) {
+    const asked: string[] = [];
+    vi.stubGlobal('fetch', (url: string) => {
+      asked.push(url);
+      const dir = url.split('/')[0] ?? '';
+      const body = dir === 'cutouts' ? cutout : new Float32Array([0.5]).buffer;
+      return Promise.resolve(new Response(body, { status: status[dir] ?? 200 }));
+    });
+    return asked;
+  }
+
+  it('shows the cutout without an overlay if the map is missing', async () => {
+    serve({ maps: 404 });
+    const d = await loadTile('', bundle, 0);
+    expect(d.source).toBe('cutout');
+    expect(d.map2).toBeNull();
+    expect(Array.from(d.map1 ?? [])).toEqual([0.5]);
+    expect(d.mapError).toBe(
+      "Couldn't load the patch map (maps/000000.f32 returned 404), so there is no overlay. Step away and back to try again.",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it('asks again for a pass 1 map that failed', async () => {
+    const asked = serve({ maps1: 500 });
+    const cache = new TileCache(
+      '',
+      bundle,
+      () => undefined,
+      () => undefined,
+    );
+    const d = await cache.get(0);
+    expect(d.map1).toBeNull();
+    expect(Array.from(d.map2 ?? [])).toEqual([0.5]);
+    expect(cache.peek(0)).toBeUndefined();
+    await cache.get(0);
+    expect(asked.filter((u) => u.startsWith('maps1/'))).toHaveLength(2);
     vi.unstubAllGlobals();
   });
 });

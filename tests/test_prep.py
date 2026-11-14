@@ -318,6 +318,14 @@ def test_make_output_name() -> None:
     assert with_wcs == "A5_cx000010_cy000020_ra150.100000_decm2.300000_i00000001.png"
 
 
+def test_tile_names_wrap_ra_into_the_range_survey_keys_take() -> None:
+    from jwst_peculiar.survey import parse_key
+
+    name = make_output_name("A5", 10, 20, global_idx=1, wcs_ra_dec=(-1.5, -2.25))
+    assert name == "A5_cx000010_cy000020_ra358.500000_decm2.250000_i00000001.png"
+    assert parse_key(name) == (10, 20, 358.5, -2.25)
+
+
 def test_sci_to_wht_path() -> None:
     assert MiriSensor.sci_to_wht_path("/data/a5_sci.fits") == "/data/a5_wht.fits"
     assert MiriSensor.sci_to_wht_path("/data/A5_SCI.FITS") == "/data/A5_wht.fits"

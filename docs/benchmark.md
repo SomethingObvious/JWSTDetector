@@ -55,7 +55,7 @@ Every detector ranks a lensed image above the sky at the same radius more often 
 
 ## Backbones
 
-The same kNN run on each DINOv3 checkpoint, with the planted sources under a Gaussian PSF.
+The same kNN run on each DINOv3 checkpoint, with the planted sources under a Gaussian PSF. The three other rows come from the bench code of 2026-11-04, and the default's row matches a rerun on 2026-11-09.
 
 | Backbone | Arc, half found at AB | Ring, half found at AB | Lensed images, same-radius percentile |
 |---|---|---|---|
@@ -81,7 +81,7 @@ The satellite weights beat the web-photo ones at both sizes, and the 7B model is
 ```
 jwst-peculiar bench --data_root datasets/smacs_nircam --out_dir bench --mags 22 23 24 25 26 27 28 --seeds 5 \
   --detectors knn subspace pixels iforest
-jwst-peculiar recall results_smacs datasets/smacs_nircam --objects lensed.csv --centre 110.8270 -73.4541
+jwst-peculiar recall results_smacs_knn datasets/smacs_nircam --objects lensed.csv --centre 110.8270 -73.4541
 ```
 
 The bench writes `injections.csv` with every planted source's rank, and its null rank among the tiles nothing was planted in, where 1 means it beat every ordinary tile, `summary.csv` with recall and its interval per detector, kind and magnitude and how many beat every ordinary tile, and `completeness.png`. The 140 runs here took 42 minutes on a laptop RTX 4070, as each embeds only the tiles that changed. STPSF comes with `pip install -e .[webb]` and needs its data files, which its documentation explains how to fetch.

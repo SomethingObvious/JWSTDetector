@@ -126,4 +126,9 @@ export function cssGradient(id: Cmap, reverse = false): string {
   return `linear-gradient(90deg, ${stops.join(', ')})`;
 }
 
-export const cmapRow = (id: Cmap) => CMAPS.findIndex((c) => c.id === id);
+// The shader reads row -1 as past the table, so a name it doesn't know gets grey.
+export const cmapRow = (id: Cmap) =>
+  Math.max(
+    0,
+    CMAPS.findIndex((c) => c.id === id),
+  );

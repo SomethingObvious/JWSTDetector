@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 # float16 tops out at 65504, and a feature past that is stored as float32 instead.
 _HALF_MAX = 6e4
+# What a torch model's from_pretrained reads weights from, sharded or whole.
+_WEIGHT_SUFFIXES = (".safetensors", ".bin")
 
 
 def _local_weights(model_name: str) -> list[str]:
@@ -40,10 +42,12 @@ def _local_weights(model_name: str) -> list[str]:
     names.
 
     Returns:
-        One digest per safetensors file in the folder, in name order.
+        One digest per weight file from_pretrained can load, in name order.
     """
     out: list[str] = []
-    for path in sorted(Path(model_name).glob("*.safetensors")):
+    for path in sorted(Path(model_name).glob("*")):
+        if path.suffix not in _WEIGHT_SUFFIXES:
+            continue
         stat = path.stat()
         out.append(_digest(path, stat.st_size, stat.st_mtime_ns))
     return out

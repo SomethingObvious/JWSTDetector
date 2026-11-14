@@ -6,7 +6,22 @@ export type SaveState =
   | { kind: 'saving'; pending: number }
   | { kind: 'saved'; at: string }
   | { kind: 'retrying'; pending: number; inSeconds: number; error: string }
+  | { kind: 'rejected'; key: string; error: string }
   | { kind: 'local'; count: number };
+
+/** What the server said went wrong, from its JSON error or its plain text. */
+async function reason(res: Response): Promise<string> {
+  const text = await res.text().catch(() => '');
+  try {
+    const { error } = JSON.parse(text) as { error?: unknown };
+    if (typeof error === 'string') {
+      return error;
+    }
+  } catch {
+    // Not JSON, so the text is the reason.
+  }
+  return text.trim().slice(0, 200) || `the server answered ${String(res.status)}`;
+}
 
 interface Pending {
   key: string;
@@ -163,6 +178,8 @@ export class Verdicts {
   private readonly known: Set<string>;
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- only read on unload, never by the UI
   private queue = new Map<string, Pending>();
+  // Saves another run of the same name left under the same key, kept so they survive.
+  private foreign: Pending[] = [];
   private flushing = false;
   private backoff = 1;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -197,7 +214,8 @@ export class Verdicts {
     }
     if (this.writable) {
       const pending = (readJson(this.pendingKey) as Pending[] | null) ?? [];
-      for (const p of pending) {
+      this.foreign = pending.filter((p) => !this.known.has(p.key));
+      for (const p of pending.filter((x) => this.known.has(x.key))) {
         this.map.set(p.key, {
           verdict: p.verdict,
           star: p.star,
@@ -241,10 +259,11 @@ export class Verdicts {
     return this.map.get(key);
   }
 
+  /** Verdicts on this run's tiles. Another run of the same name can share the store. */
   reviewedCount(): number {
     let n = 0;
-    for (const v of this.map.values()) {
-      if (v.verdict) {
+    for (const [k, v] of this.map) {
+      if (v.verdict && this.known.has(k)) {
         n++;
       }
     }
@@ -280,8 +299,9 @@ export class Verdicts {
       this.persistPending();
       void this.flush();
     } else {
+      // Another tab's save may not have reached this one as an event yet.
+      this.mergeLocal();
       this.storageOk = writeJson(this.localKey, Object.fromEntries(this.map));
-      this.state = { kind: 'local', count: this.reviewedCount() };
     }
   }
 
@@ -290,7 +310,10 @@ export class Verdicts {
   }
 
   private persistPending() {
-    this.storageOk = writeJson(this.pendingKey, [...this.queue.values()]);
+    this.storageOk = writeJson(this.pendingKey, [
+      ...this.foreign,
+      ...this.queue.values(),
+    ]);
   }
 
   private async flush(): Promise<void> {
@@ -304,20 +327,26 @@ export class Verdicts {
     if (this.tick) {
       clearInterval(this.tick);
     }
+    let rejected: { key: string; error: string } | null = null;
     try {
       let next = this.queue.entries().next();
       while (!next.done) {
         const [key, item] = next.value;
         this.state = { kind: 'saving', pending: this.queue.size };
         // eslint-disable-next-line no-await-in-loop -- saves go one at a time, in order
-        const saved = await this.send(item);
+        const answer = await this.send(item);
+        if (answer.refused !== undefined) {
+          rejected = { key, error: answer.refused };
+        }
         // Only drop it if nothing newer for this key arrived while the request was out.
         if (this.queue.get(key) === item) {
           this.queue.delete(key);
         }
         this.persistPending();
         this.backoff = 1;
-        this.state = { kind: 'saved', at: saved ?? now() };
+        this.state = rejected
+          ? { kind: 'rejected', ...rejected }
+          : { kind: 'saved', at: answer.saved ?? now() };
         next = this.queue.entries().next();
       }
     } catch (err) {
@@ -351,17 +380,22 @@ export class Verdicts {
     }
   }
 
-  private async send(item: Pending): Promise<string | undefined> {
+  /** Throws for a failure worth retrying, and returns the reason for one that isn't. */
+  private async send(item: Pending): Promise<{ saved?: string; refused?: string }> {
     const res = await fetch(`${this.base}api/verdict`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(item),
     });
     if (!res.ok) {
-      throw new Error(`the server answered ${String(res.status)}`);
+      const why = await reason(res);
+      // Any other 4xx means the server will never take it, and retrying it would hold up every save behind it.
+      if (res.status >= 500 || res.status === 408 || res.status === 429) {
+        throw new Error(why);
+      }
+      return { refused: why };
     }
-    const body = (await res.json().catch(() => ({}))) as { saved?: string };
-    return body.saved;
+    return (await res.json().catch(() => ({}))) as { saved?: string };
   }
 
   retryNow() {
@@ -376,14 +410,18 @@ export class Verdicts {
     const rows = ['key,rank,mosaic,ra,dec,score,verdict,star,note,updated'];
     for (const [key, v] of this.map) {
       const t = byKey.get(key);
+      // Another run of the same name can share the store, and its tiles aren't this run's.
+      if (!t) {
+        continue;
+      }
       rows.push(
         [
           key,
-          t?.rank ?? '',
-          t?.mosaic ?? '',
-          t?.ra ?? '',
-          t?.dec ?? '',
-          t?.score ?? '',
+          t.rank,
+          t.mosaic,
+          t.ra,
+          t.dec,
+          t.score ?? '',
           v.verdict ?? '',
           v.star ? 'true' : 'false',
           v.note,

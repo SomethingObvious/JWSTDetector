@@ -548,8 +548,8 @@ def _reference_fields(args: argparse.Namespace) -> list[_Field]:
         The fields, in the order given.
 
     Raises:
-        SystemExit: If there are fewer than two to calibrate, or one has no query
-            folder.
+        SystemExit: If there are fewer than two to calibrate, one has no query
+            folder, or two share a folder name.
     """
     if args.calibrate and len(args.reference_roots) < _MIN_REFERENCE_FIELDS:
         msg = (
@@ -559,6 +559,14 @@ def _reference_fields(args: argparse.Namespace) -> list[_Field]:
         raise SystemExit(msg)
     fields: list[_Field] = []
     for r in args.reference_roots:
+        # A field is known by its folder's name, in calibration/ and in the filter
+        # that keeps it out of its own reference.
+        if any(f.name == Path(r).resolve().name for f in fields):
+            msg = (
+                f"Two --reference_roots are named {Path(r).resolve().name}, and each "
+                f"field needs a folder name of its own. {r} is the second."
+            )
+            raise SystemExit(msg)
         qdir = Path(r).resolve() / args.query_subdir
         if not qdir.is_dir():
             msg = f"There is no query folder at {qdir}"

@@ -430,13 +430,15 @@ def measure_mosaic(raw: Path, mosaic: str) -> list[Found]:
 def _near_star(coords: SkyCoords, stars_json: Path) -> npt.NDArray[np.bool_]:
     stars, g = read_stars(stars_json, coords)
     bright = g < STAR_G_MAX
+    out = np.zeros(len(coords), dtype=bool)
+    if not bright.any():
+        return out
     # The survey adds a tile's half-diagonal to the halo, but a source is a point.
     # With the tile's reach the rule throws away 16% of o003.
     reach = STAR_RADIUS_AT_19 * 10 ** (0.2 * (19 - g[bright]))
     idx_star, idx_src, sep, _ = coords.search_around_sky(
         stars[bright], float(np.max(reach)) * u.arcsec
     )
-    out = np.zeros(len(coords), dtype=bool)
     out[idx_src[sep.arcsec < reach[idx_star]]] = True
     return out
 
@@ -501,10 +503,11 @@ def build(found: list[Found], stars_json: Path) -> Catalogue:  # noqa: PLR0914 t
     sky_err = np.where(lone(flux, sky_err), np.inf, sky_err)
     err = np.sqrt(sky_err**2 + (FLOOR * flux) ** 2)
     lib = np.nonzero(np.all(flux / sky_err >= LIBRARY_SN, axis=1))[0]
-    if len(lib) < NEIGHBOUR:
+    # A library source leaves itself out, so it needs NEIGHBOUR others.
+    if len(lib) < NEIGHBOUR + 1:
         msg = (
             f"Only {len(lib)} sources reach {LIBRARY_SN} sigma in every band, and "
-            f"the score needs a library of at least {NEIGHBOUR}."
+            f"the score needs a library of at least {NEIGHBOUR + 1}."
         )
         raise SystemExit(msg)
     # astropy gives the library's index first, then the source's.

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import codecs
+import csv
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import socket
 import threading
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, unquote
 
 from astropy.table import Table
 import numpy as np
@@ -240,6 +244,36 @@ def test_only_the_catalogues_asked_for_are_used(
     assert cached["catalogues"]["NED"]["rows"] == good["rows"]
 
 
+def test_a_catalogue_of_another_field_is_not_counted_as_checked(
+    run: tuple[Path, Path], tmp_path: Path
+) -> None:
+    run_dir, data = run
+    cat = tmp_path / "elsewhere.csv"
+    Table({"ID": ["x", "y"], "RA": [150.1, 150.2], "DEC": [2.2, 2.3]}).write(cat)
+    result = catalogues.crossmatch(run_dir, data, services=[], local=[cat])
+    assert result["checked"] == []
+    assert result["failed"] == {"elsewhere": "none of its 2 sources fall on m"}
+    assert result["tiles"] == {}
+
+
+def test_a_new_radius_or_cone_fetches_again(
+    run: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, data = run
+    cones: list[float] = []
+
+    def fetch(_cat: str, _centres: object, cone_arcmin: float) -> dict[str, Any]:
+        cones.append(cone_arcmin)
+        return {"ok": True, "server": "a", "rows": [["NED x", 10.0, -5.0, "G", ""]]}
+
+    monkeypatch.setattr(catalogues, "fetch", fetch)
+    catalogues.crossmatch(run_dir, data, services=["NED"])
+    catalogues.crossmatch(run_dir, data, services=["NED"])
+    catalogues.crossmatch(run_dir, data, services=["NED"], cone_arcmin=2.0)
+    catalogues.crossmatch(run_dir, data, services=["NED"], cone_arcmin=2.0, radius=3)
+    assert cones == [3.0, 2.0, 2.0]
+
+
 def test_social_card_keeps_off_a_blank_gap() -> None:
     lit = np.r_[np.full(10, 0.4), np.zeros(5), np.full(30, 0.4)]
     lo, hi = bundle.lit_span(lit, 20, 20)
@@ -252,7 +286,10 @@ def test_social_card_keeps_off_a_blank_gap() -> None:
 @pytest.fixture
 def port(run: tuple[Path, Path]) -> Iterator[int]:
     served = bundle.RunBundle(*run, writable=True)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(served))
+    handler = make_handler(served)
+    # Short, so a request that stalls fails the test quickly.
+    handler.timeout = 1
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield server.server_port
     server.shutdown()
@@ -264,7 +301,7 @@ def _ask(
     method: str,
     path: str,
     *,
-    body: dict[str, str] | None = None,
+    body: dict[str, Any] | None = None,
     **headers: str,
 ) -> tuple[int, bytes]:
     conn = HTTPConnection("127.0.0.1", port, timeout=10)
@@ -301,16 +338,168 @@ def test_another_site_gets_nothing(port: int, run: tuple[Path, Path]) -> None:
     assert status == 403
 
 
-def test_paths_stay_inside_the_run(port: int, run: tuple[Path, Path]) -> None:
-    Image.new("RGB", (2, 2)).save(run[1].parent / "outside.png")
+def _raw(port: int, request: bytes) -> int:
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall(request)
+        return int(s.recv(1024).split()[1])
+
+
+def test_paths_stay_inside_the_viewer_and_the_run(port: int) -> None:
+    # Each of these lands on server.py, a real file one folder above the viewer's.
+    here = Path(server.__file__).resolve()
+    assert (server.APP_DIR / ".." / "server.py").resolve() == here
     assert _ask(port, "GET", "/run/mosaics/m.png")[0] == 200
     for path in (
-        "/run/mosaics/..%5C..%5Coutside.png",
-        "/run/mosaics/../../outside.png",
-        "/..%5C..%5Coutside.png",
+        "/../server.py",
+        "/%2e%2e/server.py",
+        "/%2E%2E%2Fserver.py",
+        "/..%5Cserver.py",
+        "/assets/../../server.py",
+        "/" + quote(str(here)),
+        "/run/../server.py",
         "/run/mosaics/a%00.png",
     ):
-        assert _ask(port, "GET", path)[0] == 404
+        assert _ask(port, "GET", path) == (
+            404,
+            json.dumps({
+                "error": f"There is nothing at {unquote(path).lstrip('/')}"
+            }).encode(),
+        ), path
+
+
+def test_a_request_without_this_host_or_origin_gets_nothing(port: int) -> None:
+    assert _raw(port, b"GET /run/index.json HTTP/1.0\r\n\r\n") == 403
+    status, _ = _ask(port, "GET", "/run/index.json", Origin="null")
+    assert status == 403
+    # A link or image on another site carries no Origin on a GET.
+    for site, status in (("cross-site", 403), ("same-origin", 200)):
+        request = f"GET /run/index.json HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n"
+        request += f"Sec-Fetch-Site: {site}\r\n\r\n"
+        assert _raw(port, request.encode()) == status
+
+
+def test_a_body_short_of_its_length_is_refused(port: int) -> None:
+    body = b'{"key": "c.png"}'
+    head = f"POST /run/api/verdict HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n"
+    head += f"Content-Length: {len(body) + 10}\r\n\r\n"
+    assert _raw(port, head.encode() + body) == 400
+
+
+def test_a_star_has_to_be_a_boolean(port: int, run: tuple[Path, Path]) -> None:
+    verdict = {"key": "c.png", "verdict": None, "star": "false"}
+    status, body = _ask(port, "POST", "/run/api/verdict", body=verdict)
+    assert (status, json.loads(body)) == (
+        400,
+        {"error": "star has to be true or false, not 'false'"},
+    )
+    assert bundle.read_verdicts(run[0]) == {}
+
+
+def test_verdicts_saved_by_a_spreadsheet_still_load(
+    port: int, run: tuple[Path, Path]
+) -> None:
+    # Excel's "CSV UTF-8" starts the file with a byte order mark, and a column of
+    # your own has to survive the next save.
+    (run[0] / "verdicts.csv").write_bytes(
+        codecs.BOM_UTF8
+        + b"key,verdict,star,note,updated,mine\r\n"
+        + b"a.png,artifact,1,x,2026-01-01,keep me\r\n"
+    )
+    status, body = _ask(port, "GET", "/run/verdicts.json")
+    assert status == 200
+    assert json.loads(body) == {
+        "a.png": {
+            "mine": "keep me",
+            "verdict": "artifact",
+            "star": True,
+            "note": "x",
+            "updated": "2026-01-01",
+        }
+    }
+    verdict = {"key": "c.png", "verdict": "known", "star": False, "note": ""}
+    assert _ask(port, "POST", "/run/api/verdict", body=verdict)[0] == 200
+    bundle.save_verdict(run[0], "a.png", None, False, "")
+    with (run[0] / "verdicts.csv").open(encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == ["key", "verdict", "star", "note", "updated", "mine"]
+    assert rows[1][:4] == ["a.png", "", "0", ""]
+    assert rows[1][5] == "keep me"
+    assert rows[2][:4] == ["c.png", "known", "0", ""]
+    assert rows[2][5] == ""
+
+
+def test_a_broken_verdicts_file_is_answered_with_an_error(
+    port: int, run: tuple[Path, Path]
+) -> None:
+    (run[0] / "verdicts.csv").write_text(
+        "tile,verdict\na.png,known\n", encoding="utf-8"
+    )
+    status, body = _ask(port, "GET", "/run/verdicts.json")
+    assert (status, json.loads(body)) == (
+        500,
+        {"error": "Couldn't read run/verdicts.json: KeyError: 'key'"},
+    )
+
+
+def test_export_leaves_a_folder_of_other_files_alone(
+    run: tuple[Path, Path], tmp_path: Path
+) -> None:
+    b = bundle.RunBundle(*run, writable=False)
+    mine = tmp_path / "mine"
+    (mine / "run").mkdir(parents=True)
+    (mine / "run" / "notes.txt").write_text("mine", encoding="utf-8")
+    with pytest.raises(SystemExit, match="isn't empty and isn't an earlier export"):
+        bundle.export(b, mine)
+    assert (mine / "run" / "notes.txt").read_text(encoding="utf-8") == "mine"
+    # An earlier export is replaced, as is an empty folder.
+    site = tmp_path / "site"
+    site.mkdir()
+    first = bundle.export(b, site)
+    assert bundle.export(b, site) == first
+
+
+def test_site_meta_takes_any_run_name_and_url(
+    run: tuple[Path, Path], tmp_path: Path
+) -> None:
+    b = bundle.RunBundle(*run, writable=False)
+    b.index["run"]["name"] = "COSMOS\\d field"
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "index.html").write_text(
+        "<html><head><title>x</title>\n  </head></html>", encoding="utf-8"
+    )
+    bundle.add_site_meta(b, site, "https://example.org/a?x=1&y=2")
+    page = (site / "index.html").read_text(encoding="utf-8")
+    assert "<title>COSMOS\\d field · jwst-peculiar</title>" in page
+    sitemap = (site / "sitemap.xml").read_text(encoding="utf-8")
+    assert "<loc>https://example.org/a?x=1&amp;y=2/</loc>" in sitemap
+
+
+def test_a_tile_no_catalogue_checked_is_neither_matched_nor_uncatalogued(
+    run: tuple[Path, Path], tmp_path: Path
+) -> None:
+    xmatch = {
+        "radius_arcsec": 1.5,
+        "checked": ["mine"],
+        "failed": {},
+        "tiles": {
+            "c.png": {"nearest": {}, "uncatalogued": True},
+            "a.png": {"nearest": {}, "uncatalogued": False},
+        },
+    }
+    (run[0] / "crossmatch.json").write_text(json.dumps(xmatch), encoding="utf-8")
+    b = bundle.RunBundle(*run, writable=False)
+    table = candidates.candidate_table(b)
+    assert list(table["tile"]) == ["c.png", "a.png", "b.png"]
+    assert table["uncatalogued"].tolist() == [1, 0, None]
+    reg = tmp_path / "c.reg"
+    candidates.write_regions(table, reg)
+    lines = reg.read_text(encoding="utf-8").splitlines()[2:]
+    assert [line.split("color=")[1].split()[0] for line in lines] == [
+        "cyan",
+        "orange",
+        "white",
+    ]
 
 
 def test_renaming_a_run_keeps_its_saved_verdicts(

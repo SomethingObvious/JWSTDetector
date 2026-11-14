@@ -9,7 +9,8 @@ import type { MosaicInfo, TileInfo } from './types';
 export class TileFrame {
   readonly tile: TileInfo;
   readonly mosaic: MosaicInfo;
-  readonly wcs: Tan;
+  /** Null for a mosaic without a WCS the viewer reads, which leaves it no sky positions. */
+  readonly wcs: Tan | null;
   readonly width: number;
   readonly height: number;
   readonly scaleX: number;
@@ -17,7 +18,7 @@ export class TileFrame {
   constructor(
     tile: TileInfo,
     mosaic: MosaicInfo,
-    wcs: Tan,
+    wcs: Tan | null,
     width: number,
     height: number,
   ) {
@@ -45,14 +46,14 @@ export class TileFrame {
     ];
   }
 
-  toSky(ix: number, iy: number): [number, number] {
+  toSky(ix: number, iy: number): [number, number] | null {
     const [x, y] = this.toMosaic(ix, iy);
-    return this.wcs.pix2world(x + 1, y + 1);
+    return this.wcs?.pix2world(x + 1, y + 1) ?? null;
   }
 
-  fromSky(ra: number, dec: number): [number, number] {
-    const [p1, p2] = this.wcs.world2pix(ra, dec);
-    return this.fromMosaic(p1 - 1, p2 - 1);
+  fromSky(ra: number, dec: number): [number, number] | null {
+    const p = this.wcs?.world2pix(ra, dec);
+    return p ? this.fromMosaic(p[0] - 1, p[1] - 1) : null;
   }
 
   get arcsecPerPx(): number {
@@ -60,12 +61,17 @@ export class TileFrame {
   }
 
   /** Unit vectors on screen toward north and east at the image centre. */
-  compass(): { n: [number, number]; e: [number, number] } {
-    const [ra, dec] = this.toSky(this.width / 2, this.height / 2);
-    const [x0, y0] = this.fromSky(ra, dec);
+  compass(): { n: [number, number]; e: [number, number] } | null {
+    const c = this.toSky(this.width / 2, this.height / 2);
+    if (!c) {
+      return null;
+    }
+    const [ra, dec] = c;
     const d = 5 / 3600;
-    const [xn, yn] = this.fromSky(ra, dec + d);
-    const [xe, ye] = this.fromSky(ra + d / Math.cos((dec * Math.PI) / 180), dec);
+    const at = (r: number, de: number) => this.fromSky(r, de) ?? [NaN, NaN];
+    const [x0, y0] = at(ra, dec);
+    const [xn, yn] = at(ra, dec + d);
+    const [xe, ye] = at(ra + d / Math.cos((dec * Math.PI) / 180), dec);
     const unit = (x: number, y: number): [number, number] => {
       const l = Math.hypot(x, y) || 1;
       return [x / l, y / l];

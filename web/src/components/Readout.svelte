@@ -95,8 +95,7 @@
     const px = Math.floor(probe.ix);
     const py = Math.floor(probe.iy);
     const [mx, my] = frame.toMosaic(px + 0.5, py + 0.5);
-    const [ra, dec] = frame.toSky(px + 0.5, py + 0.5);
-    const [l, b] = icrsToGalactic(ra, dec);
+    const sky = frame.toSky(px + 0.5, py + 0.5);
     const i = py * data.width + px;
     let values: number[];
     // A pixel past the edge reads as NaN, which shows as no data.
@@ -112,17 +111,14 @@
     const pr = Math.min(rows - 1, Math.floor((probe.iy / data.height) * rows));
     const pc = Math.min(cols - 1, Math.floor((probe.ix / data.width) * cols));
     const patch = pr * cols + pc;
-    const dist = data.map2[patch] ?? NaN;
+    const dist = data.map2?.[patch] ?? NaN;
     const dist1 = data.map1 ? (data.map1[patch] ?? NaN) : null;
     return {
       px,
       py,
       mx,
       my,
-      ra,
-      dec,
-      l,
-      b,
+      sky: sky ? { ra: sky[0], dec: sky[1], gal: icrsToGalactic(...sky) } : null,
       values,
       pr,
       pc,
@@ -427,22 +423,27 @@
         <dd class="num">{read.px}, {read.py}</dd>
         <dt>Mosaic px</dt>
         <dd class="num">{read.mx.toFixed(1)}, {read.my.toFixed(1)}</dd>
-        <dt>RA</dt>
-        <dd class="num">
-          <b>{raHms(read.ra, 3)}</b><span class="sub">{read.ra.toFixed(6)}&deg;</span>
-        </dd>
-        <dt>Dec</dt>
-        <dd class="num">
-          <b>{decDms(read.dec, 2)}</b><span class="sub">{signed(read.dec, 6)}&deg;</span
-          >
-        </dd>
-        <dt>Galactic</dt>
-        <dd class="num">
-          l {read.l.toFixed(5)}&deg; <span class="gap"></span> b {signed(
-            read.b,
-            5,
-          )}&deg;
-        </dd>
+        {#if read.sky}
+          {@const { ra, dec, gal } = read.sky}
+          <dt>RA</dt>
+          <dd class="num">
+            <b>{raHms(ra, 3)}</b><span class="sub">{ra.toFixed(6)}&deg;</span>
+          </dd>
+          <dt>Dec</dt>
+          <dd class="num">
+            <b>{decDms(dec, 2)}</b><span class="sub">{signed(dec, 6)}&deg;</span>
+          </dd>
+          <dt>Galactic</dt>
+          <dd class="num">
+            l {gal[0].toFixed(5)}&deg; <span class="gap"></span> b {signed(
+              gal[1],
+              5,
+            )}&deg;
+          </dd>
+        {:else}
+          <dt>Sky</dt>
+          <dd class="dim">This mosaic has no WCS the viewer reads.</dd>
+        {/if}
         <dt>Value</dt>
         <dd class="num values">
           {#each read.values as v, k (k)}
@@ -452,17 +453,19 @@
         </dd>
         <dt>Patch</dt>
         <dd class="num">
-          r{read.pr} c{read.pc} <span class="gap"></span> <b>{read.dist.toFixed(4)}</b>
+          r{read.pr} c{read.pc} <span class="gap"></span>
+          <b>{Number.isNaN(read.dist) ? 'no map' : read.dist.toFixed(4)}</b>
           {#if read.dist1 !== null}<span class="sub"
               >pass 1 {read.dist1.toFixed(4)}</span
             >{/if}
         </dd>
-        <dt>Percentile</dt>
-        <dd class="num">
-          <span class="pbar"><i style:width="{read.pct}%"></i></span>{read.pct.toFixed(
-            1,
-          )} within tile
-        </dd>
+        {#if !Number.isNaN(read.dist)}
+          <dt>Percentile</dt>
+          <dd class="num">
+            <span class="pbar"><i style:width="{read.pct}%"></i></span
+            >{read.pct.toFixed(1)} within tile
+          </dd>
+        {/if}
         {#if near}
           <dt>Source</dt>
           <dd>
@@ -581,6 +584,7 @@
           {#if data.fallback}<span class="warn"
               >The cutout failed ({data.fallback}), so this is the PNG.</span
             >{/if}
+          {#if data.mapError}<span class="warn">{data.mapError}</span>{/if}
         {:else}
           <span class="dim">Loading</span>
         {/if}

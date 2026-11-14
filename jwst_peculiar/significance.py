@@ -4,9 +4,12 @@ A tile's p-value is the share of calibration tiles that score at least as high, 
 the usual plus one on top and bottom (Bates et al. 2023). It is valid when the
 calibration tiles are exchangeable with the ordinary tiles being tested, which is
 why `jwst-peculiar run --reference_roots` scores each control field against the other
-control fields only. The target is scored against all of them, and while the kNN
-bank holds every patch, that bigger reference only lowers its scores. Real anomalies
-among the calibration tiles only raise theirs, so both push p-values up.
+control fields only. The target is scored against all of them. That bigger reference
+can only lower a kNN score while the bank holds every patch and nothing is fitted to
+it, but past --max_bank_patches the bank is a random sample, and --drop_directions
+and the subspace detector fit to the bank, so then the target's scores can move
+either way. Real anomalies among the calibration tiles only raise theirs, which
+pushes p-values up.
 """
 
 from __future__ import annotations

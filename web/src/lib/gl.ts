@@ -1,5 +1,5 @@
 import { lutTexels, cmapRow } from './colormaps';
-import type { Display } from './types';
+import type { Display, MapSource } from './types';
 import type { Limits, TileData } from './tiles';
 
 const VERT = `#version 300 es
@@ -105,7 +105,7 @@ void main() {
 
 interface Uploaded {
   img: WebGLTexture;
-  maps: { pass2: WebGLTexture; pass1: WebGLTexture | null; diff: WebGLTexture | null };
+  maps: Record<MapSource, WebGLTexture | null>;
 }
 
 export interface DrawState {
@@ -286,13 +286,13 @@ export class Renderer {
       );
     }
     const [rows, cols] = grid;
-    const map1 = d.map1;
-    const diff = map1 ? d.map2.map((v, i) => v - (map1[i] ?? NaN)) : null;
+    const { map1, map2 } = d;
+    const diff = map1 && map2 ? map2.map((v, i) => v - (map1[i] ?? NaN)) : null;
     this.textures.set(d.index, {
       img,
       maps: {
-        pass2: this.mapTexture(d.map2, cols, rows),
-        pass1: d.map1 ? this.mapTexture(d.map1, cols, rows) : null,
+        pass2: map2 ? this.mapTexture(map2, cols, rows) : null,
+        pass1: map1 ? this.mapTexture(map1, cols, rows) : null,
         diff: diff ? this.mapTexture(diff, cols, rows) : null,
       },
     });
@@ -335,7 +335,8 @@ export class Renderer {
       return;
     }
     const d = s.display;
-    const mapTex = u.maps[d.source] ?? u.maps.pass2;
+    // A map that failed to load draws no overlay rather than another pass's.
+    const mapTex = u.maps[d.source];
     // WebGL treats a missing location as null and skips the call.
     const loc = (name: string) => this.loc[name] ?? null;
 
@@ -347,7 +348,8 @@ export class Renderer {
     bind(0, u.img, 'u_img');
     bind(1, this.lut, 'u_lut');
     bind(2, this.eq, 'u_eq');
-    bind(3, mapTex, 'u_map');
+    // The sampler still needs a texture when there is no map to read.
+    bind(3, mapTex ?? u.img, 'u_map');
 
     gl.uniform2f(loc('u_size'), s.tile.width, s.tile.height);
     gl.uniform2f(loc('u_canvas'), w, h);
@@ -371,7 +373,7 @@ export class Renderer {
     gl.uniform1i(loc('u_invert'), d.invert ? 1 : 0);
     gl.uniform3f(loc('u_nan'), ...s.nan);
     let overlay = 0;
-    if (d.overlay) {
+    if (d.overlay && mapTex) {
       overlay = d.contours ? 2 : 1;
     }
     gl.uniform1i(loc('u_overlay'), overlay);

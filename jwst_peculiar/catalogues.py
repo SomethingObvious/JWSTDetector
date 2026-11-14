@@ -25,8 +25,11 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
+import astropy.units as u
 import numpy as np
 import pyvo
+import requests
+from typing_extensions import override
 
 from jwst_peculiar.bundle import RunBundle, mosaic_wcs
 
@@ -85,6 +88,19 @@ DEC_NAMES = (
     "de",
 )
 ID_NAMES = ("id", "name", "source_id", "number", "objid", "object")
+# Seconds a service may go quiet before the next mirror is tried.
+TIMEOUT_S = 60
+
+
+class _PatientSession(requests.Session):
+    """A session that gives up on a stalled server, which pyvo's own never does."""
+
+    @override
+    def request(
+        self, method: str, url: Any, *args: Any, **kwargs: Any
+    ) -> requests.Response:
+        kwargs.setdefault("timeout", TIMEOUT_S)
+        return super().request(method, url, *args, **kwargs)
 
 
 def _note(cat: str, value: TableCell) -> str:
@@ -133,7 +149,7 @@ def _query(
     spec = SERVICES[cat]
     name_col, type_col, note_col = spec["columns"]
     rows: dict[str, list[Any]] = {}
-    service = pyvo.dal.TAPService(url)
+    service = pyvo.dal.TAPService(url, session=_PatientSession())
     for ra, dec in centres:
         cone = CONE.format(ra=ra, dec=dec, r=radius_arcmin / 60)
         result = service.run_sync(spec["adql"].format(cone=cone), maxrec=2_000_000)
@@ -176,8 +192,25 @@ def fetch(
     return {"ok": False, "error": " | ".join(errors), "rows": []}
 
 
+def _degrees(path: Path, column: Any) -> npt.NDArray[np.float64]:  # noqa: ANN401 an astropy column
+    unit = column.unit
+    # A column without a unit, or with one astropy can't read, is taken as degrees.
+    if unit is None or isinstance(unit, u.UnrecognizedUnit):
+        scale = 1.0
+    else:
+        try:
+            scale = float(unit.to(u.deg))
+        except u.UnitConversionError:
+            msg = f"{path} gives {column.name} in {unit}, which isn't an angle."
+            raise SystemExit(msg) from None
+    values = np.ma.filled(np.ma.asarray(column, dtype=np.float64), np.nan)
+    return np.asarray(values * scale, dtype=np.float64)
+
+
 def read_local(path: Path) -> dict[str, Any]:
-    """Read any catalogue astropy can, with RA and Dec in degrees under the usual names.
+    """Read any catalogue astropy can, with RA and Dec under the usual names.
+
+    RA and Dec are converted from their units, or taken as degrees without one.
 
     Returns:
         The catalogue's rows, in the same form `fetch` returns them.
@@ -196,10 +229,17 @@ def read_local(path: Path) -> dict[str, Any]:
         )
         raise SystemExit(msg)
     ident = next((lower[n] for n in ID_NAMES if n in lower), None)
+    ra_deg, dec_deg = _degrees(path, table[ra]), _degrees(path, table[dec])
     rows: list[list[Any]] = []
     for i, row in enumerate(table):
         name = _text(row[ident]) if ident else str(i + 1)
-        rows.append([f"{path.stem} {name}", float(row[ra]), float(row[dec]), "", ""])
+        rows.append([
+            f"{path.stem} {name}",
+            float(ra_deg[i]),
+            float(dec_deg[i]),
+            "",
+            "",
+        ])
     return {"ok": True, "server": str(path), "rows": rows}
 
 
@@ -281,12 +321,25 @@ def _update_cache(
     cache: Path, meta: dict[str, Any], *, mosaic_id: str, plan: _Plan
 ) -> dict[str, Any]:
     record = json.loads(cache.read_text("utf-8")) if cache.is_file() else {}
-    cats: dict[str, Any] = record.get("catalogues", {})
+    geometry = {"cone_arcmin": plan.cone_arcmin, "pad_arcsec": plan.radius}
+    # Sources fetched over other cones, or padded for a smaller --radius, can stop
+    # short of a tile's match radius at the mosaic's edge.
+    same = record.get("geometry") == geometry
+    cats: dict[str, Any] = record.get("catalogues", {}) if same else {}
     centres = cone_centres(meta, plan.cone_arcmin, pad_arcsec=plan.radius)
     _fetch_services(cats, record, centres, mosaic_id=mosaic_id, plan=plan)
     for path in plan.local:
-        cats[Path(path).stem] = on_mosaic(meta, read_local(Path(path)))
-    cache.write_text(json.dumps({"catalogues": cats}), encoding="utf-8")
+        whole = read_local(Path(path))
+        cats[Path(path).stem] = on_mosaic(meta, whole)
+        if not cats[Path(path).stem]["rows"]:
+            # Most likely a catalogue of another field, which would otherwise call
+            # every tile here uncatalogued.
+            error = f"none of its {len(whole['rows'])} sources fall on {mosaic_id}"
+            logger.warning("%s: %s", path, error)
+            cats[Path(path).stem] = {"ok": False, "error": error, "rows": []}
+    cache.write_text(
+        json.dumps({"geometry": geometry, "catalogues": cats}), encoding="utf-8"
+    )
     return cats
 
 

@@ -46,7 +46,10 @@ def sign_flip_p(differences: Sequence[float]) -> float:
         raise ValueError(msg)
     bits = (np.arange(1 << d.size)[:, None] >> np.arange(d.size)) & 1
     sums = (1 - 2 * bits) @ d
-    return float((sums >= d.sum()).mean())
+    # The matmul and d.sum() add in different orders, so a tie in exact arithmetic
+    # can land a rounding error either side.
+    tol = 1e-9 * np.abs(d).sum()
+    return float((sums >= d.sum() - tol).mean())
 
 
 def total(bench_dir: Path, measure: str, detector: str = "knn") -> int:

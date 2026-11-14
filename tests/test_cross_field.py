@@ -85,6 +85,19 @@ def test_no_calibrate_ranks_without_p_values(tmp_path: Path) -> None:
     assert not (out / "calibration.csv").exists()
 
 
+def test_reference_fields_need_folder_names_of_their_own(tmp_path: Path) -> None:
+    # Calibration knows a field by its folder's name, so the two would leave each
+    # other out of their references and share one calibration folder.
+    for side in ("a", "b"):
+        _field(tmp_path / side / "ctrl", 2, seed=1)
+    args = bootstrap.parse_args([
+        "--data_root", "target",
+        "--reference_roots", str(tmp_path / "a" / "ctrl"), str(tmp_path / "b" / "ctrl"),
+    ])  # fmt: skip
+    with pytest.raises(SystemExit, match=r"named ctrl, .* \S+ctrl is the second\.$"):
+        bootstrap._reference_fields(args)
+
+
 def _grid(name: str, x0: int, y0: int, *, ra0: float = 34.3) -> dict[Path, Footprint]:
     """Nine tiles of a mosaic whose pixels are 0.04 arcsec, from one corner.
 

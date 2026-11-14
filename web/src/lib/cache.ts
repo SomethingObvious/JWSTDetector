@@ -60,6 +60,13 @@ export class TileCache {
     const p = loadTile(this.base, this.bundle, index, stop.signal).then(
       (data) => {
         finish();
+        if (data.mapError) {
+          // Not kept, so the next visit asks for the map again. The GPU copy from a
+          // visit before is dropped, as the renderer only uploads a tile it lacks.
+          this.onEvict(index);
+          this.onReady(data);
+          return data;
+        }
         this.done.set(index, data);
         this.onReady(data);
         this.trim(index);

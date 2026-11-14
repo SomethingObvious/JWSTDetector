@@ -16,7 +16,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from astropy.table import Table
+from astropy.table import MaskedColumn, Table
 import numpy as np
 
 from jwst_peculiar.bundle import RunBundle, read_verdicts
@@ -77,7 +77,7 @@ def _append_tile(
     cols["ra_tile"].append(np.nan if e["ra"] is None else e["ra"])
     cols["dec_tile"].append(np.nan if e["dec"] is None else e["dec"])
     xm = e.get("xmatch", {})
-    cols["uncatalogued"].append(bool(xm.get("uncatalogued", False)))
+    cols["uncatalogued"].append(xm.get("uncatalogued"))
     for cat in checked:
         slug = _slug(cat)
         near = xm.get("nearest", {}).get(cat)
@@ -112,6 +112,12 @@ def candidate_table(
         _append_tile(cols, e, checked=checked, verdict=verdicts.get(e["key"], {}))
 
     table: AstropyTable = Table(cols)
+    # 1 or 0, and null for a tile no catalogue was checked against. FITS can't hold
+    # a null boolean, and that tile is neither matched nor uncatalogued.
+    flags = cols["uncatalogued"]
+    table["uncatalogued"] = MaskedColumn(
+        [int(bool(f)) for f in flags], dtype=np.int16, mask=[f is None for f in flags]
+    )
     for name in ("ra_peak", "dec_peak", "ra_tile", "dec_tile"):
         table[name].unit = "deg"
     for cat in checked:
@@ -129,7 +135,8 @@ def write_regions(table: AstropyTable, path: Path, radius_arcsec: float = 1.5) -
     lines = ["# Region file format: DS9 version 4.1", "fk5"]
     for row in table:
         if np.isfinite(row["ra_peak"]):
-            colour = "cyan" if row["uncatalogued"] else "orange"
+            flag = row["uncatalogued"]
+            colour = "white" if np.ma.is_masked(flag) else "cyan" if flag else "orange"
             lines.append(
                 f'circle({row["ra_peak"]:.7f},{row["dec_peak"]:.7f},{radius_arcsec}") '
                 f"# color={colour} text={{{row['rank']}}}"

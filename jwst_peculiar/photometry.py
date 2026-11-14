@@ -7,6 +7,7 @@ magnitude in an HST, Euclid, Spitzer or ground-based mosaic as well as a JWST on
 
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 import re
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     Headers = Sequence[Mapping[str, Any]]
+
+logger = logging.getLogger(__name__)
 
 ARCSEC_PER_RAD = 206264.806
 # No imaging filter sits below 100 angstroms or above 100 microns.
@@ -81,9 +84,20 @@ def wavelength_um(headers: Headers, filt: str) -> float | None:
     """
     for key in ("PHOTPLAM", "PIVOT", "WAVELEN", "WAVELENG"):
         value = _get(headers, key)
-        if value is not None:
-            # Angstroms as a rule, though some headers give microns.
-            return float(value) * (1e-4 if float(value) > _MICRONS_BELOW else 1)
+        if value is None:
+            continue
+        if float(value) <= _MICRONS_BELOW:
+            return float(value)
+        # PHOTPLAM is in angstroms by definition, but the others come in angstroms
+        # or nanometres, and 7000 A and 700 nm are the same filter.
+        if key == "PHOTPLAM":
+            return float(value) * 1e-4
+        logger.warning(
+            "%s is %s, which could be angstroms or nanometres, so it isn't used",
+            key,
+            value,
+        )
+        break
     # JWST names give the wavelength in hundredths of a micron, so F444W is 4.44 and
     # F1000W is 10.00. HST names don't follow one rule, but HST files carry PHOTPLAM.
     m = _JWST_FILTER.fullmatch(filt.upper())
@@ -117,6 +131,10 @@ def jy_per_unit(headers: Headers, pixel_scale_arcsec: float) -> float | None:
 
 def _jy_from_bunit(raw: str, pixel_scale_arcsec: float) -> float | None:
     m = _JY.fullmatch(raw)
+    # Written all in lower case, the unit has lost what told MJy from mJy.
+    if m and m.group(1) == "m" and raw.islower():
+        logger.warning("BUNIT %s could be mJy or MJy, so it isn't used", raw)
+        return None
     if m:
         scale = _PREFIX[m.group(1)]
         per_sr = (m.group(2) or "").lower() in ("sr", "steradian")

@@ -72,6 +72,18 @@ export class Tan {
   }
 }
 
+/** The mosaic's WCS, or null when it has none or one the viewer can't read. */
+export function tanOf(cards: WcsCards | undefined): Tan | null {
+  if (!cards) {
+    return null;
+  }
+  try {
+    return new Tan(cards);
+  } catch {
+    return null;
+  }
+}
+
 type Vec3 = readonly [number, number, number];
 
 // ICRS to galactic rotation, as astropy uses it.

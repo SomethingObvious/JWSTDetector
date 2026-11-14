@@ -12,7 +12,20 @@ jwst-peculiar candidates  write the ranking as a FITS or VOTable table and DS9 r
 jwst-peculiar view        open the ranking in the web viewer, or export it as a site
 jwst-peculiar bench       plant sources of known magnitude and measure what is found
 jwst-peculiar recall      measure how a run ranks objects known to be in the field
+jwst-peculiar unzip       expand .gz mosaics so they can be memory-mapped
 ```
+
+The survey tools run as modules, and each takes `--help` too.
+
+```
+python -m jwst_peculiar.survey [--middle] SPLIT STARS DATA RESULTS   the verdict of a pre-registered search
+python -m jwst_peculiar.survey --check SPLIT STARS DATA              whether a split could name a tile, before scoring
+python -m jwst_peculiar.vet SPLIT STARS DATA RESULTS OUT             the vetting list
+python -m jwst_peculiar.colour RAW STARS OUT MOSAICS...              the colour list
+python -m jwst_peculiar.confirm --default DIRS --candidate DIRS      the sign-flip test between two models' benches
+```
+
+[search.md](search.md) and [minerva.md](minerva.md) describe what each one does.
 
 ## Cutting Tiles
 
@@ -23,7 +36,7 @@ The default sensor reads anything with a celestial WCS, one grey band per file. 
 ```
 # An HST drizzled image, counts per second with PHOTFNU in the header.
 jwst-peculiar prep --files hst_10092_acs_wfc_f814w_drz.fits --out datasets/hst \
-  --tile_size 320 --stride 160 --wcs_in_name --save_cutouts
+  --tile_size 320 --upscale 1 --stride 160 --wcs_in_name --save_cutouts
 
 # A folder of mosaics with weight maps called <name>_wht.fits.
 jwst-peculiar prep --indir rawfits/euclid --pattern "*.fits" --wht_pattern "{stem}_wht.fits" \
@@ -84,7 +97,7 @@ jwst-peculiar run --data_root datasets/smacs_nircam --out_dir results_smacs --ta
 
 This scores every tile against a random reference drawn from the tiles themselves, then rebuilds the reference from the lowest scores and scores again. A tile is never compared with a reference tile it overlaps. The ranking is in `measurements_final.csv`, with a patch-distance map per tile under `pass2/anomaly_maps/` and each tile's descriptor in `pass2/descriptors.npz`.
 
-Embeddings are cached under `DATA_ROOT/.features`, keyed by each tile's bytes and the backbone settings, so the second pass and any later run with the same backbone only embed what changed. `--feature_cache none` turns that off.
+Embeddings are cached under `DATA_ROOT/.features`, keyed by each tile's bytes, the backbone settings and, for a checkpoint in a local folder, its weight files, so the second pass and any later run with the same backbone only embed what changed. `--feature_cache none` turns that off.
 
 A few options matter more than the rest.
 
@@ -156,7 +169,7 @@ It needs a dataset cut with `--save_cutouts`. `--detectors` picks from knn, subs
 ## Known Objects
 
 ```
-jwst-peculiar recall results_smacs datasets/smacs_nircam --objects lensed.csv \
+jwst-peculiar recall results_smacs_knn datasets/smacs_nircam --objects lensed.csv \
   --centre 110.8270 -73.4541
 ```
 

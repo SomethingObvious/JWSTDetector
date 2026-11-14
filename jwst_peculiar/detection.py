@@ -775,13 +775,14 @@ class _Scoring:
             The distances of every patch in the batch.
         """
         per_tile = feats.reshape(len(keys), -1, feats.shape[-1])
-        # The number of neighbours goes in the name, as the bank outlives one run and
-        # the next can ask for another.
+        # The number of neighbours and the excluded reference tiles go in the name, as
+        # the bank outlives one run and the next can ask for others.
         nearest = f"{self.settings.k_neighbors}:"
         names = [
             (
                 k,
                 nearest
+                + ("" if excluded is None else str(excluded[i].nonzero().tolist()))
                 + hashlib.blake2b(per_tile[i].cpu().numpy().tobytes()).hexdigest(),
             )
             for i, k in enumerate(keys)

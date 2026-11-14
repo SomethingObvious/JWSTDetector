@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pytest
 
 from jwst_peculiar.colour import (
     BANDS,
+    NEIGHBOUR,
+    Found,
+    build,
     chi2_to_library,
     kernel_sigma_arcsec,
     lone,
     score,
     spikes,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _library(n: int = 40) -> np.ndarray:
@@ -100,3 +109,49 @@ def test_a_cosmic_ray_is_lone_but_a_line_or_a_cold_dwarf_is_not() -> None:
     hit = lone(np.array([ray, line, cold, faint]), sky)
     assert hit[0].tolist() == [False] * 5 + [True] + [False] * 2
     assert not hit[1:].any()
+
+
+def _found(n_lib: int) -> Found:
+    # Two faint sources first, so a library source's index in the catalogue isn't
+    # its index in the library, then the library at 10 arcsec apart.
+    wave = np.array([w for _, w, _ in BANDS])
+    faint = [20 * (wave / 2) ** a for a in (0.0, 1.0)]
+    bright = [1000 * (wave / 2) ** a for a in np.linspace(-1, 2, n_lib)]
+    n = 2 + n_lib
+    return Found(
+        ra=np.full(n, 34.4),
+        dec=-5.2 + np.arange(n) * 10 / 3600,
+        flux=np.array(faint + bright),
+        sky_err=np.ones((n, len(BANDS))),
+        det_sn=np.full(n, 50.0),
+        conc=np.full(n, 0.3),
+        block=["b"] * n,
+    )
+
+
+def _no_bright_stars(tmp_path: Path) -> Path:
+    path = tmp_path / "stars.json"
+    path.write_text(
+        json.dumps({
+            "centre": [34.4, -5.2],
+            "radius_deg": 1.0,
+            "rows": [[34.5, -5.2, 20.0]],
+        })
+    )
+    return path
+
+
+def test_each_library_source_is_scored_without_itself(tmp_path: Path) -> None:
+    found = _found(NEIGHBOUR + 1)
+    cat = build([found], _no_bright_stars(tmp_path))
+    assert cat.library.tolist() == list(range(2, NEIGHBOUR + 3))
+    err = np.sqrt(1 + (0.05 * found.flux) ** 2)
+    lib = np.arange(NEIGHBOUR + 1)
+    expected = score(found.flux, err, found.flux[2:], pairs=(lib + 2, lib))
+    assert np.isfinite(expected).all()
+    assert cat.scores.tolist() == expected.tolist()
+
+
+def test_a_library_too_small_to_leave_one_out_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match=f"library of at least {NEIGHBOUR + 1}"):
+        build([_found(NEIGHBOUR)], _no_bright_stars(tmp_path))

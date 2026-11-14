@@ -22,13 +22,12 @@
     type VerdictRecord,
   } from './lib/types';
   import { Verdicts } from './lib/verdicts.svelte';
-  import { Tan } from './lib/wcs';
+  import { tanOf, type Tan } from './lib/wcs';
+  import { parseRank, readDisplay, runBase } from './lib/checks';
 
   const params = new URLSearchParams(location.search);
-  const base = (() => {
-    const b = params.get('run') ?? './run/';
-    return b.endsWith('/') ? b : `${b}/`;
-  })();
+  const asked = runBase(params.get('run'), location.href);
+  const base = asked ?? './run/';
 
   const PREFS = 'jwst-peculiar:prefs';
   const defaults: Display = {
@@ -64,13 +63,10 @@
   let verdicts = $state.raw<Verdicts | null>(null);
   let cache: TileCache | null = null;
   let renderer: Renderer | null = null;
-  let wcs = new Map<string, Tan>();
+  let wcs = new Map<string, Tan | null>();
 
-  const initial: Display = { ...defaults, ...saved.display };
-  if (!Array.isArray(initial.lo) || !Array.isArray(initial.hi)) {
-    Object.assign(initial, { lo: [0], hi: [1], limitMode: 'p995' });
-  }
-  let display = $state<Display>(initial);
+  // load() checks the map source again once it knows how many passes the run has.
+  let display = $state<Display>(readDisplay(saved.display, defaults, 2));
   let theme = $state<Theme>(
     saved.theme && ['atlas', 'plate', 'classic'].includes(saved.theme)
       ? saved.theme
@@ -140,6 +136,11 @@
 
   async function load() {
     try {
+      if (asked === null) {
+        throw new Error(
+          `?run= points at ${params.get('run') ?? ''}, which is on another site. The viewer opens runs from this site or from localhost, so copy the run folder here or serve it locally.`,
+        );
+      }
       const res = await fetch(`${base}index.json`, { cache: 'no-store' });
       if (!res.ok) {
         throw new Error(`${base}index.json returned ${String(res.status)}`);
@@ -154,7 +155,8 @@
       if (!Array.isArray(b.tiles) || b.tiles.length === 0) {
         throw new Error('index.json lists no tiles');
       }
-      wcs = new Map(Object.entries(b.mosaics).map(([k, m]) => [k, new Tan(m.wcs)]));
+      wcs = new Map(Object.entries(b.mosaics).map(([k, m]) => [k, tanOf(m.wcs)]));
+      display = readDisplay(saved.display, defaults, b.run.passes);
       const v = new Verdicts(b, base);
       await v.load();
       const width = b.run.embedding_dims ?? 0;
@@ -384,18 +386,7 @@
     }
   });
 
-  const reviewed = $derived.by(() => {
-    if (!verdicts) {
-      return 0;
-    }
-    let n = 0;
-    for (const v of verdicts.map.values()) {
-      if (v.verdict) {
-        n++;
-      }
-    }
-    return n;
-  });
+  const reviewed = $derived(verdicts?.reviewedCount() ?? 0);
 
   $effect(() => {
     const i = current;
@@ -421,7 +412,8 @@
           // Only a load that was left behind gets stopped, and coming back starts another.
           const stopped = err instanceof DOMException && err.name === 'AbortError';
           if (current === i && !stopped) {
-            tileError = `Couldn't load tile ${String(i)}. ${err instanceof Error ? err.message : String(err)}`;
+            const rank = bundle?.tiles[i]?.rank ?? i + 1;
+            tileError = `Couldn't load the tile at rank ${String(rank)}. ${err instanceof Error ? err.message : String(err)}. Step away and back to try again.`;
           }
         },
       );
@@ -473,29 +465,25 @@
     if (!data) {
       return [0, 1];
     }
-    let src = data.map2;
-    if (display.source === 'pass1' && data.map1) {
-      src = data.map1;
-    }
     const run = bundle?.run.map_range;
     if (display.source !== 'diff' && run) {
       return run;
     }
-    const map1 = data.map1;
-    if (display.source === 'diff' && map1) {
+    const { map1, map2 } = data;
+    if (display.source === 'diff') {
       let m = 0;
-      data.map2.forEach((v, k) => {
-        m = Math.max(m, Math.abs(v - (map1[k] ?? NaN)));
+      map2?.forEach((v, k) => {
+        m = Math.max(m, Math.abs(v - (map1?.[k] ?? NaN)));
       });
       return [-m || -1, m || 1];
     }
     let lo = Infinity;
     let hi = -Infinity;
-    for (const v of src) {
+    for (const v of (display.source === 'pass1' ? map1 : map2) ?? []) {
       lo = Math.min(lo, v);
       hi = Math.max(hi, v);
     }
-    return [lo, hi > lo ? hi : lo + 1];
+    return lo > hi ? [0, 1] : [lo, hi > lo ? hi : lo + 1];
   });
 
   const frame = $derived.by(() => {
@@ -503,8 +491,9 @@
       return null;
     }
     const m = bundle.mosaics[tile.mosaic];
-    const w = wcs.get(tile.mosaic);
-    return m && w ? new TileFrame(tile, m, w, data.width, data.height) : null;
+    return m
+      ? new TileFrame(tile, m, wcs.get(tile.mosaic) ?? null, data.width, data.height)
+      : null;
   });
 
   function select(i: number) {
@@ -575,13 +564,16 @@
     if (!bundle || goto === null) {
       return;
     }
-    const r = parseInt(goto, 10);
-    const i = bundle.tiles.findIndex((t) => t.rank === r);
+    const r = parseRank(goto);
+    const i = r === null ? -1 : bundle.tiles.findIndex((t) => t.rank === r);
+    const ranks = bundle.tiles.map((t) => t.rank);
     if (i >= 0) {
       select(i);
       goto = null;
+    } else if (r === null) {
+      gotoMsg = 'Type a whole number, like 12.';
     } else {
-      gotoMsg = `No tile has rank ${goto}. Ranks run from 1 to ${String(bundle.tiles.length)}.`;
+      gotoMsg = `No tile has rank ${String(r)}. The lowest is ${String(Math.min(...ranks))} and the highest ${String(Math.max(...ranks))}.`;
     }
   }
 
@@ -672,7 +664,7 @@
 
   function focusKind(el: HTMLElement): { typing: boolean; widget: boolean } {
     const type = el instanceof HTMLInputElement ? el.type : '';
-    // Sliders and checkboxes keep their own arrow keys but let every other key through.
+    // Sliders and checkboxes keep their own arrow and delete keys but let every other key through.
     const widget = type === 'range' || type === 'checkbox';
     const typing =
       el.isContentEditable ||
@@ -697,7 +689,7 @@
     if (typing || e.ctrlKey || e.metaKey || e.altKey || !bundle) {
       return;
     }
-    if (widget && /^(?:Arrow|Home|End|Page)/u.test(e.key)) {
+    if (widget && /^(?:Arrow|Home|End|Page|Delete|Backspace)/u.test(e.key)) {
       return;
     }
     if (sheet?.open && e.key !== '?') {
@@ -902,24 +894,36 @@
             <span class="num">{order.length}</span> shown{:else}not in the filtered list{/if}</span
         >
       </span>
-      <span class="save" role="status">
-        {#if save.kind === 'saved'}
-          <i class="led ok"></i>Saved {clock(save.at)}
-        {:else if save.kind === 'saving'}
-          <i class="led busy"></i>Saving {save.pending}
-        {:else if save.kind === 'retrying'}
-          <i class="led bad"></i>Not saved, {save.pending} waiting. Retrying in {save.inSeconds}
-          s ({save.error})
+      <!-- The countdown sits outside the live region, or a reader would hear it every second. -->
+      <span class="save">
+        <span class="save" role="status">
+          {#if save.kind === 'saved'}
+            <i class="led ok"></i>Saved {clock(save.at)}
+          {:else if save.kind === 'saving'}
+            <i class="led busy"></i>Saving {save.pending}
+          {:else if save.kind === 'retrying'}
+            <i class="led bad"></i>Not saved, {save.pending} waiting ({save.error}).
+          {:else if save.kind === 'rejected'}
+            {@const r = bundle.tiles[indexOfKey.get(save.key) ?? -1]?.rank}
+            <i class="led bad"></i>The server turned down the verdict on rank {r} ({save.error}),
+            so it was dropped.
+          {:else if save.kind === 'local' && !verdicts.storageOk}
+            <i class="led bad"></i>This browser won't store verdicts. Export them before
+            you close the tab.
+          {:else if save.kind === 'local'}
+            <i class="led ok"></i><span
+              ><span class="num">{save.count}</span>
+              {save.count === 1 ? 'verdict' : 'verdicts'} in this browser</span
+            >
+          {:else}
+            <i class="led ok"></i>Every verdict saved
+          {/if}
+        </span>
+        {#if save.kind === 'retrying'}
+          Retrying in {save.inSeconds} s
           <button class="ctl mini" onclick={() => verdicts?.retryNow()}
             >Retry Now</button
           >
-        {:else if save.kind === 'local'}
-          <i class="led ok"></i><span
-            ><span class="num">{save.count}</span>
-            {save.count === 1 ? 'verdict' : 'verdicts'} in this browser</span
-          >
-        {:else}
-          <i class="led ok"></i>Every verdict saved
         {/if}
       </span>
       <span class="themes" role="group" aria-label="Theme">

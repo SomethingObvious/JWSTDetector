@@ -31,8 +31,12 @@ def decompress_dir(base_dir: Path) -> int:
         # Under another name until it's whole, so a broken archive or a Ctrl+C
         # doesn't leave half a FITS file that prep would open.
         part = out_path.with_name(out_path.name + ".part")
-        with gzip.open(gz_path, "rb") as f_in, part.open("wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        try:
+            with gzip.open(gz_path, "rb") as f_in, part.open("wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
         part.replace(out_path)
         gz_path.unlink()
     return len(gz_paths)

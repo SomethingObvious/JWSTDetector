@@ -14,8 +14,12 @@ export interface TileData {
   source: 'cutout' | 'png';
   /** Why the cutout was not used, when it was asked for and failed. */
   fallback: string | null;
-  map2: Float32Array;
+  /** Null when the map couldn't be fetched, which mapError explains. */
+  map2: Float32Array | null;
+  /** Null for a one-pass run, or when the fetch failed. */
   map1: Float32Array | null;
+  /** Which map failed and why. A tile with one isn't cached, so the next visit asks again. */
+  mapError: string | null;
   /** Finite pixel values per plane, sorted, for limits and equalisation. */
   samples: Float32Array[];
   mins: number[];
@@ -58,6 +62,39 @@ async function decodePng(
   const out = { width: bmp.width, height: bmp.height, rgba };
   bmp.close();
   return out;
+}
+
+/** A patch map, or why it couldn't be fetched. A stopped load still throws. */
+async function mapOf(
+  url: string,
+  signal?: AbortSignal,
+): Promise<Float32Array | string> {
+  try {
+    return new Float32Array(await fetchBytes(url, signal));
+  } catch (err) {
+    if (signal?.aborted) {
+      throw err;
+    }
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+function mapsOf(
+  map2: Float32Array | string,
+  map1: Float32Array | string | null,
+): Pick<TileData, 'map2' | 'map1' | 'mapError' | 'map2Sorted'> {
+  let mapError: string | null = null;
+  if (typeof map2 === 'string') {
+    mapError = `Couldn't load the patch map (${map2}), so there is no overlay. Step away and back to try again.`;
+  } else if (typeof map1 === 'string') {
+    mapError = `Couldn't load the pass 1 map (${map1}), so Pass 1 and Change show no overlay. Step away and back to try again.`;
+  }
+  return {
+    map2: typeof map2 === 'string' ? null : map2,
+    map1: typeof map1 === 'string' ? null : map1,
+    mapError,
+    map2Sorted: typeof map2 === 'string' ? new Float32Array(0) : map2.slice().sort(),
+  };
 }
 
 // A type guard so the pixel loops can read typed arrays without a second check
@@ -112,18 +149,12 @@ export async function loadTile(
   const mosaic = bundle.mosaics[t.mosaic];
   const wantsColour = (mosaic?.filters.length ?? 1) >= 3;
 
-  const mapsP = fetchBytes(`${base}maps/${id}.f32`, signal).then(
-    (b) => new Float32Array(b),
-  );
-  // It's awaited last, and a load stopped before then would leave its failure unhandled.
-  mapsP.catch(() => undefined);
+  const mapsP = mapOf(`${base}maps/${id}.f32`, signal);
   const maps1P =
-    bundle.run.passes >= 2
-      ? fetchBytes(`${base}maps1/${id}.f32`, signal).then(
-          (b) => new Float32Array(b),
-          () => null,
-        )
-      : Promise.resolve(null);
+    bundle.run.passes >= 2 ? mapOf(`${base}maps1/${id}.f32`, signal) : null;
+  // They're awaited last, and a load stopped before then would leave the failure unhandled.
+  mapsP.catch(() => undefined);
+  maps1P?.catch(() => undefined);
 
   let planes: Float32Array[] | null = null;
   let rgba: Uint8Array | null = null;
@@ -170,8 +201,7 @@ export async function loadTile(
     return sampleOf(rgba ?? new Uint8Array(0), n, 4, c);
   });
 
-  const map2 = await mapsP;
-  const map1 = await maps1P;
+  const maps = mapsOf(await mapsP, (await maps1P) ?? null);
   return {
     index,
     width,
@@ -182,12 +212,10 @@ export async function loadTile(
     bunit,
     source: planes ? 'cutout' : 'png',
     fallback,
-    map2,
-    map1,
+    ...maps,
     samples: stats.map((x) => x.sample),
     mins: stats.map((x) => x.min),
     maxs: stats.map((x) => x.max),
-    map2Sorted: Float32Array.from(map2).sort(),
   };
 }
 

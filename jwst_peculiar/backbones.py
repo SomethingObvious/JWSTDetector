@@ -223,6 +223,11 @@ def parse_layers(spec: str, depth: int) -> list[int] | None:
     if not picked or min(picked) < 1 or max(picked) > depth:
         msg = f"--layers {spec} is outside this model's 1 to {depth}"
         raise ValueError(msg)
+    if len(set(picked)) != len(picked):
+        # The streamed model counts a layer once, where the in-memory one would
+        # weight it twice.
+        msg = f"--layers {spec} names a layer more than once"
+        raise ValueError(msg)
     return picked
 
 
@@ -413,6 +418,9 @@ def _load_backbone(request: _Request, device: torch.device) -> Backbone:
         patch_size=patch_size,
         device=device,
     ):
+        if _precision_dtype("bf16", device) == dtype:
+            msg = f"{repo} overflows fp16, and {device} has no bf16 to run it in"
+            raise RuntimeError(msg)
         logger.warning("%s overflows fp16, so running it in bf16", repo)
         del model, forward_patches
         gc.collect()

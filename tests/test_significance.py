@@ -12,13 +12,14 @@ def test_conformal_p_counts_ties_and_the_test_point() -> None:
 
 
 def test_conformal_p_is_uniform_for_exchangeable_scores() -> None:
-    # Over many draws, P(p <= a) is at most a when test and calibration share a law.
+    # Over many draws, P(p <= a) is a when test and calibration share a law, as p
+    # takes each of 1/100 to 100/100 equally often.
     rng = np.random.default_rng(0)
     p = np.concatenate([
         conformal_p(rng.normal(size=1), rng.normal(size=99)) for _ in range(4000)
     ])
     for a in (0.05, 0.1, 0.5):
-        assert np.mean(p <= a) <= a + 0.015, (a, np.mean(p <= a))
+        assert abs(np.mean(p <= a) - a) <= 0.015, (a, np.mean(p <= a))
 
 
 def test_bh_q_matches_the_step_up_rule() -> None:

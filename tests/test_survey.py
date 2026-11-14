@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from astropy import units as u
 from astropy.coordinates import SkyCoord
@@ -13,6 +13,8 @@ from jwst_peculiar.survey import (
     can_name_one,
     check_owned,
     cut_blocks,
+    kept_tiles,
+    main,
     middle_scores,
     near_bright_star,
     overlaps_other_visit,
@@ -43,7 +45,7 @@ def test_a_run_that_scored_every_patch_is_refused(tmp_path: Path) -> None:
         (tmp_path / "args.yaml").write_text(f"score_region: {region}\nstride: 160\n")
         check_owned(tmp_path)
     (tmp_path / "args.yaml").write_text("score_region: all\nstride: 160\n")
-    with pytest.raises(ValueError, match="wasn't scored with --score_region owned"):
+    with pytest.raises(ValueError, match="--score_region owned or middle, so"):
         check_owned(tmp_path)
 
 
@@ -62,6 +64,228 @@ def test_a_lone_tile_is_rescored_on_its_middle(tmp_path: Path) -> None:
     dists[0, 3], dists[10, 12] = 9, 5
     np.save(maps / "a.npy", dists)
     assert middle_scores(run, data) == {"a.png": 5.0}
+
+
+def test_middle_rescore_leaves_out_masked_patches(
+    tmp_path: Path,
+) -> None:
+    run, data = tmp_path / "run", tmp_path / "data"
+    key = "sub/M_cx000160_cy000160_ra150.000000_dec2.000000_i00000000.png"
+    # Nested under its folder and named with every dot, as detection saves it.
+    maps = run / "pass2" / "anomaly_maps" / "seed=3" / "sub"
+    maps.mkdir(parents=True)
+    data.mkdir()
+    (run / "args.yaml").write_text(
+        "score_region: owned\nscore_mode: peak_minus_median\nmasking: true\nseed: 3\n"
+    )
+    (run / "measurements_final.csv").write_text(f"Sample,AnomalyScore\n{key},9.0\n")
+    (data / "manifest.csv").write_text(
+        f"key,mosaic,x0,y0,size,ra,dec,cutout\n{key},M,0,0,320,150,2,\n"
+    )
+    # The middle is rows and columns 7 to 20. Over half of it was masked out and saved
+    # as 0, which would pull the median from 1 to 0.
+    dists = np.ones((28, 28), np.float32)
+    dists[7:15, 7:21] = 0
+    dists[18, 12] = 5
+    np.save(maps / f"{key[4:-4]}.npy", dists)
+    assert middle_scores(run, data) == {key: 4.0}
+
+
+def _visit(
+    data: Path,
+    name: str,
+    tiles: list[tuple[float, float]],
+    *,
+    size: int = 320,
+    scale: float = 0.0625,
+) -> list[str]:
+    """Write a visit's manifest and mosaic record, one mosaic of `size` px tiles.
+
+    Returns:
+        The tile keys, in the order given.
+    """
+    root = data / name
+    (root / "mosaics").mkdir(parents=True)
+    (root / "mosaics" / f"M{name}.json").write_text(
+        json.dumps({"pixel_scale_arcsec": scale}), encoding="utf-8"
+    )
+    keys = [
+        f"M{name}_cx{400 * j:06d}_cy000160_ra{ra:.6f}_dec{dec:.6f}_i{j:08d}.png"
+        for j, (ra, dec) in enumerate(tiles)
+    ]
+    rows = [
+        f"{k},M{name},{400 * j},0,{size},{ra},{dec},"
+        for j, (k, (ra, dec)) in enumerate(zip(keys, tiles, strict=True))
+    ]
+    (root / "manifest.csv").write_text(
+        "key,mosaic,x0,y0,size,ra,dec,cutout\n" + "\n".join(rows) + "\n",
+        encoding="utf-8",
+    )
+    return keys
+
+
+def _row(i: int, dec: float) -> list[tuple[float, float]]:
+    return [(150.0 + 0.05 * j, dec) for j in range(i)]
+
+
+def _survey(
+    tmp_path: Path, scores: dict[str, list[float]]
+) -> tuple[list[str], dict[str, Any]]:
+    """Lay out a search visit, two calibration visits and a bank, with their results.
+
+    c1's last tile sits 30 arcsec from a G = 12 star and c2's last tile 10 arcsec
+    from the bank's tile, and every other tile is 3 arcmin from the next.
+
+    Returns:
+        The search visit's keys and the split.
+    """
+    data, results = tmp_path / "data", tmp_path / "results"
+    keys = {
+        "s1": _visit(data, "s1", _row(3, 2.0)),
+        "c1": _visit(data, "c1", _row(5, 2.05)),
+        "c2": _visit(data, "c2", [*_row(4, 2.1), (150.0, 2.15 + 10 / 3600)]),
+        "b": _visit(data, "b", [(150.0, 2.15)]),
+    }
+    for v, values in scores.items():
+        (results / v).mkdir(parents=True)
+        (results / v / "args.yaml").write_text("score_region: owned\n")
+        (results / v / "measurements_final.csv").write_text(
+            "Sample,AnomalyScore\n"
+            + "".join(f"{k},{s}\n" for k, s in zip(keys[v], values, strict=True))
+        )
+    (tmp_path / "stars.json").write_text(
+        json.dumps({
+            "centre": [150.0, 2.0],
+            "radius_deg": 1.0,
+            "rows": [[150.2, 2.05 + 30 / 3600, 12.0]],
+        }),
+        encoding="utf-8",
+    )
+    split = {
+        "alpha": 0.5,
+        "tile_px": 320,
+        "search": ["s1"],
+        "bank": ["b"],
+        "calibration": ["c1", "c2"],
+    }
+    (tmp_path / "split.json").write_text(json.dumps(split), encoding="utf-8")
+    return keys["s1"], split
+
+
+def _main(tmp_path: Path) -> int:
+    return main([
+        str(tmp_path / "split.json"),
+        str(tmp_path / "stars.json"),
+        str(tmp_path / "data"),
+        str(tmp_path / "results"),
+    ])
+
+
+# The tiles the rules drop score 50, which would change every count had they stayed.
+SCORES = {
+    "s1": [100.0, 0.0, 4.5],
+    "c1": [1.0, 3.0, 5.0, 7.0, 50.0],
+    "c2": [2.0, 4.0, 6.0, 8.0, 50.0],
+}
+
+
+def test_search_names_only_the_tile_no_calibration_tile_reaches(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    search, _ = _survey(tmp_path, SCORES)
+    assert _main(tmp_path) == 0
+    verdict = json.loads((tmp_path / "results" / "verdict.json").read_text())
+    assert json.loads(capsys.readouterr().out) == verdict
+    # Against 8 kept calibration tiles, p is 1/9, 5/9 and 1, and q 1/3, 5/6 and 1.
+    # Each rehearsal draw tests 4 interleaved tiles against the other 4 and names
+    # none.
+    assert verdict == {
+        "search_tiles": 3,
+        "calibration_tiles": 8,
+        "dropped": {"overlap": 1, "star": 1},
+        "smallest_p": 1 / 9,
+        "bh_needs_for_one": 0.5 / 3,
+        "rehearsal_draws_with_any_detection": 0.0,
+        "rehearsal_passed": True,
+        "detections": [search[0]],
+    }
+    rows = (tmp_path / "results" / "search_pvalues.csv").read_text().splitlines()
+    assert rows == [
+        "key,score,p,q",
+        f"{search[0]},100,0.111111,0.333333",
+        f"{search[2]},4.5,0.555556,0.833333",
+        f"{search[1]},0,1,1",
+    ]
+
+
+def test_nan_score_stops_the_search(tmp_path: Path) -> None:
+    _survey(tmp_path, {**SCORES, "c2": [2.0, float("nan"), 6.0, 8.0, 50.0]})
+    with pytest.raises(ValueError, match=r"^c2's tile Mc2_cx000400_\S+ scored NaN"):
+        _main(tmp_path)
+
+
+def test_rehearsal_needs_a_calibration_visit_left_over(
+    tmp_path: Path,
+) -> None:
+    _survey(tmp_path, SCORES)
+    split = {**json.loads((tmp_path / "split.json").read_text()), "search": ["s1", "x"]}
+    (tmp_path / "split.json").write_text(json.dumps(split), encoding="utf-8")
+    with pytest.raises(ValueError, match="more than 2 calibration visits, not 2"):
+        _main(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("argv", "code"),
+    [
+        ([], 2),
+        (["split.json", "stars.json", "data"], 2),
+        (["--check", "split.json", "stars.json", "data", "results"], 2),
+        (["--middle", "split.json", "stars.json", "data"], 2),
+        (["--fast", "split.json", "stars.json", "data", "results"], 2),
+        (["--help"], 0),
+    ],
+)
+def test_arguments_that_fit_no_form_print_the_usage(
+    argv: list[str], code: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(argv) == code
+    out, err = capsys.readouterr()
+    shown = out if code == 0 else err
+    assert shown.startswith(
+        "usage: python -m jwst_peculiar.survey [--middle] SPLIT_JSON STARS_JSON "
+        "DATA_ROOT RESULTS_DIR\n"
+        "       python -m jwst_peculiar.survey --check SPLIT_JSON STARS_JSON "
+        "DATA_ROOT\n"
+    ), shown
+    if code:
+        want = 3 if argv[:1] == ["--check"] else 4
+        assert f"survey: error: expected {want} paths, got {argv}\n" in err
+
+
+def test_tiles_of_another_size_are_refused(tmp_path: Path) -> None:
+    _, split = _survey(tmp_path, SCORES)
+    _visit(tmp_path / "train", "t", [(151.0, 2.0)], size=640)
+    split["training_data"] = [str(tmp_path / "train" / "t")]
+    with pytest.raises(ValueError, match=r"at 640 px across, .* tile_px of 320"):
+        kept_tiles(
+            split,
+            stars_json=tmp_path / "stars.json",
+            data=tmp_path / "data",
+            results=None,
+        )
+
+
+def test_mosaics_of_another_pixel_scale_are_refused(tmp_path: Path) -> None:
+    _, split = _survey(tmp_path, SCORES)
+    _visit(tmp_path / "data", "c3", [(151.0, 2.0)], scale=0.03)
+    split["calibration"] = [*split["calibration"], "c3"]
+    with pytest.raises(ValueError, match=r"Mc3.json is 0.03 arcsec .* is 0.0625,"):
+        kept_tiles(
+            split,
+            stars_json=tmp_path / "stars.json",
+            data=tmp_path / "data",
+            results=None,
+        )
 
 
 def _sky(*points: tuple[float, float]) -> SkyCoords:

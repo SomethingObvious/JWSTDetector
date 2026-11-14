@@ -4,6 +4,7 @@ import itertools
 import json
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 
 from jwst_peculiar.confirm import main, sign_flip_p, total
@@ -14,6 +15,12 @@ if TYPE_CHECKING:
 
 def test_a_gain_on_every_visit_gives_the_smallest_p() -> None:
     assert sign_flip_p([3, 1, 4, 1, 5, 9, 2, 6, 5, 3]) == 1 / 1024
+
+
+def test_sign_flip_floor_holds_for_float_differences() -> None:
+    # Summed in another order, the observed pattern can round below d.sum().
+    rng = np.random.default_rng(0)
+    assert {sign_flip_p(rng.random(12).tolist()) for _ in range(50)} == {1 / 4096}
 
 
 def test_sign_flip_matches_counting_the_patterns_by_hand() -> None:

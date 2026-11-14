@@ -18,7 +18,7 @@ These are ranks 2, 3, 11 and 12. The top of the kNN ranking is mostly lensed arc
 
 ![Share of planted points, arcs, rings and streaks found in the top 5% against AB magnitude, for kNN, the subspace detector, kNN on raw pixels and an isolation forest](docs/completeness.png)
 
-`jwst-peculiar bench` plants points, arcs, rings and streaks of known AB magnitude in the FITS cutouts, blurred by STPSF's model of each filter's PSF, and renders them the way prep would have. On SMACS 0723, kNN finds half the planted arcs down to AB 27.2 and half the rings to 26.2. The same search on raw pixels finds almost none of them (14 of 315 arcs, rings and streaks against kNN's 133), and an isolation forest's ranking doesn't move with what is planted.
+`jwst-peculiar bench` plants points, arcs, rings and streaks of known AB magnitude in the FITS cutouts, blurred by STPSF's model of each filter's PSF, and renders them the way prep would have. On SMACS 0723, kNN finds half the planted rings down to AB 26.2. It finds 9 of 15 arcs at AB 26 and at 27, dropping below half past 27.2, but only 2 to 7 of 15 brighter ones, for a reason [the benchmark page](docs/benchmark.md#why-knn-finds-faint-arcs-more-often-than-bright-ones) explains. The same search on raw pixels finds almost none of them (14 of 315 arcs, rings and streaks against kNN's 133), and an isolation forest's ranking doesn't move with what is planted.
 
 `jwst-peculiar recall` checks the 85 known lensed images in the field. Every detector ranks them above sky at the same distance from the core more often than chance (kNN at 64 where 50 is chance), though none clearly beats the others. [The benchmark page](docs/benchmark.md) has the numbers and caveats.
 
@@ -26,11 +26,11 @@ A LoRA fine-tune, trained so the same sky gives the same features wherever it fa
 
 ## Searches
 
-Both searches were written down and pushed before any of their tiles were scored, and both came back empty.
+Both searches were written down and pushed before any of their tiles were scored, and both came back empty. The pages list what changed in each plan after that.
 
 COSMOS-Web scored 1,345 search tiles against 39,298 calibration tiles and named nothing at a false discovery rate of 0.1. The lowest p-value was 0.0018, and the injection check found that one badly rendered visit had capped what the search could see. [The search page](docs/search.md) has the plan and the result.
 
-MINERVA, the medium-band survey, scored 514 tiles in 8 search blocks against 3,838 calibration tiles and named nothing either, with a lowest p-value of 0.006. The overlap rules emptied 17 calibration blocks, which left too few calibration tiles for any one tile to pass alone (it would have taken two that beat every calibration tile), so an empty result says little here. A rescore afterwards on each tile's middle, which wasn't planned, named nothing either. The search also writes a colour list for people to look at. [The MINERVA page](docs/minerva.md) has the details.
+MINERVA, the medium-band survey, scored 514 tiles in 8 search blocks against 3,838 calibration tiles and named nothing either, with a lowest p-value of 0.006. The overlap and star rules emptied 17 of its 84 calibration blocks, which left too few calibration tiles for any one tile to pass alone (it would have taken two that beat every calibration tile), so an empty result says little here. A rescore afterwards on each tile's middle, which wasn't planned, named nothing either. The search also writes a colour list for people to look at. [The MINERVA page](docs/minerva.md) has the details.
 
 ## How It Works
 
@@ -56,7 +56,7 @@ The default backbone, `dinov3-vitl16-pretrain-sat493m`, was trained on satellite
 
 ```
 jwst-peculiar prep --files hst_10092_acs_wfc_f814w_drz.fits --out datasets/hst \
-  --tile_size 320 --stride 160 --wcs_in_name --save_cutouts
+  --tile_size 320 --upscale 1 --stride 160 --wcs_in_name --save_cutouts
 jwst-peculiar run --data_root datasets/hst --out_dir results --tag hst
 jwst-peculiar match results_hst datasets/hst
 jwst-peculiar view results_hst datasets/hst

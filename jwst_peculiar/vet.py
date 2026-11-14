@@ -50,6 +50,8 @@ RATIO = 1.6
 # Overlapping tiles see the same source, so hot spots this close are one source.
 SAME_SOURCE_ARCSEC = 1.5
 MATCH_ARCSEC = 2.0
+# Filters it takes to draw the hot spot in colour.
+RGB = 3
 
 
 def _mad(x: npt.NDArray[np.float64]) -> float:
@@ -97,12 +99,12 @@ def flag(sigs: list[float]) -> str:
     Returns:
         "one filter", "no filter" or "".
     """
-    top, second = sorted(sigs, reverse=True)[:2]
-    # A filter with no data at the patch can't vouch for the source.
-    if not top >= SHOWS:
+    # A filter with no data at the patch can't vouch for the source, so it counts as
+    # nothing there, as does the second filter a one-filter cutout lacks.
+    seen = sorted((0.0 if np.isnan(s) else s for s in sigs), reverse=True)
+    top, second = [*seen, 0.0, 0.0][:2]
+    if top < SHOWS:
         return "no filter"
-    if np.isnan(second):
-        return "one filter"
     if second < QUIET and top >= RATIO * second:
         return "one filter"
     return ""
@@ -118,6 +120,7 @@ class Source:
     z: float
     hot: SkyCoords
     cell: tuple[int, int]
+    grid: int
     sigs: list[float] = field(default_factory=list)
     flag: str = ""
     near: dict[str, str] = field(default_factory=dict)
@@ -247,7 +250,7 @@ def _sheet(
 
     n = len(filters)
     fig, ax = plt.subplots(1, n + 2, figsize=(4 * (n + 2), 4.6), dpi=80)
-    step = planes.shape[1] / 28
+    step = planes.shape[1] / src.grid
     x, y = (src.cell[1] + 0.5) * step, (src.cell[0] + 0.5) * step
     chans = [_stretch(p)[::-1] for p in planes]
     ax[0].imshow(np.asarray(Image.open(tile_png)))
@@ -259,8 +262,9 @@ def _sheet(
         a.plot(x, y, "o", mfc="none", mec="cyan", ms=18)
     half = max(int(3 * step), 24)
     lo_y, lo_x = max(int(y) - half, 0), max(int(x) - half, 0)
-    ax[-1].imshow(np.dstack(chans[:3])[lo_y : int(y) + half, lo_x : int(x) + half])
-    ax[-1].set_title("hot spot, colour")
+    hot = np.dstack(chans[:RGB]) if n >= RGB else chans[0]
+    ax[-1].imshow(hot[lo_y : int(y) + half, lo_x : int(x) + half], cmap="gray")
+    ax[-1].set_title("hot spot, colour" if n >= RGB else "hot spot")
     for a in ax:
         a.set_xticks([])
         a.set_yticks([])
@@ -298,21 +302,24 @@ def _rank(args: argparse.Namespace) -> tuple[list[Source], list[Source]]:
         if any(hot.separation(t).arcsec < SAME_SOURCE_ARCSEC for t in taken):
             continue
         taken.append(hot)
-        src = Source(len(taken), visit, key, score, hot, cell)
+        src = Source(len(taken), visit, key, score, hot, cell, grid)
         src.sigs = [significance(p, cell, grid) for p in _planes(cutouts[key])]
         src.flag = flag(src.sigs)
         (flagged if src.flag else clean).append(src)
     return clean, flagged
 
 
+def _filters(data: Path, src: Source) -> list[str]:
+    mosaic = _tiles(data, src.visit)[src.key]["mosaic"]
+    return list(_mosaic_record(data, src.visit, mosaic)["filters"])
+
+
 def _write(args: argparse.Namespace, sources: list[Source], n_clean: int) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
-    first = sources[0]
-    mosaic = _tiles(args.data, first.visit)[first.key]["mosaic"]
-    filters = list(_mosaic_record(args.data, first.visit, mosaic)["filters"])
     cutouts = _cutouts(args.data, sorted({s.visit for s in sources}))
     rows = []
     for src in sources:
+        filters = _filters(args.data, src)
         src.near = {} if args.no_catalogues else catalogue_note(src.hot)
         sheet = f"source{src.rank:03d}.png"
         _sheet(
@@ -336,7 +343,9 @@ def _write(args: argparse.Namespace, sources: list[Source], n_clean: int) -> Non
             "sheet": sheet,
         })
     with (args.out / "sources.csv").open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        # Visits can have different filters, so each gets its own columns.
+        fields = dict.fromkeys(k for r in rows for k in r if k != "sheet")
+        w = csv.DictWriter(f, fieldnames=[*fields, "sheet"])
         w.writeheader()
         w.writerows(rows)
     body = "".join(

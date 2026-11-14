@@ -269,7 +269,7 @@ def main() -> None:
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
     ckpt, done = args.out / "ckpt.pt", 0
     if ckpt.exists():
-        state = torch.load(ckpt, map_location="cuda", weights_only=False)
+        state = torch.load(ckpt, map_location="cuda", weights_only=True)
         with torch.no_grad():
             for lora, (a, b) in zip(loras, state["loras"], strict=True):
                 lora.a.copy_(a)

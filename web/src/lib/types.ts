@@ -31,7 +31,8 @@ export interface MosaicInfo {
   preview_scale: number;
   filters: string[];
   pixel_scale_arcsec: number;
-  wcs: WcsCards;
+  /** Left out when the mosaic's header has no celestial WCS. */
+  wcs?: WcsCards;
   header: Record<string, string>;
 }
 

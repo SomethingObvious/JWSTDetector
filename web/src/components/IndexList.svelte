@@ -242,7 +242,10 @@
     onscroll={(e) => (scrollTop = e.currentTarget.scrollTop)}
     role="listbox"
     aria-label="Candidates"
-    tabindex="-1"
+    tabindex="0"
+    aria-activedescendant={rows.some((r) => r.i === current)
+      ? `cand-${String(current)}`
+      : undefined}
   >
     {#if order.length === 0}
       <div class="empty">
@@ -270,6 +273,7 @@
           class:current={i === current}
           style:transform="translateY({k * ROW}px)"
           style:height="{ROW}px"
+          id="cand-{i}"
           role="option"
           aria-selected={i === current}
           tabindex="-1"
@@ -416,7 +420,10 @@
     overflow-x: hidden;
     position: relative;
     min-height: 0;
-    outline: none;
+  }
+  /* Inside the edge, as the column clips anything outside it. */
+  .list:focus-visible {
+    outline-offset: -1px;
   }
   .spacer {
     position: relative;
