@@ -2,7 +2,7 @@
 
 This is the plan for searching MINERVA (JWST program 7814, Muzzin et al. 2025) the way [search.md](search.md) searched COSMOS-Web, written before any of its deep tiles are scored, with what COSMOS-Web taught built in. Where it doesn't say otherwise, the rules are COSMOS-Web's.
 
-The plan as it stood before scoring is this page at commit 8ba435a, pushed on 2026-11-08. Every change to it since is listed in [Changes to the Plan After Scoring](#changes-to-the-plan-after-scoring), and the Result and the Rescore were written after the verdict.
+The plan as it stood before scoring is this page at commit c8a0c58, pushed on 2026-11-08. Every change to it since is listed in [Changes to the Plan After Scoring](#changes-to-the-plan-after-scoring), and the Result and the Rescore were written after the verdict.
 
 ## Data
 
@@ -48,15 +48,16 @@ There's one known answer in o003. Festin et al. (2026) list a brown dwarf candid
 
 ## What It Claims
 
-Only search tiles with q <= 0.1 count as detections. Anything else, both lists included, is a candidate for a person to look at and nothing more. A detection gets looked at in every filter and matched against catalogues, and nothing is said about it to anyone outside before that, or before the MINERVA team has seen it. The lists are looked at the same way, and only what survives a first look goes any further.
+Only search tiles with q <= 0.1 count as detections. Anything else, both lists included, is a candidate for a person to look at and nothing more. A detection gets looked at in every filter and matched against catalogues, and nothing is said about it to anyone outside before that. The lists are looked at the same way, and only what survives a first look goes any further.
 
 ## Changes to the Plan After Scoring
 
-These are every edit to the sections above since 8ba435a, apart from the package's rename and two references added.
+These are every edit to the sections above since c8a0c58, apart from the package's rename and two references added.
 
 - The colour search's hot pixel rule and its rule for one band 20 times the rest were added on 2026-11-09, once the first full list had been looked at. They only change the colour list, which makes no claim.
 - The Blocks section said the tiles straddling a border leave a 160 px strip along it unsearched. With `owned` scoring, which the search used, a block's edge tiles score out to its border, so none of it went unsearched. Only the later rescore on tile middles leaves 80 px inside each border unscored.
 - Scoring and the Verdict said BH ran over the search's grid tiles. The 320 px grid rule had been dropped before this plan (see [search.md](search.md)), and the verdict counted every kept search tile.
+- A clause in What It Claims about who would see a detection first was taken out on 2026-11-13. There was no detection, so it changed nothing.
 
 ## The Result
 
